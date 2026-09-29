@@ -1,0 +1,25 @@
+1. Radar Module
+   - Ball speed
+   - Launch angle
+   - Distance calculations
+
+2. Vision Module
+   - Ball detection
+   - Club tracking
+   - Shot verification
+
+3. Sensor Fusion Module
+   - Combines radar and camera measurements
+
+4. User Interface Module
+   - LCD output
+   - Mobile app communication
+
+5. Data Management Module
+   - Session storage
+   - Cloud upload
+
+6. Calibration Module
+   - Radar calibration
+   - Camera calibration
+   - Alignment calibration
