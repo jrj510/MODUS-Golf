@@ -23,3 +23,7 @@
    - Radar calibration
    - Camera calibration
    - Alignment calibration
+
+install the same packages in terminal with:
+
+pip install -r requirements.txt
