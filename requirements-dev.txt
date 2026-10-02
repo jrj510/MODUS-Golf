@@ -1,0 +1,22 @@
+# MODUS-Golf: development, training, and calibration (PC)
+# Install with: pip install -r requirements-dev.txt
+# Includes everything the Pi needs, plus tools that should NOT ship on the Pi.
+
+-r requirements-raspi.txt
+
+# Model training and export (YOLO)
+torch==2.14.0
+torchvision==0.29.0
+ultralytics==8.4.165
+
+# Calibration and analysis (OPS243 vs IWR6843 comparison)
+scipy==1.17.1
+pandas==3.0.6
+matplotlib==3.11.2
+# polars==1.44.2   # only if you use polars; pandas alone is enough for most analysis
+
+# Testing
+pytest==9.1.1
+
+# GPU monitoring (NVIDIA dev machine only)
+nvidia-ml-py==13.615.71
