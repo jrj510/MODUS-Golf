@@ -28,37 +28,27 @@ Thumbs.db
 
 *.pt
 ----------------------------------------------------------------------------------------------
+pushing new vs  code to github:
+git status
+git add .
+git commit -m "Describe what you changed"
+git push
+-------
 enter github on pi5 os:
 cd ~/MODUS-Golf
-
-activate virtual environment:
-source venv/bin/activate
-
-deactivate environment:
-deactivate
-
-shutdown board:
-sudo shutdown now
-
+-------
 after pushing updated code to git hub update github on pi5:
 git pull
-----------------------------------------------------------------------------------------
-
-
-pi5os code:
-# one-time system packages
-sudo apt update
-sudo apt install -y git python3-venv python3-picamera2
-
-# get the code
-git clone <your-repo-url>
-cd MODUS-Golf
-
-# create the environment and install the Pi requirements
-python3 -m venv --system-site-packages venv
+--------
+activate virtual environment:
 source venv/bin/activate
-pip install -r requirements-raspi.txt
-
+------
+deactivate environment:
+deactivate
+--------
+shutdown board:
+sudo shutdown now
+----------------------------------------------------------------------------------------*
 # allow serial port access for the radars (log out and back in after)
 sudo usermod -aG dialout $USER
 
