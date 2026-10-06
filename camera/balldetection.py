@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 Golf ball "ready" detector for Raspberry Pi 5 + OV9281 global shutter camera
-(ribbon/CSI), running the sensor in its fast 640x400 mode (up to ~309 fps).
+(ribbon/CSI), running the sensor in its fast 640x400 mode.
 
-Finds a golf ball in the camera view and reports one of three states:
+Method: everything darker than a brightness cutoff is turned black and
+everything brighter is turned white, then the white shapes are checked for
+one that is round and the right size.
+
+States reported:
     NO BALL  -> nothing found
     BALL     -> a ball is visible but has not settled yet
     READY    -> the ball has sat still long enough to arm for a shot
 
-A live annotated view is served to any browser on the same network:
+Live view (camera picture on the left, black/white mask on the right):
     http://modus.local:8000
 
 Install once on the Pi:
@@ -16,13 +20,15 @@ Install once on the Pi:
 
 Run:
     python3 ball_detect.py
-    python3 ball_detect.py --min-radius 60 --max-radius 120 --min-contrast 10
+    python3 ball_detect.py --threshold 180
+    python3 ball_detect.py --threshold 0          (0 = pick the cutoff automatically)
     python3 ball_detect.py --fps 120 --exposure 2000 --gain 4
 
 Stop with Ctrl+C.
 """
 
 import argparse
+import math
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +39,7 @@ from picamera2 import Picamera2
 
 WIDTH, HEIGHT = 640, 400  # fast binned mode of the OV9281
 STREAM_FPS = 20           # browser view rate; kept low so it doesn't slow detection
+KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
 PAGE = (
     b"<html><body style='margin:0;background:#111;text-align:center'>"
@@ -88,65 +95,53 @@ class StreamHandler(BaseHTTPRequestHandler):
 
 
 def find_ball(gray, args):
-    """Return (x, y, r) of the best ball candidate in full-size pixels, or None."""
-    s = args.scale
-    small = gray if s == 1.0 else cv2.resize(
-        gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    blurred = cv2.GaussianBlur(small, (5, 5), 1.2)
-    circles = cv2.HoughCircles(
-        blurred,
-        cv2.HOUGH_GRADIENT,
-        dp=1.2,
-        minDist=small.shape[0] // 4,
-        param1=args.edge,
-        param2=args.votes,
-        minRadius=max(int(args.min_radius * s), 3),
-        maxRadius=max(int(args.max_radius * s), 4),
-    )
-    if circles is None:
-        return None
+    """Return ((x, y, r) or None, mask). The mask is the black/white image."""
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    if args.threshold > 0:
+        _, mask = cv2.threshold(blurred, args.threshold, 255, cv2.THRESH_BINARY)
+    else:
+        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    # Remove specks, then fill small holes left by the logo and dimples.
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     best, best_score = None, 0.0
-    for cx, cy, cr in circles[0][:6]:
-        x, y, r = int(round(cx / s)), int(round(cy / s)), int(round(cr / s))
-        # A golf ball is bright against its surroundings, so score each circle
-        # by how much brighter its inside is than a ring around it. Only a
-        # small crop around the circle is examined, to keep this fast.
-        pad = int(r * 1.6) + 1
-        x0, y0 = max(x - pad, 0), max(y - pad, 0)
-        x1, y1 = min(x + pad, WIDTH), min(y + pad, HEIGHT)
-        crop = gray[y0:y1, x0:x1]
-        if crop.size == 0:
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < 30:
             continue
-        c = (x - x0, y - y0)
-        inner = np.zeros(crop.shape, np.uint8)
-        cv2.circle(inner, c, max(int(r * 0.8), 1), 255, -1)
-        ring = np.zeros(crop.shape, np.uint8)
-        cv2.circle(ring, c, int(r * 1.6), 255, -1)
-        cv2.circle(ring, c, int(r * 1.15), 0, -1)
-        inside = cv2.mean(crop, mask=inner)[0]
-        outside = cv2.mean(crop, mask=ring)[0]
-        score = inside - outside
-        if inside >= args.min_brightness and score > best_score:
-            best, best_score = (x, y, r), score
-
-    if best_score < args.min_contrast:
-        return None
-    return best
+        (x, y), r = cv2.minEnclosingCircle(c)
+        if not args.min_radius <= r <= args.max_radius:
+            continue
+        perimeter = cv2.arcLength(c, True)
+        if perimeter == 0:
+            continue
+        # 1.0 is a perfect circle; long or ragged shapes score much lower.
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        # How much of the surrounding circle the shape actually fills.
+        fill = area / (math.pi * r * r)
+        if circularity < args.min_circularity or fill < args.min_fill:
+            continue
+        score = circularity * fill
+        if score > best_score:
+            best, best_score = (int(round(x)), int(round(y)), int(round(r))), score
+    return best, mask
 
 
 def main():
     p = argparse.ArgumentParser(description="Golf ball ready detector")
     p.add_argument("--port", type=int, default=8000, help="web stream port")
     p.add_argument("--fps", type=float, default=309.0, help="camera frame rate to request")
-    p.add_argument("--min-radius", type=int, default=20, help="smallest ball radius, pixels")
-    p.add_argument("--max-radius", type=int, default=120, help="largest ball radius, pixels")
-    p.add_argument("--scale", type=float, default=0.5,
-                   help="shrink factor for the circle search (smaller = faster; use 1.0 for small/far balls)")
-    p.add_argument("--edge", type=int, default=100, help="edge strength (Hough param1)")
-    p.add_argument("--votes", type=int, default=28, help="circle strictness (Hough param2); raise to cut false hits")
-    p.add_argument("--min-brightness", type=int, default=90, help="ball must be at least this bright (0-255)")
-    p.add_argument("--min-contrast", type=int, default=15, help="ball must beat its surroundings by this much")
+    p.add_argument("--threshold", type=int, default=200,
+                   help="brightness cutoff 1-254: brighter becomes white, darker becomes black (0 = automatic)")
+    p.add_argument("--min-radius", type=int, default=10, help="smallest ball radius, pixels")
+    p.add_argument("--max-radius", type=int, default=150, help="largest ball radius, pixels")
+    p.add_argument("--min-circularity", type=float, default=0.75,
+                   help="how round the white shape must be, 0-1")
+    p.add_argument("--min-fill", type=float, default=0.75,
+                   help="how much of its circle the shape must fill, 0-1")
     p.add_argument("--still-pixels", type=float, default=4.0, help="max movement that still counts as still")
     p.add_argument("--still-seconds", type=float, default=0.7, help="time the ball must sit still before READY")
     p.add_argument("--exposure", type=int, default=0, help="exposure in microseconds (0 = auto)")
@@ -189,7 +184,7 @@ def main():
             # is all a black-and-white sensor has, so no conversion is needed.
             gray = cam.capture_array("main")[:HEIGHT, :WIDTH]
             now = time.time()
-            ball = find_ball(gray, args)
+            ball, mask = find_ball(gray, args)
 
             if ball is None:
                 new_state = "NO BALL"
@@ -210,18 +205,21 @@ def main():
                 detail = f" at x={ball[0]} y={ball[1]} r={ball[2]}" if ball else ""
                 print(f"[{time.strftime('%H:%M:%S')}] {state}{detail}")
 
-            # Annotated view for the browser, sent at a modest rate.
+            # Browser view: camera picture on the left, mask on the right.
             if now - last_stream >= 1.0 / STREAM_FPS:
                 last_stream = now
                 view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+                mask_view = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
                 color = {"NO BALL": (0, 0, 255), "BALL": (0, 200, 255),
                          "READY": (0, 255, 0)}[state]
                 if ball:
-                    cv2.circle(view, (ball[0], ball[1]), ball[2], color, 2)
-                    cv2.circle(view, (ball[0], ball[1]), 2, color, -1)
+                    for img in (view, mask_view):
+                        cv2.circle(img, (ball[0], ball[1]), ball[2], color, 2)
+                        cv2.circle(img, (ball[0], ball[1]), 2, color, -1)
                 cv2.putText(view, f"{state}  {fps:.0f} fps", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                ok, jpeg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                both = np.hstack((view, mask_view))
+                ok, jpeg = cv2.imencode(".jpg", both, [cv2.IMWRITE_JPEG_QUALITY, 70])
                 if ok:
                     BUFFER.put(jpeg.tobytes())
 
