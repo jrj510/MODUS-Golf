@@ -1,4 +1,3 @@
-
 install the same packages in terminal with:
 
 Step 1 copy the following in separate commands into a terminal:
@@ -10,7 +9,6 @@ C:\venvs\modus-golf\Scripts\Activate.ps1
 python -m pip install --upgrade pip setuptools wheel
 
 pip install -r requirements-dev.txt
-
 
 Step 2:
 make sure your .gitignore file looks like this:
@@ -29,10 +27,22 @@ __pycache__/
 Thumbs.db
 
 *.pt
+----------------------------------------------------------------------------------------------
+enter github on pi5 os:
+cd ~/MODUS-Golf
 
+activate virtual environment:
+source venv/bin/activate
 
+deactivate environment:
+deactivate
 
+shutdown board:
+sudo shutdown now
 
+after pushing updated code to git hub update github on pi5:
+git pull
+----------------------------------------------------------------------------------------
 
 
 pi5os code:
