@@ -50,6 +50,7 @@ multiObjBeamForming -1 1 0.5
 clutterRemoval -1 0
 calibDcRangeSig -1 0 -5 8 256
 extendedMaxVelocity -1 0
+bpmCfg -1 0 0 1
 lvdsStreamCfg -1 0 0 0
 compRangeBiasAndRxChanPhase 0.0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0
 measureRangeBiasAndRxChanPhase 0 1.5 0.2
@@ -86,9 +87,16 @@ def read_for(fd, seconds):
     return data.decode(errors="replace")
 
 
-def command(cli, line, wait=0.15):
+def command(cli, line, wait=3.0):
+    """Send one command and wait for the board's prompt before returning,
+    so the next command is never sent while the board is still busy."""
     os.write(cli, (line + "\n").encode())
-    reply = read_for(cli, wait)
+    end, raw = time.monotonic() + wait, b""
+    while time.monotonic() < end and b":/>" not in raw:
+        ready, _, _ = select.select([cli], [], [], 0.05)
+        if ready:
+            raw += os.read(cli, 4096)
+    reply = raw.decode(errors="replace")
     lines = [l.strip() for l in reply.splitlines()
              if l.strip() and l.strip() != line and not l.strip().endswith(":/>")]
     return lines
@@ -117,11 +125,15 @@ def main():
         return
 
     print("Sending configuration...")
+    os.write(cli, b"\n")
+    read_for(cli, 0.3)          # clear anything left over on the port
     failed = False
     for line in CONFIG.strip().splitlines():
-        reply = command(cli, line, wait=0.6 if line == "sensorStart" else 0.15)
+        reply = command(cli, line)
         bad = [r for r in reply if "error" in r.lower() or "not recognized" in r.lower()
                or "invalid" in r.lower()]
+        if not bad and not any("done" in r.lower() for r in reply):
+            bad = reply or ["(no reply)"]
         if bad:
             failed = True
             print(f"  REJECTED: {line}\n            board said: {' | '.join(reply)}")
