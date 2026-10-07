@@ -29,7 +29,7 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, new_track,
+from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, detect_ball, new_track,
                           save_shot, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
@@ -195,6 +195,8 @@ def main():
     p.add_argument("--model", default=DEFAULT_MODEL, help="path to the golf ball model")
     p.add_argument("--imgsz", type=int, default=256)
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
+    p.add_argument("--tile", type=int, default=256,
+                   help="size of the full-detail tiles used to find a distant ball (0 = whole frame only)")
     p.add_argument("--fps", type=float, default=200.0, help="camera frame rate to request")
     p.add_argument("--checks-per-second", type=float, default=8.0)
     p.add_argument("--still-pixels", type=float, default=12.0)
@@ -310,13 +312,7 @@ def main():
                     sh.armed = True
                 K.state = "SWINGTEST" if sh.armed else "WAIT"
             else:
-                bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                result = model.predict(bgr, imgsz=args.imgsz, conf=args.conf, verbose=False)[0]
-                ball = None
-                if len(result.boxes):
-                    i = int(result.boxes.conf.argmax())
-                    ball = [int(v) for v in result.boxes.xyxy[i]]
-
+                ball = detect_ball(model, gray, args, trk)
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"]
 

@@ -121,7 +121,8 @@ class Shared:
 
 def new_track():
     """Bookkeeping for the ready logic."""
-    return {"center": None, "still_since": None, "lost_since": None, "box": None}
+    return {"center": None, "still_since": None, "lost_since": None, "box": None,
+            "far": False}
 
 
 def _patch_diff(sh, gray):
@@ -147,6 +148,49 @@ def _set_patch(sh, gray, ball):
         sh.roi = None
         sh.roi_ref = gray[y0:y1, x0:x1].copy()
         sh.roi = (x0, y0, x1, y1)
+
+
+def detect_ball(model, gray, args, trk):
+    """Ask the model where the ball is. Returns [x0, y0, x1, y1] or None.
+
+    The model looks at a small square picture. Shrinking the whole frame down
+    to that size makes a distant ball only a few pixels wide, too small to
+    recognise. So besides the whole frame, the frame is also cut into
+    overlapping tiles that are checked at full detail. Once a distant ball is
+    found, only the tile around it is checked, which keeps things fast.
+    """
+    def run(img, ox, oy):
+        bgr = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_GRAY2BGR)
+        r = model.predict(bgr, imgsz=args.imgsz, conf=args.conf, verbose=False)[0]
+        if not len(r.boxes):
+            return None
+        i = int(r.boxes.conf.argmax())
+        x0, y0, x1, y1 = [float(v) for v in r.boxes.xyxy[i]]
+        return [int(x0 + ox), int(y0 + oy), int(x1 + ox), int(y1 + oy)]
+
+    T = min(args.tile, HEIGHT)
+    if T <= 0 or T >= WIDTH:
+        return run(gray, 0, 0)
+
+    # Already following a distant ball: look only around where it was.
+    if trk["far"] and trk["center"] is not None:
+        ox = int(min(max(trk["center"][0] - T / 2, 0), WIDTH - T))
+        oy = int(min(max(trk["center"][1] - T / 2, 0), HEIGHT - T))
+        ball = run(gray[oy:oy + T, ox:ox + T], ox, oy)
+        if ball:
+            return ball
+
+    ball = run(gray, 0, 0)          # whole frame: finds a close, large ball
+    if ball:
+        trk["far"] = False
+        return ball
+    for oy in sorted({0, HEIGHT - T}):
+        for ox in sorted({0, (WIDTH - T) // 2, WIDTH - T}):
+            ball = run(gray[oy:oy + T, ox:ox + T], ox, oy)
+            if ball:
+                trk["far"] = True
+                return ball
+    return None
 
 
 def update_ready(sh, args, gray, ball, trk, now):
@@ -286,6 +330,8 @@ def main():
     p.add_argument("--model", required=True, help="path to the golf ball .onnx or .pt model")
     p.add_argument("--imgsz", type=int, default=256, help="size the model looks at")
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
+    p.add_argument("--tile", type=int, default=256,
+                   help="size of the full-detail tiles used to find a distant ball (0 = whole frame only)")
     p.add_argument("--fps", type=float, default=200.0,
                    help="camera frame rate to request (309 timed out on this board)")
     p.add_argument("--checks-per-second", type=float, default=8.0, help="how often the model runs")
@@ -372,13 +418,7 @@ def main():
 
             capturing = sh.trigger_time is not None
             if not capturing:
-                bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-                result = model.predict(bgr, imgsz=args.imgsz, conf=args.conf, verbose=False)[0]
-                ball = None
-                if len(result.boxes):
-                    i = int(result.boxes.conf.argmax())
-                    ball = [int(v) for v in result.boxes.xyxy[i]]
-
+                ball = detect_ball(model, gray, args, trk)
                 new_state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"]
             else:
