@@ -298,6 +298,8 @@ def main():
     p.add_argument("--trigger", default="sound,motion,key", help="which triggers to use, comma separated")
     p.add_argument("--motion-threshold", type=float, default=25.0,
                    help="how much the ball's patch must change to count as a shot (0-255)")
+    p.add_argument("--bit-depth", type=int, default=8, choices=(8, 10),
+                   help="sensor bit depth; 8 allows the fastest frame rates")
     p.add_argument("--exposure", type=int, default=0, help="exposure in microseconds (0 = auto)")
     p.add_argument("--gain", type=float, default=0.0, help="analogue gain (0 = auto)")
     p.add_argument("--out", default="shots", help="folder to save shots into")
@@ -318,7 +320,7 @@ def main():
     cam = Picamera2()
     cam.configure(cam.create_video_configuration(
         main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
-        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": 10},
+        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": args.bit_depth},
         controls=controls, buffer_count=8))
     cam.start()
     time.sleep(1.0)
