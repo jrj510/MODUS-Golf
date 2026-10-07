@@ -183,6 +183,7 @@ def save_shot(pending, out_dir):
     print(f"SHOT ({source}): saved {len(frames)} frames, "
           f"{times[0] * 1000:.0f} ms to +{times[-1] * 1000:.0f} ms, "
           f"about {rate:.0f} fps, in {folder}")
+    return folder
 
 
 def main():
@@ -190,7 +191,8 @@ def main():
     p.add_argument("--model", required=True, help="path to the golf ball .onnx or .pt model")
     p.add_argument("--imgsz", type=int, default=256, help="size the model looks at")
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
-    p.add_argument("--fps", type=float, default=309.0, help="camera frame rate to request")
+    p.add_argument("--fps", type=float, default=200.0,
+                   help="camera frame rate to request (309 timed out on this board)")
     p.add_argument("--checks-per-second", type=float, default=8.0, help="how often the model runs")
     p.add_argument("--still-pixels", type=float, default=12.0, help="movement that still counts as still")
     p.add_argument("--still-seconds", type=float, default=1.0, help="time the ball must sit still before READY")
