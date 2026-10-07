@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
 """
-Kiosk mode for the launch monitor camera.
+Kiosk mode for the launch monitor.
 
-Shows a full-screen status on the touchscreen:
-    Looking for Ball  ->  Ready  ->  Recorded Shot
-After a shot it replays the clip on a loop and asks Keep or Delete, then goes
-back to looking for the next ball.
+The touchscreen shows a dashboard of shot numbers that is always on screen:
+    Ball Speed, Club Speed, Smash Factor, Carry,
+    Launch Angle, Launch Direction, Spin Rate, Club Path
+
+Top left is the status indicator (Looking for Ball / Ready / Recording).
+After a shot the numbers fill in and a "Shot Preview" button appears beside
+the status. Tapping it opens the slow-motion replay with Save and Delete.
+
+Nothing needs to be tapped between shots. The numbers and the replay stay
+until the next shot replaces them. A replay that was neither saved nor
+deleted is deleted when the next shot arrives, or when the kiosk exits.
+
+Numbers that no connected sensor can measure yet are shown as "--".
 
 This file must sit in the same folder as shot_capture.py, which it reuses.
 
-Run from a terminal on the Pi's own screen, inside vision-env:
+Run from a terminal, inside vision-env:
     python3 camera/kiosk.py
-
-Tap "Exit" in the top right corner to leave kiosk mode.
+    python3 camera/kiosk.py --no-ball          (swing test, no ball needed)
+    python3 camera/kiosk.py --no-browser       (no screen attached; view from the laptop)
 """
 
 import argparse
+import collections
 import json
+import math
 import os
+import re
+import select
 import shutil
 import subprocess
+import termios
 import threading
 import time
+import tty
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -29,67 +44,117 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, detect_ball, new_track,
-                          save_shot, update_ready)
+from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, detect_ball,
+                          new_track, save_shot, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 REPLAY_FPS = 30
+NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
 PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-html,body{margin:0;height:100%;background:#0b0f14;color:#fff;font-family:sans-serif;
-  overflow:hidden;user-select:none;cursor:none}
-#wrap{height:100%;display:flex;flex-direction:column;align-items:center;
-  justify-content:center;gap:10px}
-#status{font-size:64px;font-weight:700}
-#sub{font-size:22px;color:#9aa7b4;min-height:26px}
-img{max-height:52%;max-width:92%;border-radius:8px}
-#buttons{display:none;gap:28px;margin-top:6px}
-button{font-size:30px;padding:16px 48px;border:0;border-radius:12px;color:#fff}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#0b0f14;color:#fff;
+  font-family:system-ui,sans-serif;overflow:hidden;user-select:none}
+body{display:flex;flex-direction:column}
+#top{display:flex;align-items:center;gap:10px;padding:8px 10px;height:15vh;min-height:52px}
+#status{display:flex;align-items:center;gap:10px;background:#141b24;border-radius:999px;
+  padding:0 18px;height:100%;font-size:4.4vh;font-weight:700;white-space:nowrap}
+#dot{width:2.6vh;height:2.6vh;border-radius:50%;background:#9aa7b4}
+#shotno{color:#7c8894;font-size:3vh;margin-left:auto;white-space:nowrap}
+button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
+  padding:0 18px;height:100%;background:#22303f}
+#pv{background:#2563a8}
+#quit{background:#1c232c;color:#7c8894;font-size:2.6vh}
+.hide{display:none!important}
+.view{flex:1;min-height:0;padding:0 10px 10px}
+#main{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:1fr 1fr;gap:10px}
+.tile{background:#141b24;border-radius:14px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;padding:6px;min-width:0}
+.lbl{color:#9aa7b4;font-size:3.1vh;text-align:center}
+.val{font-size:11.5vh;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.val.none{color:#3d4a59}
+.unit{color:#7c8894;font-size:2.8vh;min-height:3.4vh}
+.fresh .val{color:#4dabf7}
+#preview,#camera{display:flex;flex-direction:column;align-items:center;gap:8px}
+#preview img,#camera img{flex:1;min-height:0;max-width:100%;object-fit:contain;border-radius:8px}
+.bar{display:flex;align-items:center;gap:14px;height:13vh;min-height:48px;width:100%;
+  justify-content:center}
 #keep{background:#1f9d55}#del{background:#c0392b}
-#quit{position:fixed;top:6px;right:8px;font-size:14px;padding:6px 12px;
-  background:#1c232c;color:#7c8894}
+#vmsg{font-size:3.4vh;color:#9aa7b4}
 </style></head><body>
-<button id="quit" onclick="post('quit')">Exit</button>
-<div id="wrap">
-  <div id="status">Starting</div>
-  <div id="sub"></div>
-  <img id="view">
-  <div id="buttons">
-    <button id="keep" onclick="post('keep')">Keep</button>
+<div id="top">
+  <div id="status"><span id="dot"></span><span id="stext">Starting</span></div>
+  <button id="pv" class="hide" onclick="show('preview')">Shot Preview</button>
+  <span id="shotno"></span>
+  <button id="cam" onclick="show('camera')">Camera</button>
+  <button id="quit" onclick="post('quit')">Exit</button>
+</div>
+<div id="main" class="view"></div>
+<div id="preview" class="view hide">
+  <img id="rep">
+  <div class="bar">
+    <button onclick="show('main')">Back</button>
+    <span id="vmsg"></span>
+    <button id="keep" onclick="post('keep')">Save</button>
     <button id="del" onclick="post('delete')">Delete</button>
   </div>
 </div>
+<div id="camera" class="view hide">
+  <img id="live">
+  <div class="bar"><button onclick="show('main')">Back</button></div>
+</div>
 <script>
-const T={
-  STARTING:['Starting','#9aa7b4','Loading'],
-  SEARCHING:['Looking for Ball','#f0b429','Place a ball in view'],
-  BALL:['Looking for Ball','#f0b429','Ball found, keep it still'],
-  READY:['Ready','#2ecc71','Take your shot'],
-  WAIT:['Get Set','#f0b429','Swing test starting'],
-  SWINGTEST:['Ready','#2ecc71','Swing test: no ball needed'],
-  CAPTURING:['Recording','#c77dff',''],
-  RECORDED:['Recorded Shot','#4dabf7',''],
-  REVIEW:['Recorded Shot','#4dabf7','Keep this video?']};
-const st=document.getElementById('status'),sub=document.getElementById('sub'),
-      view=document.getElementById('view'),buttons=document.getElementById('buttons');
-let mode='';
+const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
+  ['smash','Smash Factor','',2],['carry','Carry','yd',0],
+  ['launch_angle','Launch Angle','deg',1],['launch_dir','Launch Direction','deg',1],
+  ['spin','Spin Rate','rpm',0],['club_path','Club Path','deg',1]];
+const STATUS={STARTING:['Starting','#9aa7b4'],SEARCHING:['Looking for Ball','#f0b429'],
+  BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
+  CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],
+  SWINGTEST:['Ready','#2ecc71']};
+const $=id=>document.getElementById(id);
+const main=$('main');
+for(const [k,label,unit] of TILES){
+  const t=document.createElement('div');t.className='tile';t.id='t_'+k;
+  t.innerHTML='<div class="lbl">'+label+'</div><div class="val none" id="m_'+k+'">--</div>'+
+              '<div class="unit" id="u_'+k+'">'+unit+'</div>';
+  main.appendChild(t);
+}
+let view='main',shot=-1,video='none';
 function post(a){fetch('/'+a,{method:'POST'});}
+function show(v){
+  view=v;
+  for(const n of ['main','preview','camera'])$(n).classList.toggle('hide',n!=v);
+  $('rep').src=(v=='preview')?'/replay.mjpg?'+shot+'_'+Date.now():'';
+  $('live').src=(v=='camera')?'/stream.mjpg':'';
+}
 async function tick(){
   try{
     const s=await (await fetch('/state')).json();
-    const t=T[s.state]||[s.state,'#fff',''];
-    st.textContent=t[0];st.style.color=t[1];sub.textContent=t[2];
-    const m=s.state=='REVIEW'?'replay'+s.shot:
-            (s.state=='RECORDED'||s.state=='STARTING'?'none':'live');
-    if(m!=mode){
-      mode=m;
-      view.style.display=(m=='none')?'none':'';
-      if(m=='live')view.src='/stream.mjpg';
-      else if(m!='none')view.src='/replay.mjpg?'+s.shot;
-      buttons.style.display=m.startsWith('replay')?'flex':'none';
+    const st=STATUS[s.state]||[s.state,'#fff'];
+    $('stext').textContent=st[0];$('dot').style.background=st[1];
+    if(s.shot!=shot){
+      shot=s.shot;
+      for(const [k,label,unit,dp] of TILES){
+        const v=s.metrics[k],el=$('m_'+k);
+        el.textContent=(v===null||v===undefined)?'--':Number(v).toFixed(dp);
+        el.classList.toggle('none',v===null||v===undefined);
+        $('u_'+k).textContent=unit+((k=='carry'&&s.metrics.carry_estimated&&v!=null)?' est.':'');
+        $('t_'+k).classList.add('fresh');
+      }
+      setTimeout(()=>{for(const [k] of TILES)$('t_'+k).classList.remove('fresh');},1500);
+      $('shotno').textContent=shot>0?'Shot '+shot:'';
+      if(view=='preview')show(s.video=='none'||s.video=='deleted'?'main':'preview');
     }
+    video=s.video;
+    const has=(video=='pending'||video=='kept');
+    $('pv').classList.toggle('hide',!has);
+    $('keep').classList.toggle('hide',video!='pending');
+    $('del').classList.toggle('hide',!has);
+    $('vmsg').textContent=video=='kept'?'Saved':(video=='pending'?'Save this video?':'');
+    if(view=='preview'&&!has)show('main');
   }catch(e){}
   setTimeout(tick,250);
 }
@@ -97,13 +162,42 @@ tick();
 </script></body></html>"""
 
 
+def empty_metrics():
+    return {"ball_speed": None, "club_speed": None, "smash": None, "carry": None,
+            "carry_estimated": True, "launch_angle": None, "launch_dir": None,
+            "spin": None, "club_path": None}
+
+
 class Kiosk:
     def __init__(self):
+        self.lock = threading.Lock()
         self.state = "STARTING"
-        self.shot = 0          # counts shots, so the page knows a replay is new
-        self.replay = []       # JPEG frames of the last shot
-        self.decision = None   # "keep", "delete" or "quit"
+        self.shot = 0
+        self.metrics = empty_metrics()
+        self.replay = []        # JPEG frames of the latest shot
+        self.folder = None      # where the latest shot is saved
+        self.video = "none"     # none / pending / kept / deleted
         self.quit = False
+
+    def decide(self, action):
+        """Save or delete the latest shot's video."""
+        with self.lock:
+            if action == "keep" and self.video == "pending":
+                self.video = "kept"
+                print(f"Kept {self.folder}")
+            elif action == "delete" and self.video in ("pending", "kept"):
+                if self.folder:
+                    shutil.rmtree(self.folder, ignore_errors=True)
+                    print(f"Deleted {self.folder}")
+                self.video, self.replay, self.folder = "deleted", [], None
+
+    def drop_undecided(self):
+        """A video nobody saved is deleted by default."""
+        with self.lock:
+            if self.video == "pending" and self.folder:
+                shutil.rmtree(self.folder, ignore_errors=True)
+                print(f"No choice made, deleted {self.folder}")
+                self.video, self.replay, self.folder = "deleted", [], None
 
 
 K = Kiosk()
@@ -125,7 +219,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             if path == "/state":
-                body = json.dumps({"state": K.state, "shot": K.shot}).encode()
+                body = json.dumps({"state": K.state, "shot": K.shot,
+                                   "metrics": K.metrics, "video": K.video}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -140,9 +235,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/replay.mjpg":
                 self._mjpeg_headers()
                 shot, frames = K.shot, K.replay
-                while not K.quit and K.state == "REVIEW" and K.shot == shot and frames:
+                while not K.quit and K.shot == shot and K.replay and frames:
                     for jpeg in frames:
-                        if K.state != "REVIEW" or K.shot != shot:
+                        if K.quit or K.shot != shot or not K.replay:
                             break
                         self._send_jpeg(jpeg)
                         time.sleep(1.0 / REPLAY_FPS)
@@ -159,14 +254,106 @@ class Handler(BaseHTTPRequestHandler):
         action = self.path.strip("/")
         if action == "quit":
             K.quit = True
-            K.decision = "quit"
-        elif action in ("keep", "delete") and K.state == "REVIEW":
-            K.decision = action
+        elif action in ("keep", "delete"):
+            K.decide(action)
         self.send_response(204)
         self.end_headers()
 
     def log_message(self, *args):
         pass
+
+
+class Radar:
+    """Reads speeds from the OPS243-A in the background."""
+
+    def __init__(self, port):
+        self.readings = collections.deque(maxlen=5000)  # (time, mph)
+        self.ok = False
+        try:
+            self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY)
+            tty.setraw(self.fd)
+            termios.tcflush(self.fd, termios.TCIOFLUSH)
+            for command in ("US", "SL"):   # mph, 50 kHz sample rate
+                os.write(self.fd, command.encode())
+                time.sleep(0.15)
+            self.ok = True
+            threading.Thread(target=self._run, daemon=True).start()
+            print(f"Speed radar connected on {port}")
+        except OSError as e:
+            print(f"Speed radar not available on {port} ({e}); speeds will show as --")
+
+    def _run(self):
+        buffer = b""
+        while not K.quit:
+            try:
+                ready, _, _ = select.select([self.fd], [], [], 0.2)
+                if not ready:
+                    continue
+                buffer += os.read(self.fd, 4096)
+            except OSError:
+                self.ok = False
+                print("Speed radar disconnected")
+                return
+            now = time.monotonic()
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                text = line.decode(errors="replace").strip()
+                if not text or text.startswith("{"):
+                    continue
+                numbers = NUMBER.findall(text)
+                if numbers:
+                    self.readings.append((now, float(numbers[-1])))
+
+    def window(self, t0, t1):
+        return [(t, s) for t, s in list(self.readings) if t0 <= t <= t1]
+
+
+def carry_estimate(ball_mph, launch_deg):
+    """Rough carry in yards from ball speed and launch angle.
+
+    A simple flight model with fixed drag and lift. Real carry depends on spin,
+    which is not measured, so treat this as an estimate.
+    """
+    v = ball_mph * 0.44704
+    a = math.radians(launch_deg)
+    vx, vy, x, y = v * math.cos(a), v * math.sin(a), 0.0, 0.0
+    k, cd, cl, dt = 0.0191, 0.23, 0.16, 0.002
+    for _ in range(20000):
+        s = math.hypot(vx, vy)
+        ax = -k * cd * s * vx - k * cl * s * vy
+        ay = -9.81 - k * cd * s * vy + k * cl * s * vx
+        vx, vy = vx + ax * dt, vy + ay * dt
+        x, y = x + vx * dt, y + vy * dt
+        if y < 0:
+            break
+    return x * 1.09361
+
+
+def shot_metrics(radar, trigger_time, args):
+    """Work out the numbers for one shot from what the sensors recorded."""
+    m = empty_metrics()
+    if radar is not None and radar.ok:
+        readings = [(t, abs(s)) for t, s in
+                    radar.window(trigger_time - 0.6, time.monotonic())
+                    if abs(s) >= args.min_speed]
+        if readings:
+            t_top, top = max(readings, key=lambda r: r[1])
+            if args.swing_test:
+                m["club_speed"] = round(top, 1)   # no ball, so the fastest thing is the club
+            else:
+                m["ball_speed"] = round(top, 1)
+                # The club is the fastest reading before the ball that is clearly
+                # slower than the ball. This is a first guess and needs checking
+                # against real shots.
+                earlier = [s for t, s in readings if t < t_top and top / 1.8 <= s <= top / 1.05]
+                if earlier:
+                    m["club_speed"] = round(max(earlier), 1)
+                    m["smash"] = round(top / max(earlier), 2)
+    if args.assume_launch > 0:
+        m["launch_angle"] = args.assume_launch
+    if m["ball_speed"] and m["launch_angle"]:
+        m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
+    return m
 
 
 def open_browser(url):
@@ -191,7 +378,7 @@ def open_browser(url):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Launch monitor camera kiosk")
+    p = argparse.ArgumentParser(description="Launch monitor kiosk")
     p.add_argument("--model", default=DEFAULT_MODEL, help="path to the golf ball model")
     p.add_argument("--imgsz", type=int, default=256)
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
@@ -217,6 +404,12 @@ def main():
                    help="swing test: skip ball detection and record when a fast swing passes")
     p.add_argument("--swing-fraction", type=float, default=0.015,
                    help="share of the picture that must change in one frame to count as a swing")
+    p.add_argument("--radar-port", default="/dev/ttyACM0", help="OPS243-A serial port")
+    p.add_argument("--no-radar", action="store_true", help="run without the speed radar")
+    p.add_argument("--min-speed", type=float, default=10.0,
+                   help="ignore radar readings slower than this (mph)")
+    p.add_argument("--assume-launch", type=float, default=0.0,
+                   help="launch angle in degrees to assume for the carry estimate until it is measured")
     p.add_argument("--no-browser", action="store_true", help="do not open the full-screen browser")
     args = p.parse_args()
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
@@ -229,6 +422,8 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     browser = None if args.no_browser else open_browser(url)
     print(f"Kiosk page: {url}  (also http://modus.local:{args.port} from the laptop)")
+
+    radar = None if args.no_radar else Radar(args.radar_port)
 
     model = None
     if not args.swing_test:
@@ -271,26 +466,25 @@ def main():
         while not K.quit:
             loop_start = time.monotonic()
 
-            # A shot was captured: save it, replay it, and wait for Keep/Delete.
+            # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
-                K.state = "RECORDED"
-                window = sh.pending[2]
+                K.state = "CAPTURING"
+                K.drop_undecided()           # the previous video defaults to deleted
+                trigger_time, _, window = sh.pending
                 folder = save_shot(sh.pending, args.out)
-                K.replay = [cv2.imencode(".jpg", np.ascontiguousarray(f[2]),
-                                         [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
-                            for f in window]
-                time.sleep(1.2)
-                K.decision = None
-                K.shot += 1
-                K.state = "REVIEW"
-                while K.decision is None and not K.quit:
-                    time.sleep(0.05)
-                if K.decision == "delete" and folder:
-                    shutil.rmtree(folder, ignore_errors=True)
-                    print(f"Deleted {folder}")
-                elif K.decision == "keep":
-                    print(f"Kept {folder}")
-                K.replay = []
+                replay = [cv2.imencode(".jpg", np.ascontiguousarray(f[2]),
+                                       [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                          for f in window]
+                metrics = shot_metrics(radar, trigger_time, args)
+                if folder:
+                    with open(os.path.join(folder, "metrics.json"), "w") as f:
+                        json.dump(metrics, f, indent=2)
+                with K.lock:
+                    K.replay, K.folder, K.metrics = replay, folder, metrics
+                    K.video = "pending" if folder else "none"
+                    K.shot += 1
+                shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
+                print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'}")
                 with sh.lock:
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
@@ -316,7 +510,7 @@ def main():
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"]
 
-            # Live picture for the kiosk page, with a box round the ball.
+            # Live picture for the Camera view, with a box round the ball.
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             if ball and K.state in ("BALL", "READY"):
                 color = (0, 255, 0) if K.state == "READY" else (0, 200, 255)
@@ -332,6 +526,7 @@ def main():
         pass
     finally:
         print("\nStopping.")
+        K.drop_undecided()
         K.quit = True
         sh.running = False
         if browser is not None:
