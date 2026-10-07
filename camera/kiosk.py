@@ -29,7 +29,8 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from shot_capture import HEIGHT, STREAM, WIDTH, Shared, camera_thread, save_shot
+from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, new_track,
+                          save_shot, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 REPLAY_FPS = 30
@@ -196,6 +197,8 @@ def main():
     p.add_argument("--checks-per-second", type=float, default=8.0)
     p.add_argument("--still-pixels", type=float, default=12.0)
     p.add_argument("--still-seconds", type=float, default=1.0)
+    p.add_argument("--hold-seconds", type=float, default=3.0,
+                   help="how long to stay Ready when the ball is covered")
     p.add_argument("--pre", type=float, default=0.25, help="seconds kept from before the trigger")
     p.add_argument("--post", type=float, default=0.5, help="seconds recorded after the trigger")
     p.add_argument("--trigger", default="motion", help="motion, sound, or both: motion,sound")
@@ -244,7 +247,7 @@ def main():
         except Exception as e:
             print(f"Sound trigger not available ({e}); continuing without it")
 
-    ball, last_center, still_since = None, None, None
+    ball, trk = None, new_track()
     period = 1.0 / args.checks_per_second
     K.state = "SEARCHING"
 
@@ -275,7 +278,7 @@ def main():
                 with sh.lock:
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
-                ball, last_center, still_since = None, None, None
+                ball, trk = None, new_track()
                 K.state = "SEARCHING"
                 continue
 
@@ -294,32 +297,8 @@ def main():
                     i = int(result.boxes.conf.argmax())
                     ball = [int(v) for v in result.boxes.xyxy[i]]
 
-                now = time.monotonic()
-                if ball is None:
-                    K.state = "SEARCHING"
-                    last_center, still_since = None, None
-                    sh.armed = False
-                else:
-                    cx, cy = (ball[0] + ball[2]) / 2, (ball[1] + ball[3]) / 2
-                    if last_center is not None and \
-                            np.hypot(cx - last_center[0], cy - last_center[1]) <= args.still_pixels:
-                        if still_since is None:
-                            still_since = now
-                    else:
-                        last_center, still_since = (cx, cy), None
-                        sh.armed = False
-                    ready = still_since is not None and now - still_since >= args.still_seconds
-                    K.state = "READY" if ready else "BALL"
-                    if ready and not sh.armed:
-                        w, h = ball[2] - ball[0], ball[3] - ball[1]
-                        x0 = max(int(ball[0] + 0.2 * w), 0)
-                        y0 = max(int(ball[1] + 0.2 * h), 0)
-                        x1 = min(int(ball[2] - 0.2 * w), WIDTH)
-                        y1 = min(int(ball[3] - 0.2 * h), HEIGHT)
-                        if x1 > x0 and y1 > y0:
-                            sh.roi_ref = gray[y0:y1, x0:x1].copy()
-                            sh.roi = (x0, y0, x1, y1)
-                        sh.armed = True
+                K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
+                ball = trk["box"]
 
             # Live picture for the kiosk page, with a box round the ball.
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)

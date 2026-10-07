@@ -119,9 +119,90 @@ class Shared:
             self.trigger_source = source
 
 
+def new_track():
+    """Bookkeeping for the ready logic."""
+    return {"center": None, "still_since": None, "lost_since": None, "box": None}
+
+
+def _patch_diff(sh, gray):
+    """How much the patch where the ball sat has changed (0-255), or None."""
+    roi, ref = sh.roi, sh.roi_ref
+    if roi is None or ref is None:
+        return None
+    x0, y0, x1, y1 = roi
+    patch = gray[y0:y1, x0:x1]
+    if patch.shape != ref.shape:
+        return None
+    return float(cv2.absdiff(patch, ref).mean())
+
+
+def _set_patch(sh, gray, ball):
+    """Remember the middle of the ball's box for the motion trigger."""
+    w, h = ball[2] - ball[0], ball[3] - ball[1]
+    x0 = max(int(ball[0] + 0.2 * w), 0)
+    y0 = max(int(ball[1] + 0.2 * h), 0)
+    x1 = min(int(ball[2] - 0.2 * w), WIDTH)
+    y1 = min(int(ball[3] - 0.2 * h), HEIGHT)
+    if x1 > x0 and y1 > y0:
+        sh.roi = None
+        sh.roi_ref = gray[y0:y1, x0:x1].copy()
+        sh.roi = (x0, y0, x1, y1)
+
+
+def update_ready(sh, args, gray, ball, trk, now):
+    """Decide SEARCHING / BALL / READY from the model's latest answer.
+
+    Once READY, the script stays READY even if the model loses the ball (for
+    example when the club is set down next to it), as long as the patch of
+    picture where the ball sits still looks the same.
+    """
+    center = None
+    if ball is not None:
+        center = ((ball[0] + ball[2]) / 2, (ball[1] + ball[3]) / 2)
+
+    if sh.armed and trk["center"] is not None:
+        diff = _patch_diff(sh, gray)
+        same = center is not None and np.hypot(
+            center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels
+        if same:
+            trk["lost_since"] = None
+            trk["box"] = ball
+            if diff is not None and diff <= args.motion_threshold * 0.5:
+                _set_patch(sh, gray, ball)  # follow slow lighting changes
+            return "READY"
+        if diff is not None and diff <= args.motion_threshold:
+            trk["lost_since"] = None
+            return "READY"  # the ball's patch is unchanged, so it is still there
+        if trk["lost_since"] is None:
+            trk["lost_since"] = now
+        if now - trk["lost_since"] < args.hold_seconds:
+            return "READY"  # briefly covered; give it a moment
+        sh.armed = False
+        sh.roi = sh.roi_ref = None
+        trk.update(new_track())
+
+    if center is None:
+        trk.update(new_track())
+        sh.armed = False
+        return "SEARCHING"
+    if trk["center"] is not None and np.hypot(
+            center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels:
+        if trk["still_since"] is None:
+            trk["still_since"] = now
+    else:
+        trk["center"], trk["still_since"] = center, None
+    trk["box"] = ball
+    if trk["still_since"] is not None and now - trk["still_since"] >= args.still_seconds:
+        _set_patch(sh, gray, ball)
+        sh.armed = True
+        trk["lost_since"] = None
+        return "READY"
+    return "BALL"
+
+
 def camera_thread(cam, sh, args):
     """Grab every frame at full speed into the rolling memory."""
-    count, t0 = 0, time.monotonic()
+    count, t0, hits = 0, time.monotonic(), 0
     while sh.running:
         req = cam.capture_request()
         try:
@@ -135,12 +216,12 @@ def camera_thread(cam, sh, args):
 
         # Motion trigger: has the patch where the ball sat changed a lot?
         if "motion" in args.triggers and sh.armed and sh.trigger_time is None:
-            roi, ref = sh.roi, sh.roi_ref
-            if roi is not None and ref is not None:
-                x0, y0, x1, y1 = roi
-                diff = cv2.absdiff(img[y0:y1, x0:x1], ref)
-                if float(diff.mean()) > args.motion_threshold:
-                    sh.trigger("motion")
+            diff = _patch_diff(sh, img)
+            # Three frames in a row must differ, so one noisy frame can't fire it.
+            hits = hits + 1 if diff is not None and diff > args.motion_threshold else 0
+            if hits >= 3:
+                hits = 0
+                sh.trigger("motion")
 
         # After a trigger, keep recording for the "after" time, then hand over.
         tt = sh.trigger_time
@@ -196,6 +277,8 @@ def main():
     p.add_argument("--checks-per-second", type=float, default=8.0, help="how often the model runs")
     p.add_argument("--still-pixels", type=float, default=12.0, help="movement that still counts as still")
     p.add_argument("--still-seconds", type=float, default=1.0, help="time the ball must sit still before READY")
+    p.add_argument("--hold-seconds", type=float, default=3.0,
+                   help="how long to stay READY when the ball is covered and the model cannot see it")
     p.add_argument("--pre", type=float, default=0.25, help="seconds to keep from before the trigger")
     p.add_argument("--post", type=float, default=0.5, help="seconds to record after the trigger")
     p.add_argument("--trigger", default="sound,motion,key", help="which triggers to use, comma separated")
@@ -250,7 +333,7 @@ def main():
     print(f"Live view: http://modus.local:{args.port}   (Ctrl+C to stop)")
 
     state, ball = None, None
-    last_center, still_since = None, None
+    trk = new_track()
     period = 1.0 / args.checks_per_second
 
     try:
@@ -262,7 +345,7 @@ def main():
                 with sh.lock:
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
-                last_center, still_since, ball = None, None, None
+                trk, ball = new_track(), None
                 state = None
                 continue
 
@@ -280,33 +363,8 @@ def main():
                     i = int(result.boxes.conf.argmax())
                     ball = [int(v) for v in result.boxes.xyxy[i]]
 
-                now = time.monotonic()
-                if ball is None:
-                    new_state = "SEARCHING"
-                    last_center, still_since = None, None
-                    sh.armed = False
-                else:
-                    cx, cy = (ball[0] + ball[2]) / 2, (ball[1] + ball[3]) / 2
-                    if last_center is not None and \
-                            np.hypot(cx - last_center[0], cy - last_center[1]) <= args.still_pixels:
-                        if still_since is None:
-                            still_since = now
-                    else:
-                        last_center, still_since = (cx, cy), None
-                        sh.armed = False
-                    ready = still_since is not None and now - still_since >= args.still_seconds
-                    new_state = "READY" if ready else "BALL"
-                    if ready and not sh.armed:
-                        # Remember the middle of the ball's box for the motion trigger.
-                        w, h = ball[2] - ball[0], ball[3] - ball[1]
-                        x0 = max(int(ball[0] + 0.2 * w), 0)
-                        y0 = max(int(ball[1] + 0.2 * h), 0)
-                        x1 = min(int(ball[2] - 0.2 * w), WIDTH)
-                        y1 = min(int(ball[3] - 0.2 * h), HEIGHT)
-                        if x1 > x0 and y1 > y0:
-                            sh.roi_ref = gray[y0:y1, x0:x1].copy()
-                            sh.roi = (x0, y0, x1, y1)
-                        sh.armed = True
+                new_state = update_ready(sh, args, gray, ball, trk, time.monotonic())
+                ball = trk["box"]
             else:
                 new_state = "CAPTURING"
 
