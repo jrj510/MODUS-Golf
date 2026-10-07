@@ -203,6 +203,7 @@ def update_ready(sh, args, gray, ball, trk, now):
 def camera_thread(cam, sh, args):
     """Grab every frame at full speed into the rolling memory."""
     count, t0, hits = 0, time.monotonic(), 0
+    prev_small = None
     while sh.running:
         req = cam.capture_request()
         try:
@@ -222,6 +223,19 @@ def camera_thread(cam, sh, args):
             if hits >= 3:
                 hits = 0
                 sh.trigger("motion")
+
+        # Swing test (no ball): fire when a lot of the picture changes between two
+        # consecutive frames. A club at full speed does that; slow movement at
+        # address does not. The average change is removed first so flickering
+        # room lights don't count.
+        if getattr(args, "swing_test", False):
+            small = img[::4, ::4].astype(np.int16)
+            if prev_small is not None and sh.armed and sh.trigger_time is None:
+                d = small - prev_small
+                d -= int(d.mean())
+                if np.count_nonzero(np.abs(d) > 30) > args.swing_fraction * d.size:
+                    sh.trigger("swing")
+            prev_small = small
 
         # After a trigger, keep recording for the "after" time, then hand over.
         tt = sh.trigger_time

@@ -67,6 +67,8 @@ const T={
   SEARCHING:['Looking for Ball','#f0b429','Place a ball in view'],
   BALL:['Looking for Ball','#f0b429','Ball found, keep it still'],
   READY:['Ready','#2ecc71','Take your shot'],
+  WAIT:['Get Set','#f0b429','Swing test starting'],
+  SWINGTEST:['Ready','#2ecc71','Swing test: no ball needed'],
   CAPTURING:['Recording','#c77dff',''],
   RECORDED:['Recorded Shot','#4dabf7',''],
   REVIEW:['Recorded Shot','#4dabf7','Keep this video?']};
@@ -207,9 +209,16 @@ def main():
     p.add_argument("--gain", type=float, default=0.0)
     p.add_argument("--out", default="shots", help="folder to save shots into")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--no-ball", action="store_true",
+                   help="swing test: skip ball detection and record when a fast swing passes")
+    p.add_argument("--swing-fraction", type=float, default=0.015,
+                   help="share of the picture that must change in one frame to count as a swing")
     p.add_argument("--no-browser", action="store_true", help="do not open the full-screen browser")
     args = p.parse_args()
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
+    args.swing_test = args.no_ball
+    if args.swing_test:
+        args.triggers.discard("motion")  # there is no ball patch to watch
 
     url = f"http://localhost:{args.port}"
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
@@ -217,9 +226,11 @@ def main():
     browser = None if args.no_browser else open_browser(url)
     print(f"Kiosk page: {url}  (also http://modus.local:{args.port} from the laptop)")
 
-    print("Loading model...")
-    model = YOLO(os.path.expanduser(args.model), task="detect")
-    model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
+    model = None
+    if not args.swing_test:
+        print("Loading model...")
+        model = YOLO(os.path.expanduser(args.model), task="detect")
+        model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
 
     frame_us = int(1_000_000 / args.fps)
     controls = {"FrameDurationLimits": (frame_us, frame_us)}
@@ -248,6 +259,7 @@ def main():
             print(f"Sound trigger not available ({e}); continuing without it")
 
     ball, trk = None, new_track()
+    rearm_at = time.monotonic() + 2.0
     period = 1.0 / args.checks_per_second
     K.state = "SEARCHING"
 
@@ -279,6 +291,7 @@ def main():
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
                 ball, trk = None, new_track()
+                rearm_at = time.monotonic() + 2.0
                 K.state = "SEARCHING"
                 continue
 
@@ -289,6 +302,11 @@ def main():
 
             if sh.trigger_time is not None:
                 K.state = "CAPTURING"
+            elif args.swing_test:
+                # No ball needed: arm shortly after start-up or the last shot.
+                if not sh.armed and time.monotonic() >= rearm_at:
+                    sh.armed = True
+                K.state = "SWINGTEST" if sh.armed else "WAIT"
             else:
                 bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
                 result = model.predict(bgr, imgsz=args.imgsz, conf=args.conf, verbose=False)[0]
