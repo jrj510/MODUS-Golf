@@ -61,6 +61,7 @@ class IWRBridge:
         stamp = details[0] if details and isinstance(details[0], (int, float)) else None
         event = {"t": time.monotonic(), "stamp": stamp, "done": threading.Event(),
                  "result": None}
+        print(f"[{time.strftime('%H:%M:%S')}] Sound trigger received; TI radar capturing")
         with self.lock:
             now = time.monotonic()
             self.events = [e for e in self.events if now - e["t"] < 120] + [event]
