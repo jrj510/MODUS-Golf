@@ -44,8 +44,8 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, camera_thread, detect_ball,
-                          new_track, save_shot, update_ready)
+from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, add_blob_args, camera_thread,
+                          detect_ball, new_track, save_shot, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 REPLAY_FPS = 30
@@ -468,6 +468,7 @@ def main():
     p.add_argument("--gain", type=float, default=0.0)
     p.add_argument("--out", default="shots", help="folder to save shots into")
     p.add_argument("--port", type=int, default=8000)
+    add_blob_args(p)
     p.add_argument("--no-ball", action="store_true",
                    help="swing test: skip ball detection and record when a fast swing passes")
     p.add_argument("--swing-fraction", type=float, default=0.015,
