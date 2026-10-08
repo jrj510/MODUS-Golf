@@ -151,15 +151,15 @@ def _set_patch(sh, gray, ball):
 
 
 def add_blob_args(p):
-    """Options for the bright-spot ball finder (shared with kiosk.py)."""
+    """Options for the small-ball finder (shared with kiosk.py)."""
     p.add_argument("--blob", action="store_true",
-                   help="also find the ball as a bright round spot (for a distant ball on a dark mat)")
-    p.add_argument("--blob-contrast", type=float, default=35.0,
-                   help="how much brighter than its surroundings the ball must be (0-255)")
-    p.add_argument("--blob-min-radius", type=float, default=2.0, help="smallest ball radius, pixels")
-    p.add_argument("--blob-max-radius", type=float, default=20.0, help="largest ball radius, pixels")
+                   help="also find a distant ball the model misses (a small spot that stands out from the mat)")
+    p.add_argument("--blob-contrast", type=float, default=18.0,
+                   help="how much the ball must differ from the mat around it (0-255)")
+    p.add_argument("--blob-min-radius", type=float, default=3.0, help="smallest ball radius, pixels")
+    p.add_argument("--blob-max-radius", type=float, default=25.0, help="largest ball radius, pixels")
     p.add_argument("--search-area", default=None,
-                   help="only look for the ball inside x0,y0,x1,y1 (pixels, e.g. the mat)")
+                   help="only look for the ball inside x0,y0,x1,y1 (pixels): the mat")
 
 
 def _search_area(args):
@@ -171,12 +171,20 @@ def _search_area(args):
     return max(x0, 0), max(y0, 0), min(x1, WIDTH), min(y1, HEIGHT)
 
 
-def find_bright_ball(gray, args, near=None):
-    """Find a small, bright, round spot on a darker background (a white ball on
-    a mat). Works for balls too small for the model. Returns a box or None.
+def _inside_area(args, box):
+    x0, y0, x1, y1 = _search_area(args)
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return x0 <= cx <= x1 and y0 <= cy <= y1
 
-    Each pixel is compared with the average brightness of its surroundings, so
-    a white ball stands out on the mat even when the lighting is uneven.
+
+def find_ball_spot(gray, args, near=None):
+    """Find a small ball the model misses. Returns a box or None.
+
+    Lit from above, a ball on the mat has a bright top and a dark, shadowed
+    bottom, so it is found as a small, roughly round spot that differs from the
+    mat around it (brighter or darker). The mat's own edges run across the
+    picture, so each pixel is compared with the average of its own row; long
+    edges then vanish while the ball stands out.
     """
     x0, y0, x1, y1 = _search_area(args)
     if near is not None:   # only look around where the ball was last seen
@@ -185,35 +193,28 @@ def find_bright_ball(gray, args, near=None):
         x1, y1 = min(x1, int(near[0]) + r), min(y1, int(near[1]) + r)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
-    img = gray[y0:y1, x0:x1]
-    background = cv2.blur(img, (31, 31))
-    lift = cv2.subtract(img, background)                 # brighter than surroundings
-    mask = (lift > getattr(args, "blob_contrast", 35)).astype(np.uint8)
-    n, _, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    img = gray[y0:y1, x0:x1].astype(np.float32)
+    dev = img - cv2.blur(img, (51, 1))
+    c = getattr(args, "blob_contrast", 18.0)
+    mask = (np.abs(dev) > c).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    n, labels, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    rmin, rmax = getattr(args, "blob_min_radius", 2.0), getattr(args, "blob_max_radius", 20.0)
+    rmin, rmax = getattr(args, "blob_min_radius", 3.0), getattr(args, "blob_max_radius", 25.0)
     best, best_score = None, 0.0
     for i in range(1, n):
         bx, by, bw, bh, area = stats[i]
         r = (bw + bh) / 4.0
-        if not (rmin <= r <= rmax) or not (0.6 <= bw / max(bh, 1) <= 1.6):
+        if not (rmin <= r <= rmax) or not (0.5 <= bw / max(bh, 1) <= 2.0):
             continue
-        fill = area / float(bw * bh)           # a disc fills about 0.79 of its box
-        if fill < 0.5:
+        if area / float(bw * bh) < 0.45:
             continue
-        cx, cy = centers[i]
-        # The ring just outside the spot must be clearly darker than the spot.
-        pad = max(2, int(r))
-        ox0, oy0 = max(bx - pad, 0), max(by - pad, 0)
-        ox1, oy1 = min(bx + bw + pad, img.shape[1]), min(by + bh + pad, img.shape[0])
-        outer = img[oy0:oy1, ox0:ox1].astype(np.float32)
-        inner = img[by:by + bh, bx:bx + bw].astype(np.float32)
-        ring = (outer.sum() - inner.sum()) / max(outer.size - inner.size, 1)
-        contrast = inner.mean() - ring
-        if contrast < getattr(args, "blob_contrast", 35):
-            continue
-        score = contrast * fill
+        d = dev[labels == i]
+        score = float(np.abs(d).mean())
+        if (d > c).any() and (d < -c).any():
+            score *= 1.5               # bright top and shadowed bottom: looks like a ball
         if near is not None:
+            cx, cy = centers[i]
             score /= 1.0 + np.hypot(cx + x0 - near[0], cy + y0 - near[1]) / 20.0
         if score > best_score:
             best_score = score
@@ -223,18 +224,19 @@ def find_bright_ball(gray, args, near=None):
 
 def detect_ball(model, gray, args, trk):
     """The ball's box [x0, y0, x1, y1], or None: the model first, then (with
-    --blob) the bright-spot finder for balls too small for the model."""
+    --blob) the small-ball finder. With --search-area, anything found outside
+    that area is ignored."""
     use_blob = getattr(args, "blob", False)
     if use_blob and trk.get("blob") and trk["center"] is not None:
-        ball = find_bright_ball(gray, args, near=trk["center"])   # cheap: keep following it
+        ball = find_ball_spot(gray, args, near=trk["center"])   # cheap: keep following it
         if ball:
             return ball
     ball = _detect_with_model(model, gray, args, trk)
-    if ball:
+    if ball and _inside_area(args, ball):
         trk["blob"] = False
         return ball
     if use_blob:
-        ball = find_bright_ball(gray, args)
+        ball = find_ball_spot(gray, args)
         if ball:
             trk["blob"] = True
             return ball
