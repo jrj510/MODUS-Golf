@@ -485,6 +485,8 @@ def main():
     p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
     p.add_argument("--iwr-port", default="/dev/ttyUSB0")
     p.add_argument("--iwr-config", default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg")
+    p.add_argument("--iwr-cal", default="config/iwr6843_calibration_reference.json",
+                   help="TI radar calibration file (inside the OpenFlight folder)")
     p.add_argument("--iwr-tee-m", type=float, default=1.575, help="radar to tee distance, m")
     p.add_argument("--iwr-net-m", type=float, default=4.6, help="radar to net distance, m")
     p.add_argument("--iwr-tilt-deg", type=float, default=10.4, help="radar upward tilt, degrees")
@@ -551,7 +553,7 @@ def main():
             from iwr_bridge import IWRBridge
             # OpenFlight's monitor owns GPIO17; each sound trigger is passed on to
             # the camera so it can capture the shot too.
-            bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"))
+            bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
         except Exception as e:
             print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
     if "sound" in args.triggers and bridge is None:
