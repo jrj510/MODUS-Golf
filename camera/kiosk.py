@@ -367,32 +367,55 @@ def save_metrics(folder, metrics, radar_log):
             json.dump({"metrics": metrics, "radar_readings": radar_log}, f, indent=2)
 
 
-def add_iwr_result(bridge, shot, trigger_time, folder, radar_log, args):
-    """Wait for the TI radar's answer for this shot and put it on screen."""
-    r = bridge.result_for(trigger_time)
+def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
+    """Wait for both radars' answers for this shot and put them on screen."""
+    results = {}
+    jobs = []
+    if iwr is not None:
+        jobs.append(threading.Thread(target=lambda: results.update(iwr=iwr.result_for(trigger_time))))
+    if ops is not None:
+        jobs.append(threading.Thread(target=lambda: results.update(ops=ops.result_for(trigger_time))))
+    for j in jobs:
+        j.start()
+    for j in jobs:
+        j.join()
+    o, r = results.get("ops"), results.get("iwr")
+
     with K.lock:
         if K.shot != shot:
             return                      # a newer shot has already replaced this one
         m = dict(K.metrics)
         m["radar_pending"] = False
-        m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
-        if r["launch_angle"] is not None:
-            m["launch_angle"] = round(r["launch_angle"], 1)
-        if m.get("ball_speed") is None and r["ball_speed"] is not None:
-            m["ball_speed"] = round(r["ball_speed"], 1)
-        if m.get("ball_speed") and m.get("launch_angle"):
-            m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
+        if o:
+            if o["ball_speed"] is not None:
+                m["ball_speed"] = round(o["ball_speed"], 1)
+            if o["club_speed"] is not None:
+                m["club_speed"] = round(o["club_speed"], 1)
+            if o["spin"] is not None:
+                m["spin"] = round(o["spin"])
+        if r:
+            m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
+            if r["launch_angle"] is not None:
+                m["launch_angle"] = round(r["launch_angle"], 1)
+            if m.get("ball_speed") is None and r["ball_speed"] is not None:
+                m["ball_speed"] = round(r["ball_speed"], 1)
         if m.get("ball_speed") and m.get("club_speed"):
             m["smash"] = round(m["ball_speed"] / m["club_speed"], 2)
+        if m.get("ball_speed") and m.get("launch_angle"):
+            m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
+        elif o and o.get("carry"):
+            m["carry"] = round(o["carry"])
         K.metrics = m
         K.rev += 1
     save_metrics(folder if K.folder == folder else None, m, radar_log)
-    if r["error"]:
-        print(f"Shot {shot}: TI radar gave no angle ({r['error']})")
-    else:
-        print(f"Shot {shot}: launch angle {m.get('launch_angle')} deg, "
-              f"ball speed {m.get('ball_speed')} mph (TI radar, quality {r['quality']})")
 
+    if ops is not None and not o:
+        print(f"Shot {shot}: speed radar gave no reading (no ball seen flying away from it)")
+    if r and r["error"]:
+        print(f"Shot {shot}: TI radar gave no angle ({r['error']})")
+    shown = {x: m[x] for x in ("ball_speed", "club_speed", "smash", "launch_angle", "spin", "carry")
+             if m.get(x) is not None}
+    print(f"Shot {shot}: {shown if shown else 'no radar numbers'}")
 
 def open_browser(url):
     """Open Chromium full screen on the Pi's own display."""
@@ -446,6 +469,10 @@ def main():
     p.add_argument("--ops-speed-mode", action="store_true",
                    help="read plain speed readings from the OPS243-A. Only for a radar NOT set up in "
                         "rolling-buffer mode; this sends it setup commands")
+    p.add_argument("--ops", action="store_true",
+                   help="use the OPS243-A in rolling-buffer mode through OpenFlight's code "
+                        "(ball speed, club speed, spin)")
+    p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
     p.add_argument("--iwr", action="store_true",
                    help="use the TI radar through OpenFlight's code for launch angle")
     p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
@@ -501,6 +528,16 @@ def main():
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
     threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
 
+    ops = None
+    if args.ops:
+        if args.ops_speed_mode:
+            print("--ops and --ops-speed-mode can't be used together; using --ops")
+            radar = None
+        try:
+            from iwr_bridge import OPSBridge
+            ops = OPSBridge(args)
+        except Exception as e:
+            print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
     bridge = None
     if args.iwr:
         try:
@@ -546,7 +583,7 @@ def main():
                                  radar.window(trigger_time - 0.6, time.monotonic())]
                     print("Radar readings (ms from trigger, mph):",
                           radar_log if radar_log else "none")
-                if bridge is not None:
+                if bridge is not None or ops is not None:
                     metrics["radar_pending"] = True
                 save_metrics(folder, metrics, radar_log)
                 with K.lock:
@@ -554,9 +591,9 @@ def main():
                     K.video = "pending" if folder else "none"
                     K.shot += 1
                     K.rev += 1
-                if bridge is not None:
-                    threading.Thread(target=add_iwr_result,
-                                     args=(bridge, K.shot, trigger_time, folder, radar_log, args),
+                if bridge is not None or ops is not None:
+                    threading.Thread(target=add_radar_results,
+                                     args=(bridge, ops, K.shot, trigger_time, folder, radar_log),
                                      daemon=True).start()
                 shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
                 print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'}")
@@ -606,6 +643,8 @@ def main():
         sh.running = False
         if bridge is not None:
             bridge.stop()
+        if ops is not None:
+            ops.stop()
         if browser is not None:
             browser.terminate()
         time.sleep(0.2)

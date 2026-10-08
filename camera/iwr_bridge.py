@@ -1,5 +1,9 @@
 """
-Bridge between our kiosk and OpenFlight's IWR6843 code.
+Bridges between our kiosk and OpenFlight's radar code.
+
+IWRBridge: the TI IWR6843LEVM (launch angle).
+OPSBridge: the OPS243-A in rolling-buffer mode (ball speed, club speed, spin).
+Both are driven by the shared sound trigger.
 
 OpenFlight's code handles the TI radar: it watches the sound trigger on GPIO17,
 tells the radar to hand over its capture, and turns that capture into a launch
@@ -17,12 +21,17 @@ import threading
 import time
 
 
+def _openflight_root(args):
+    root = os.path.expanduser(args.openflight)
+    src = os.path.join(root, "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    return root
+
+
 class IWRBridge:
     def __init__(self, args, on_trigger=None):
-        root = os.path.expanduser(args.openflight)
-        src = os.path.join(root, "src")
-        if src not in sys.path:
-            sys.path.insert(0, src)
+        root = _openflight_root(args)
         from openflight.iwr6843 import Calibration, process_dump
         from openflight.iwr6843.monitor import IWR6843CaptureMonitor, tx_order_from_config
 
@@ -113,3 +122,60 @@ class IWRBridge:
             self.monitor.stop()
         except Exception as e:
             print(f"TI radar stop: {e}")
+
+
+class OPSBridge:
+    """Runs OpenFlight's rolling-buffer monitor for the OPS243-A.
+
+    It connects to the radar, keeps its trigger pin set up as an input, collects
+    the raw samples after every sound trigger, re-arms the radar, and works out
+    ball speed, club speed and spin. Only real shots come out: triggers with
+    nothing flying away from the radar (claps) are dropped by OpenFlight's code.
+    """
+
+    def __init__(self, args):
+        _openflight_root(args)
+        from openflight.rolling_buffer import RollingBufferMonitor
+
+        self.lock = threading.Lock()
+        self.shots = []    # (arrival time, Shot)
+        self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type="sound",
+                                            sample_rate_ksps=args.ops_ksps)
+        if not self.monitor.connect():
+            raise RuntimeError(f"could not connect on {args.radar_port}")
+        self.monitor.start(shot_callback=self._on_shot)
+        print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode)")
+
+    def _on_shot(self, shot):
+        now = time.monotonic()
+        with self.lock:
+            self.shots = [s for s in self.shots if now - s[0] < 120] + [(now, shot)]
+        print(f"[{time.strftime('%H:%M:%S')}] Speed radar shot: "
+              f"ball {getattr(shot, 'ball_speed_mph', None)} mph, "
+              f"club {getattr(shot, 'club_speed_mph', None)} mph, "
+              f"spin {getattr(shot, 'spin_rpm', None)} rpm")
+
+    def result_for(self, shot_time, wait_s=12.0):
+        """The speed radar's shot that goes with a camera shot, or None.
+
+        Its data arrives a couple of seconds after impact, so this waits."""
+        deadline = time.monotonic() + wait_s
+        while True:
+            with self.lock:
+                near = [s for s in self.shots if shot_time - 1.0 <= s[0] <= shot_time + 10.0]
+            if near:
+                shot = min(near, key=lambda s: abs(s[0] - shot_time))[1]
+                return {"ball_speed": getattr(shot, "ball_speed_mph", None),
+                        "club_speed": getattr(shot, "club_speed_mph", None),
+                        "spin": getattr(shot, "spin_rpm", None),
+                        "carry": getattr(shot, "estimated_carry_yards", None)}
+            if time.monotonic() > deadline:
+                return None
+            time.sleep(0.1)
+
+    def stop(self):
+        for step in (self.monitor.stop, self.monitor.disconnect):
+            try:
+                step()
+            except Exception as e:
+                print(f"Speed radar stop: {e}")
