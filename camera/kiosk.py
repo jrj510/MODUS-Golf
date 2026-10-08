@@ -400,7 +400,14 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
             if m.get("ball_speed") is None and r["ball_speed"] is not None:
                 m["ball_speed"] = round(r["ball_speed"], 1)
         if m.get("ball_speed") and m.get("club_speed"):
-            m["smash"] = round(m["ball_speed"] / m["club_speed"], 2)
+            smash = m["ball_speed"] / m["club_speed"]
+            if 0.8 <= smash <= 1.6:
+                m["smash"] = round(smash, 2)
+            else:
+                # No real strike gives this ratio: the club reading is wrong.
+                print(f"Shot {shot}: club speed {m['club_speed']} mph doesn't fit ball speed "
+                      f"{m['ball_speed']} mph (smash {smash:.2f}); not shown")
+                m["club_speed_rejected"] = m.pop("club_speed")
         if m.get("ball_speed") and m.get("launch_angle"):
             m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
         elif o and o.get("carry"):
