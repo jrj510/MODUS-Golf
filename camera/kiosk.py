@@ -122,7 +122,7 @@ for(const [k,label,unit] of TILES){
               '<div class="unit" id="u_'+k+'">'+unit+'</div>';
   main.appendChild(t);
 }
-let view='main',shot=-1,video='none';
+let view='main',shot=-1,rev=-1,video='none';
 function post(a){fetch('/'+a,{method:'POST'});}
 function show(v){
   view=v;
@@ -135,16 +135,20 @@ async function tick(){
     const s=await (await fetch('/state')).json();
     const st=STATUS[s.state]||[s.state,'#fff'];
     $('stext').textContent=st[0];$('dot').style.background=st[1];
-    if(s.shot!=shot){
-      shot=s.shot;
+    if(s.rev!=rev){
+      rev=s.rev;
+      const waiting=s.metrics.radar_pending?['ball_speed','launch_angle','carry','launch_dir']:[];
       for(const [k,label,unit,dp] of TILES){
-        const v=s.metrics[k],el=$('m_'+k);
-        el.textContent=(v===null||v===undefined)?'--':Number(v).toFixed(dp);
-        el.classList.toggle('none',v===null||v===undefined);
-        $('u_'+k).textContent=unit+((k=='carry'&&s.metrics.carry_estimated&&v!=null)?' est.':'');
+        const v=s.metrics[k],el=$('m_'+k),none=(v===null||v===undefined);
+        el.textContent=none?(waiting.includes(k)?'...':'--'):Number(v).toFixed(dp);
+        el.classList.toggle('none',none);
+        $('u_'+k).textContent=unit+((k=='carry'&&s.metrics.carry_estimated&&!none)?' est.':'');
         $('t_'+k).classList.add('fresh');
       }
       setTimeout(()=>{for(const [k] of TILES)$('t_'+k).classList.remove('fresh');},1500);
+    }
+    if(s.shot!=shot){
+      shot=s.shot;
       $('shotno').textContent=shot>0?'Shot '+shot:'';
       if(view=='preview')show(s.video=='none'||s.video=='deleted'?'main':'preview');
     }
@@ -173,6 +177,7 @@ class Kiosk:
         self.lock = threading.Lock()
         self.state = "STARTING"
         self.shot = 0
+        self.rev = 0           # goes up whenever the numbers on screen change
         self.metrics = empty_metrics()
         self.replay = []        # JPEG frames of the latest shot
         self.folder = None      # where the latest shot is saved
@@ -219,7 +224,7 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             if path == "/state":
-                body = json.dumps({"state": K.state, "shot": K.shot,
+                body = json.dumps({"state": K.state, "shot": K.shot, "rev": K.rev,
                                    "metrics": K.metrics, "video": K.video}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -356,6 +361,39 @@ def shot_metrics(radar, trigger_time, args):
     return m
 
 
+def save_metrics(folder, metrics, radar_log):
+    if folder and os.path.isdir(folder):
+        with open(os.path.join(folder, "metrics.json"), "w") as f:
+            json.dump({"metrics": metrics, "radar_readings": radar_log}, f, indent=2)
+
+
+def add_iwr_result(bridge, shot, trigger_time, folder, radar_log, args):
+    """Wait for the TI radar's answer for this shot and put it on screen."""
+    r = bridge.result_for(trigger_time)
+    with K.lock:
+        if K.shot != shot:
+            return                      # a newer shot has already replaced this one
+        m = dict(K.metrics)
+        m["radar_pending"] = False
+        m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
+        if r["launch_angle"] is not None:
+            m["launch_angle"] = round(r["launch_angle"], 1)
+        if m.get("ball_speed") is None and r["ball_speed"] is not None:
+            m["ball_speed"] = round(r["ball_speed"], 1)
+        if m.get("ball_speed") and m.get("launch_angle"):
+            m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
+        if m.get("ball_speed") and m.get("club_speed"):
+            m["smash"] = round(m["ball_speed"] / m["club_speed"], 2)
+        K.metrics = m
+        K.rev += 1
+    save_metrics(folder if K.folder == folder else None, m, radar_log)
+    if r["error"]:
+        print(f"Shot {shot}: TI radar gave no angle ({r['error']})")
+    else:
+        print(f"Shot {shot}: launch angle {m.get('launch_angle')} deg, "
+              f"ball speed {m.get('ball_speed')} mph (TI radar, quality {r['quality']})")
+
+
 def open_browser(url):
     """Open Chromium full screen on the Pi's own display."""
     exe = shutil.which("chromium") or shutil.which("chromium-browser")
@@ -405,7 +443,22 @@ def main():
     p.add_argument("--swing-fraction", type=float, default=0.015,
                    help="share of the picture that must change in one frame to count as a swing")
     p.add_argument("--radar-port", default="/dev/ttyACM0", help="OPS243-A serial port")
-    p.add_argument("--no-radar", action="store_true", help="run without the speed radar")
+    p.add_argument("--ops-speed-mode", action="store_true",
+                   help="read plain speed readings from the OPS243-A. Only for a radar NOT set up in "
+                        "rolling-buffer mode; this sends it setup commands")
+    p.add_argument("--iwr", action="store_true",
+                   help="use the TI radar through OpenFlight's code for launch angle")
+    p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
+    p.add_argument("--iwr-port", default="/dev/ttyUSB0")
+    p.add_argument("--iwr-config", default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg")
+    p.add_argument("--iwr-tee-m", type=float, default=1.575, help="radar to tee distance, m")
+    p.add_argument("--iwr-net-m", type=float, default=4.6, help="radar to net distance, m")
+    p.add_argument("--iwr-tilt-deg", type=float, default=10.4, help="radar upward tilt, degrees")
+    p.add_argument("--iwr-radar-height-m", type=float, default=0.1524,
+                   help="antenna centre height above the floor, m")
+    p.add_argument("--iwr-ball-height-m", type=float, default=0.040,
+                   help="ball centre height above the floor, m")
+    p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
     p.add_argument("--min-speed", type=float, default=10.0,
                    help="ignore radar readings slower than this (mph)")
     p.add_argument("--assume-launch", type=float, default=0.0,
@@ -423,7 +476,7 @@ def main():
     browser = None if args.no_browser else open_browser(url)
     print(f"Kiosk page: {url}  (also http://modus.local:{args.port} from the laptop)")
 
-    radar = None if args.no_radar else Radar(args.radar_port)
+    radar = Radar(args.radar_port) if args.ops_speed_mode else None
 
     model = None
     if not args.swing_test:
@@ -448,7 +501,16 @@ def main():
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
     threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
 
-    if "sound" in args.triggers:
+    bridge = None
+    if args.iwr:
+        try:
+            from iwr_bridge import IWRBridge
+            # OpenFlight's monitor owns GPIO17; each sound trigger is passed on to
+            # the camera so it can capture the shot too.
+            bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"))
+        except Exception as e:
+            print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
+    if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice
             gate = DigitalInputDevice(17, pull_up=False)
@@ -476,13 +538,26 @@ def main():
                                        [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
                           for f in window]
                 metrics = shot_metrics(radar, trigger_time, args)
-                if folder:
-                    with open(os.path.join(folder, "metrics.json"), "w") as f:
-                        json.dump(metrics, f, indent=2)
+                # Every radar reading around the shot, as (milliseconds from the
+                # trigger, mph). Printed and saved so the club/ball rule can be tuned.
+                radar_log = []
+                if radar is not None and radar.ok:
+                    radar_log = [(round((t - trigger_time) * 1000), round(s, 1)) for t, s in
+                                 radar.window(trigger_time - 0.6, time.monotonic())]
+                    print("Radar readings (ms from trigger, mph):",
+                          radar_log if radar_log else "none")
+                if bridge is not None:
+                    metrics["radar_pending"] = True
+                save_metrics(folder, metrics, radar_log)
                 with K.lock:
                     K.replay, K.folder, K.metrics = replay, folder, metrics
                     K.video = "pending" if folder else "none"
                     K.shot += 1
+                    K.rev += 1
+                if bridge is not None:
+                    threading.Thread(target=add_iwr_result,
+                                     args=(bridge, K.shot, trigger_time, folder, radar_log, args),
+                                     daemon=True).start()
                 shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
                 print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'}")
                 with sh.lock:
@@ -529,6 +604,8 @@ def main():
         K.drop_undecided()
         K.quit = True
         sh.running = False
+        if bridge is not None:
+            bridge.stop()
         if browser is not None:
             browser.terminate()
         time.sleep(0.2)

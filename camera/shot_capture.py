@@ -122,7 +122,7 @@ class Shared:
 def new_track():
     """Bookkeeping for the ready logic."""
     return {"center": None, "still_since": None, "lost_since": None, "box": None,
-            "far": False}
+            "far": False, "confirmed_at": None}
 
 
 def _patch_diff(sh, gray):
@@ -210,11 +210,14 @@ def update_ready(sh, args, gray, ball, trk, now):
             center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels
         if same:
             trk["lost_since"] = None
+            trk["confirmed_at"] = now
             trk["box"] = ball
             if diff is not None and diff <= args.motion_threshold * 0.5:
                 _set_patch(sh, gray, ball)  # follow slow lighting changes
             return "READY"
-        if diff is not None and diff <= args.motion_threshold:
+        blind = now - (trk["confirmed_at"] or now)
+        if diff is not None and diff <= args.motion_threshold \
+                and blind <= getattr(args, "blind_seconds", 30.0):
             trk["lost_since"] = None
             return "READY"  # the ball's patch is unchanged, so it is still there
         if trk["lost_since"] is None:
@@ -240,14 +243,72 @@ def update_ready(sh, args, gray, ball, trk, now):
         _set_patch(sh, gray, ball)
         sh.armed = True
         trk["lost_since"] = None
+        trk["confirmed_at"] = now
         return "READY"
     return "BALL"
 
 
+class PatchWatch:
+    """Tells a shot apart from the club being set down behind the ball.
+
+    It is fed, frame by frame, how much the ball's patch differs from its
+    reference picture.
+
+    A shot: the patch changes all at once (the ball is there in one frame and
+    gone a frame or two later) and then stays put. That returns "trigger".
+
+    A club arriving at address: the patch keeps changing over many frames as
+    the club creeps in, then settles. That does not trigger. Once it has been
+    steady for a moment it returns "reref", meaning "accept this as the new
+    normal picture", so the shot can still be caught from there.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.hist = collections.deque(maxlen=16)
+        self.n = 0
+        self.cand = None
+        self.steady_since = None
+
+    def step(self, diff, now, thr):
+        h = self.hist
+        h.append(diff)
+        self.n += 1
+        # A jump of most of the threshold within three frames starts a check.
+        # The patch must have been still just before the jump: a club that is
+        # already creeping in does not count.
+        if self.cand is None and len(h) >= 7 and diff - h[-4] > 0.8 * thr \
+                and abs(h[-4] - h[-7]) < 0.25 * thr:
+            self.cand = (self.n, h[-4])
+        if self.cand is not None:
+            k, base = self.cand
+            if self.n - k == 4:
+                self.cand = None
+                rise_end = diff - base        # change four frames after the jump
+                rise_early = h[-4] - base     # change one frame after the jump
+                # A shot has finished changing almost at once; a creeping club
+                # is still changing four frames later.
+                if rise_end > 0.8 * thr and rise_early >= 0.75 * rise_end:
+                    return "trigger"
+        if self.cand is None and len(h) >= 4 and diff > 0.5 * thr \
+                and abs(diff - h[-4]) < 0.15 * thr:
+            if self.steady_since is None:
+                self.steady_since = now
+            elif now - self.steady_since >= 0.4:
+                self.reset()
+                return "reref"
+        else:
+            self.steady_since = None
+        return None
+
+
 def camera_thread(cam, sh, args):
     """Grab every frame at full speed into the rolling memory."""
-    count, t0, hits = 0, time.monotonic(), 0
+    count, t0 = 0, time.monotonic()
     prev_small = None
+    watch = PatchWatch()
     while sh.running:
         req = cam.capture_request()
         try:
@@ -259,14 +320,22 @@ def camera_thread(cam, sh, args):
         sh.frames.append((now, sensor_ns, img))
         sh.latest = img
 
-        # Motion trigger: has the patch where the ball sat changed a lot?
+        # Motion trigger: has the ball suddenly gone from where it was sitting?
         if "motion" in args.triggers and sh.armed and sh.trigger_time is None:
             diff = _patch_diff(sh, img)
-            # Three frames in a row must differ, so one noisy frame can't fire it.
-            hits = hits + 1 if diff is not None and diff > args.motion_threshold else 0
-            if hits >= 3:
-                hits = 0
-                sh.trigger("motion")
+            if diff is None:
+                watch.reset()
+            else:
+                verdict = watch.step(diff, now, args.motion_threshold)
+                if verdict == "trigger":
+                    watch.reset()
+                    sh.trigger("motion")
+                elif verdict == "reref" and sh.roi is not None:
+                    # Something (usually the club) has settled beside the ball.
+                    x0, y0, x1, y1 = sh.roi
+                    sh.roi_ref = img[y0:y1, x0:x1].copy()
+        else:
+            watch.reset()
 
         # Swing test (no ball): fire when a lot of the picture changes between two
         # consecutive frames. A club at full speed does that; slow movement at
