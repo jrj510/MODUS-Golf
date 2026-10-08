@@ -155,14 +155,15 @@ class OPSBridge:
               f"club {getattr(shot, 'club_speed_mph', None)} mph, "
               f"spin {getattr(shot, 'spin_rpm', None)} rpm")
 
-    def result_for(self, shot_time, wait_s=12.0):
+    def result_for(self, shot_time, wait_s=35.0):
         """The speed radar's shot that goes with a camera shot, or None.
 
-        Its data arrives a couple of seconds after impact, so this waits."""
+        Its data arrives a few seconds after impact (up to ~20 s when the TI
+        radar is sending its capture at the same time), so this waits."""
         deadline = time.monotonic() + wait_s
         while True:
             with self.lock:
-                near = [s for s in self.shots if shot_time - 1.0 <= s[0] <= shot_time + 10.0]
+                near = [s for s in self.shots if shot_time - 1.0 <= s[0] <= shot_time + 30.0]
             if near:
                 shot = min(near, key=lambda s: abs(s[0] - shot_time))[1]
                 return {"ball_speed": getattr(shot, "ball_speed_mph", None),
