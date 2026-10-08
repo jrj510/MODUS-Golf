@@ -29,6 +29,27 @@ def _openflight_root(args):
     return root
 
 
+def _summary(m):
+    """The small fields of OpenFlight's result (numbers, text, flags), so the
+    log shows why a capture was rejected. Big arrays are left out."""
+    try:
+        fields = dataclasses.asdict(m) if dataclasses.is_dataclass(m) else dict(vars(m))
+    except Exception:
+        return repr(m)[:600]
+    out = {}
+    for k, v in fields.items():
+        if getattr(v, "ndim", None) == 0 and hasattr(v, "item"):
+            v = v.item()   # a single numpy number
+        if isinstance(v, float):
+            out[k] = round(v, 3)
+        elif isinstance(v, (int, bool, str)) or v is None:
+            out[k] = v if not isinstance(v, str) else v[:120]
+        elif isinstance(v, (list, tuple)) and len(v) <= 8 and all(
+                isinstance(x, (int, float, str, bool)) for x in v):
+            out[k] = list(v)
+    return out
+
+
 class IWRBridge:
     def __init__(self, args, on_trigger=None):
         root = _openflight_root(args)
@@ -94,6 +115,7 @@ class IWRBridge:
                 m = self._process(capture.raw, self.cal, net_range_m=self.net_m,
                                   tx_order=self.tx_order)
                 result["quality"] = m.quality
+                print(f"[{time.strftime('%H:%M:%S')}] TI radar details: {_summary(m)}")
                 if m.ball_found and m.quality != "reject":
                     result["launch_angle"] = m.launch_angle_deg
                     result["ball_speed"] = m.ball_speed_corrected_mph or m.ball_speed_mph
