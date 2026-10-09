@@ -103,7 +103,8 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
 </div>
 <div id="camera" class="view hide">
   <img id="live">
-  <div class="bar"><button onclick="show('main')">Back</button></div>
+  <div class="bar"><button onclick="show('main')">Back</button>
+    <span id="vmsg">Tap the ball to aim the camera there</span></div>
 </div>
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
@@ -124,6 +125,14 @@ for(const [k,label,unit] of TILES){
 }
 let view='main',shot=-1,rev=-1,video='none';
 function post(a){fetch('/'+a,{method:'POST'});}
+// Tap the ball in the live view: the ball search moves to that spot.
+$('live').addEventListener('click',e=>{
+  const img=e.target,r=img.getBoundingClientRect();
+  const s=Math.min(r.width/img.naturalWidth,r.height/img.naturalHeight);
+  const w=img.naturalWidth*s,h=img.naturalHeight*s;
+  const x=(e.clientX-r.left-(r.width-w)/2)/w,y=(e.clientY-r.top-(r.height-h)/2)/h;
+  if(x>=0&&x<=1&&y>=0&&y<=1)fetch('/aim?x='+x.toFixed(4)+'&y='+y.toFixed(4),{method:'POST'});
+});
 function show(v){
   view=v;
   for(const n of ['main','preview','camera'])$(n).classList.toggle('hide',n!=v);
@@ -172,6 +181,9 @@ def empty_metrics():
             "spin": None, "club_path": None}
 
 
+AREA_FILE = "search_area.txt"   # where a tapped search area is remembered
+
+
 class Kiosk:
     def __init__(self):
         self.lock = threading.Lock()
@@ -183,6 +195,25 @@ class Kiosk:
         self.folder = None      # where the latest shot is saved
         self.video = "none"     # none / pending / kept / deleted
         self.quit = False
+        self.args = None
+        self.reset_track = False
+
+    def aim(self, fx, fy):
+        """Centre the ball search on a spot tapped in the live view (0-1 of the
+        picture's width and height), and remember it for the next start."""
+        if self.args is None:
+            return
+        x, y = int(fx * WIDTH), int(fy * HEIGHT)
+        area = (max(x - 110, 0), max(y - 25, 0), min(x + 110, WIDTH), min(y + 30, HEIGHT))
+        self.args.search_area = ",".join(str(v) for v in area)
+        self.reset_track = True
+        try:
+            os.makedirs(self.args.out, exist_ok=True)
+            with open(os.path.join(self.args.out, AREA_FILE), "w") as f:
+                f.write(self.args.search_area)
+        except OSError as e:
+            print(f"Could not save the search area: {e}")
+        print(f"Search area set by tap: {self.args.search_area}")
 
     def decide(self, action):
         """Save or delete the latest shot's video."""
@@ -237,6 +268,20 @@ class Handler(BaseHTTPRequestHandler):
                     jpeg = STREAM.get()
                     if jpeg is not None:
                         self._send_jpeg(jpeg)
+            elif path == "/frame.png":
+                # The exact picture the ball finder last looked at, for tuning.
+                gray = getattr(K, "latest_gray", None)
+                ok, png = cv2.imencode(".png", gray) if gray is not None else (False, None)
+                if not ok:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Disposition", 'attachment; filename="frame.png"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(png.tobytes())
             elif path == "/replay.mjpg":
                 self._mjpeg_headers()
                 shot, frames = K.shot, K.replay
@@ -256,7 +301,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
-        action = self.path.strip("/")
+        action = self.path.split("?")[0].strip("/")
+        if action == "aim":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            try:
+                K.aim(float(q["x"]), float(q["y"]))
+            except (KeyError, ValueError):
+                pass
         if action == "quit":
             K.quit = True
         elif action in ("keep", "delete"):
@@ -506,6 +557,16 @@ def main():
     args.swing_test = args.no_ball
     if args.swing_test:
         args.triggers.discard("motion")  # there is no ball patch to watch
+    # A search area set by tapping the ball last time wins over --search-area.
+    try:
+        with open(os.path.join(args.out, AREA_FILE)) as f:
+            saved = f.read().strip()
+        if saved:
+            args.search_area = saved
+            print(f"Using the search area you last tapped: {saved}")
+    except OSError:
+        pass
+    K.args = args
 
     url = f"http://localhost:{args.port}"
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
@@ -574,6 +635,11 @@ def main():
     try:
         while not K.quit:
             loop_start = time.monotonic()
+            if K.reset_track:             # the search area was just moved by a tap
+                K.reset_track = False
+                trk.update(new_track())
+                sh.armed = False
+                sh.roi = sh.roi_ref = None
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
@@ -632,8 +698,12 @@ def main():
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"]
 
+            K.latest_gray = gray
             # Live picture for the Camera view, with a box round the ball.
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            if args.search_area:
+                a = [int(float(v)) for v in args.search_area.split(",")]
+                cv2.rectangle(view, (a[0], a[1]), (a[2], a[3]), (255, 200, 0), 1)
             if ball and K.state in ("BALL", "READY"):
                 color = (0, 255, 0) if K.state == "READY" else (0, 200, 255)
                 cv2.rectangle(view, (ball[0], ball[1]), (ball[2], ball[3]), color, 2)

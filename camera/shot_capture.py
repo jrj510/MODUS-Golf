@@ -203,29 +203,47 @@ def find_ball_spot(gray, args, near=None):
     # The threshold follows the picture's brightness, so a dark, fast-exposure
     # frame works as well as a bright one (18 means 18% of the mat's brightness).
     c = getattr(args, "blob_contrast", 18.0) * max(float(img.mean()), 20.0) / 100.0
-    mask = (np.abs(dev) > c).astype(np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    n, labels, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
-
     rmin, rmax = getattr(args, "blob_min_radius", 3.0), getattr(args, "blob_max_radius", 25.0)
+    kernel = np.ones((3, 3), np.uint8)
+
+    def parts(mask):
+        """Connected spots in a mask: (x0, y0, x1, y1, pixel count)."""
+        mask = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        n, _, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        return [(st[i][0], st[i][1], st[i][0] + st[i][2], st[i][1] + st[i][3], st[i][4])
+                for i in range(1, n)]
+
+    bright, dark = parts(dev > c), parts(dev < -c)
+    # A ball lit from above is a bright cap with its own shadow right under it:
+    # join each such pair into one candidate.
+    candidates = [(b, False) for b in bright] + [(d, False) for d in dark]
+    for b in bright:
+        for d in dark:
+            overlap = min(b[2], d[2]) - max(b[0], d[0])
+            if overlap > 0.5 * min(b[2] - b[0], d[2] - d[0]) and 0 <= d[1] - b[3] <= 3 \
+                    and d[1] >= b[1]:
+                joined = (min(b[0], d[0]), b[1], max(b[2], d[2]), d[3], b[4] + d[4])
+                candidates.append((joined, True))
+
     best, best_score = None, 0.0
-    for i in range(1, n):
-        bx, by, bw, bh, area = stats[i]
+    for (bx0, by0, bx1, by1, count), pair in candidates:
+        bw, bh = bx1 - bx0, by1 - by0
         r = (bw + bh) / 4.0
-        if not (rmin <= r <= rmax) or not (0.5 <= bw / max(bh, 1) <= 2.0):
+        if not (rmin <= r <= rmax) or not (0.6 <= bw / max(bh, 1) <= 1.7):
             continue
-        if area / float(bw * bh) < 0.45:
+        if count / float(bw * bh) < 0.45:
             continue
-        d = dev[labels == i]
-        score = float(np.abs(d).mean())
-        if (d > c).any() and (d < -c).any():
+        patch = np.abs(dev[by0:by1, bx0:bx1])
+        score = float(patch[patch > c].mean()) if (patch > c).any() else 0.0
+        score *= 1.0 - min(abs(np.log(bw / max(bh, 1))), 0.5)   # rounder is better
+        if pair:
             score *= 1.5               # bright top and shadowed bottom: looks like a ball
         if near is not None:
-            cx, cy = centers[i]
-            score /= 1.0 + np.hypot(cx + x0 - near[0], cy + y0 - near[1]) / 20.0
+            cx, cy = (bx0 + bx1) / 2 + x0, (by0 + by1) / 2 + y0
+            score /= 1.0 + np.hypot(cx - near[0], cy - near[1]) / 20.0
         if score > best_score:
             best_score = score
-            best = [int(bx + x0), int(by + y0), int(bx + bw + x0), int(by + bh + y0)]
+            best = [int(bx0 + x0), int(by0 + y0), int(bx1 + x0), int(by1 + y0)]
     return best
 
 
