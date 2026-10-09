@@ -155,7 +155,7 @@ def add_blob_args(p):
     p.add_argument("--blob", action="store_true",
                    help="also find a distant ball the model misses (a small spot that stands out from the mat)")
     p.add_argument("--blob-contrast", type=float, default=18.0,
-                   help="how much the ball must differ from the mat around it (0-255)")
+                   help="how much the ball must differ from the mat around it, percent of its brightness")
     p.add_argument("--blob-min-radius", type=float, default=3.0, help="smallest ball radius, pixels")
     p.add_argument("--blob-max-radius", type=float, default=25.0, help="largest ball radius, pixels")
     p.add_argument("--search-area", default=None,
@@ -172,9 +172,14 @@ def _search_area(args):
 
 
 def _inside_area(args, box):
+    """True if a box from the model could be the ball: roughly square, not
+    huge, and (with --search-area) entirely inside the search area."""
+    w, h = box[2] - box[0], box[3] - box[1]
+    if w <= 0 or h <= 0 or not (0.6 <= w / h <= 1.6) or max(w, h) > 120:
+        return False
     x0, y0, x1, y1 = _search_area(args)
-    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
-    return x0 <= cx <= x1 and y0 <= cy <= y1
+    m = 4   # small allowance at the edges
+    return box[0] >= x0 - m and box[1] >= y0 - m and box[2] <= x1 + m and box[3] <= y1 + m
 
 
 def find_ball_spot(gray, args, near=None):
@@ -193,9 +198,11 @@ def find_ball_spot(gray, args, near=None):
         x1, y1 = min(x1, int(near[0]) + r), min(y1, int(near[1]) + r)
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
-    img = gray[y0:y1, x0:x1].astype(np.float32)
+    img = cv2.GaussianBlur(gray[y0:y1, x0:x1].astype(np.float32), (5, 5), 0)  # calm the noise
     dev = img - cv2.blur(img, (51, 1))
-    c = getattr(args, "blob_contrast", 18.0)
+    # The threshold follows the picture's brightness, so a dark, fast-exposure
+    # frame works as well as a bright one (18 means 18% of the mat's brightness).
+    c = getattr(args, "blob_contrast", 18.0) * max(float(img.mean()), 20.0) / 100.0
     mask = (np.abs(dev) > c).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     n, labels, stats, centers = cv2.connectedComponentsWithStats(mask, connectivity=8)
