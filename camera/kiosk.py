@@ -418,25 +418,14 @@ def save_metrics(folder, metrics, radar_log):
             json.dump({"metrics": metrics, "radar_readings": radar_log}, f, indent=2)
 
 
-def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
-    """Wait for both radars' answers for this shot and put them on screen."""
-    results = {}
-    jobs = []
-    if iwr is not None:
-        jobs.append(threading.Thread(target=lambda: results.update(iwr=iwr.result_for(trigger_time))))
-    if ops is not None:
-        jobs.append(threading.Thread(target=lambda: results.update(ops=ops.result_for(trigger_time))))
-    for j in jobs:
-        j.start()
-    for j in jobs:
-        j.join()
-    o, r = results.get("ops"), results.get("iwr")
-
+def _publish(shot, o, r, final):
+    """Show the radar numbers for this shot. Returns the metrics, or None if a
+    newer shot has replaced it."""
     with K.lock:
         if K.shot != shot:
-            return                      # a newer shot has already replaced this one
+            return None
         m = dict(K.metrics)
-        m["radar_pending"] = False
+        m["radar_pending"] = not final
         if o:
             if o["ball_speed"] is not None:
                 m["ball_speed"] = round(o["ball_speed"], 1)
@@ -456,16 +445,41 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
                 m["smash"] = round(smash, 2)
             else:
                 # No real strike gives this ratio: the club reading is wrong.
-                print(f"Shot {shot}: club speed {m['club_speed']} mph doesn't fit ball speed "
-                      f"{m['ball_speed']} mph (smash {smash:.2f}); not shown")
+                if final:
+                    print(f"Shot {shot}: club speed {m['club_speed']} mph doesn't fit ball speed "
+                          f"{m['ball_speed']} mph (smash {smash:.2f}); not shown")
                 m["club_speed_rejected"] = m.pop("club_speed")
+                m.pop("smash", None)
         if m.get("ball_speed") and m.get("launch_angle"):
             m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
         elif o and o.get("carry"):
             m["carry"] = round(o["carry"])
         K.metrics = m
         K.rev += 1
+        return m
+
+
+def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
+    """Put the radars' answers for this shot on screen: the speed radar's
+    numbers as soon as they arrive (a few seconds), then the TI radar's launch
+    angle when its capture has been processed (several seconds more)."""
+    o = ops.result_for(trigger_time, wait_s=12.0) if ops is not None else None
+    m = _publish(shot, o, None, final=(iwr is None or o is None))
+    if m is None:
+        return                          # a newer shot has already replaced this one
+    r = None
+    if iwr is not None:
+        # The TI radar is guided by the speed radar's shot, so without one there
+        # is nothing to wait for.
+        r = iwr.result_for(trigger_time, wait_s=30.0) if o else {
+            "launch_angle": None, "ball_speed": None, "quality": None,
+            "error": "no speed-radar shot to guide the TI radar"}
+        m = _publish(shot, o, r, final=True)
+        if m is None:
+            return
     save_metrics(folder if K.folder == folder else None, m, radar_log)
+    if getattr(K, "sim", None) is not None and o:
+        K.sim.send(o.get("shot"), r.get("launch_angle") if r else None)
 
     if ops is not None and not o:
         print(f"Shot {shot}: speed radar gave no reading (no ball seen flying away from it)")
@@ -547,6 +561,14 @@ def main():
     p.add_argument("--iwr-ball-height-m", type=float, default=0.040,
                    help="ball centre height above the floor, m")
     p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
+    p.add_argument("--sim", action="store_true",
+                   help="send each shot to a golf simulator (OpenGolfSim by default)")
+    p.add_argument("--sim-type", default="opengolfsim", choices=("opengolfsim", "gspro", "partee"))
+    p.add_argument("--sim-host", default="192.168.137.1",
+                   help="IP address of the computer running the simulator")
+    p.add_argument("--sim-port", type=int, default=0, help="0 = the simulator's usual port")
+    p.add_argument("--sim-club", default="",
+                   help="club the simulator should assume, e.g. driver, 7i, pw (default: OpenFlight's)")
     p.add_argument("--min-speed", type=float, default=10.0,
                    help="ignore radar readings slower than this (mph)")
     p.add_argument("--assume-launch", type=float, default=0.0,
@@ -609,6 +631,16 @@ def main():
             ops = OPSBridge(args)
         except Exception as e:
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
+    K.sim = None
+    if args.sim:
+        if ops is None:
+            print("Simulator needs the speed radar (--ops); not sending shots")
+        else:
+            try:
+                from sim_bridge import SimBridge
+                K.sim = SimBridge(args)
+            except Exception as e:
+                print(f"Simulator not available ({type(e).__name__}: {e}); continuing without it")
     bridge = None
     if args.iwr:
         try:
@@ -725,6 +757,8 @@ def main():
             bridge.stop()
         if ops is not None:
             ops.stop()
+        if K.sim is not None:
+            K.sim.stop()
         if browser is not None:
             browser.terminate()
         time.sleep(0.2)

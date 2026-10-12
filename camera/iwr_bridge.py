@@ -229,7 +229,8 @@ class OPSBridge:
                 return {"ball_speed": getattr(shot, "ball_speed_mph", None),
                         "club_speed": getattr(shot, "club_speed_mph", None),
                         "spin": getattr(shot, "spin_rpm", None),
-                        "carry": getattr(shot, "estimated_carry_yards", None)}
+                        "carry": getattr(shot, "estimated_carry_yards", None),
+                        "shot": shot}
             if time.monotonic() > deadline:
                 return None
             time.sleep(0.1)
