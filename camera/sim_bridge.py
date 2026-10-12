@@ -17,6 +17,7 @@ import copy
 import dataclasses
 import json
 import os
+import pathlib
 import tempfile
 import threading
 import time
@@ -48,7 +49,7 @@ class SimBridge:
             json.dump({"connectors": [entry]}, f)
             path = f.name
         try:
-            cfgs = load_sim_config(path)
+            cfgs = load_sim_config(pathlib.Path(path))   # OpenFlight expects a Path
         finally:
             os.unlink(path)
         if not cfgs:
