@@ -3,9 +3,9 @@ Sends each shot to a golf simulator (OpenGolfSim, GSPro or PAR-TEE) using
 OpenFlight's simulator connector code.
 
 OpenGolfSim: pick the "Developer API" launch monitor in OpenGolfSim. It then
-listens on TCP port 3111 for shots in the OpenConnect V1 format, the same format
-GSPro uses. OpenFlight's connector keeps the connection open, reconnects if it
-drops and sends a heartbeat.
+listens on TCP port 3111 for shots in its own JSON format (one JSON message per
+line, see help.opengolfsim.com/desktop/apis). That format is written here
+directly. GSPro and PAR-TEE use OpenFlight's OpenConnect V1 connector.
 
 What is sent for each shot: ball speed (speed radar), vertical launch angle (TI
 radar; if it has none, OpenFlight's per-club typical value), horizontal launch
@@ -18,6 +18,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import socket
 import tempfile
 import threading
 import time
@@ -31,14 +32,27 @@ class SimBridge:
         from openflight.sim.config import load_sim_config
         from openflight.sim.resolver import resolve_shot
         from openflight.sim.types import PlayerState
+        self._resolve = resolve_shot
+        self.lock = threading.Lock()
+        self.state = "connecting"
+        self.player = PlayerState()
+        club = _club(args.sim_club)
+        if club is not None:
+            self.player.club = club
+
+        if args.sim_type == "opengolfsim":
+            self.connector = OpenGolfSimClient(args.sim_host, args.sim_port or 3111,
+                                               on_status=self._on_status)
+            self.cfg = self.connector
+            self.connector.start()
+            print(f"Simulator: sending shots to OpenGolfSim at "
+                  f"{args.sim_host}:{args.sim_port or 3111} (club {self.player.club})")
+            return
+
         try:
             from openflight.sim.codec import build_connector
         except ImportError:
             from openflight.sim.connector import build_connector
-
-        self._resolve = resolve_shot
-        self.lock = threading.Lock()
-        self.state = "connecting"
 
         # Let OpenFlight's own config loader fill in its defaults for this
         # simulator type (units, device ID, heartbeat).
@@ -55,11 +69,6 @@ class SimBridge:
         if not cfgs:
             raise RuntimeError("OpenFlight did not accept the simulator settings")
         self.cfg = cfgs[0]
-
-        self.player = PlayerState()
-        club = _club(args.sim_club)
-        if club is not None:
-            self.player.club = club
         self.connector = build_connector(self.cfg, on_status=self._on_status,
                                          on_inbound=self._on_inbound)
         self.connector.start()
@@ -120,6 +129,105 @@ class SimBridge:
             self.connector.stop()
         except Exception as e:
             print(f"Simulator stop: {e}")
+
+
+class OpenGolfSimClient:
+    """OpenGolfSim's Developer API: newline-separated JSON over TCP (port 3111).
+
+    Connects in the background, tells OpenGolfSim the device is ready, keeps
+    reconnecting if the connection drops, and prints the carry OpenGolfSim
+    reports back for each shot."""
+
+    def __init__(self, host, port, on_status=None):
+        self.host, self.port = host, port
+        self.on_status = on_status
+        self.sock = None
+        self.lock = threading.Lock()
+        self.running = False
+
+    def _status(self, state, message=""):
+        if self.on_status:
+            self.on_status("opengolfsim", _Status(state, message))
+
+    def start(self):
+        self.running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while self.running:
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=5)
+                sock.settimeout(None)
+                with self.lock:
+                    self.sock = sock
+                self._write({"type": "device", "status": "ready"})
+                self._status("connected")
+                self._read(sock)          # returns when the connection closes
+            except OSError as e:
+                self._status("reconnecting", str(e))
+            with self.lock:
+                self.sock = None
+            if self.running:
+                time.sleep(3)
+
+    def _read(self, sock):
+        buf = b""
+        while self.running:
+            data = sock.recv(4096)
+            if not data:
+                return
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("type") == "result":
+                    r = (msg.get("data") or msg).get("result") or {}
+                    carry = r.get("carry")
+                    total = r.get("total")
+                    if carry is not None:
+                        print(f"[{time.strftime('%H:%M:%S')}] OpenGolfSim: carry "
+                              f"{carry * 1.0936:.0f} yd" + (f", total {total * 1.0936:.0f} yd"
+                                                            if total is not None else ""))
+
+    def _write(self, payload):
+        data = (json.dumps(payload) + "\n").encode()
+        with self.lock:
+            if self.sock is None:
+                raise OSError("not connected")
+            self.sock.sendall(data)
+
+    def is_connected(self):
+        with self.lock:
+            return self.sock is not None
+
+    def send_shot(self, resolved):
+        clamp = lambda v, lo, hi: max(lo, min(hi, float(v or 0.0)))
+        self._write({"type": "shot", "unit": "imperial", "shot": {
+            "ballSpeed": round(float(resolved.ball_speed_mph), 2),
+            "verticalLaunchAngle": round(clamp(resolved.vla, 0, 45), 2),
+            "horizontalLaunchAngle": round(clamp(resolved.hla, -45, 45), 2),
+            "spinSpeed": round(float(resolved.total_spin_rpm or 0.0)),
+            "spinAxis": round(clamp(resolved.spin_axis_deg, -45, 45), 2)}})
+
+    def stop(self):
+        self.running = False
+        with self.lock:
+            sock, self.sock = self.sock, None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._status("stopped")
+
+
+class _Status:
+    def __init__(self, state, message=""):
+        self.state = type("S", (), {"value": state})()
+        self.message = message
 
 
 def _with(obj, **changes):
