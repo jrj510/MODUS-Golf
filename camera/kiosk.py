@@ -44,6 +44,8 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
+from ballflight import shot_flight
+from range_page import RANGE_PAGE
 from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, add_blob_args, camera_thread,
                           detect_ball, new_track, save_shot, update_ready)
 
@@ -89,6 +91,7 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
   <button id="pv" class="hide" onclick="show('preview')">Shot Preview</button>
   <span id="shotno"></span>
   <button id="cam" onclick="show('camera')">Camera</button>
+  <button id="rng" onclick="location.href='/range'">Range</button>
   <button id="quit" onclick="post('quit')">Exit</button>
 </div>
 <div id="main" class="view"></div>
@@ -197,6 +200,25 @@ class Kiosk:
         self.quit = False
         self.args = None
         self.reset_track = False
+        self.history = []       # flights of the last shots, for the range view
+
+    def test_shot(self, speed=None, launch=None):
+        """A pretend shot, for trying the screens without hitting a ball."""
+        import random
+        club = getattr(self.args, "club", "52") if self.args else "52"
+        speed = float(speed) if speed else random.uniform(55, 75)
+        f = shot_flight(speed, club, launch_angle=float(launch) if launch else None,
+                        direction=random.uniform(-4, 4))
+        f["test"] = True
+        with self.lock:
+            self.shot += 1
+            m = empty_metrics()
+            m.update(ball_speed=round(speed, 1), carry=round(f["carry"]),
+                     carry_estimated=True, flight=f, test=True)
+            self.metrics = m
+            self.history = (self.history + [dict(f, shot=self.shot, at=time.strftime("%H:%M:%S"))])[-30:]
+            self.rev += 1
+        print(f"Test shot {self.shot}: {speed:.1f} mph, carry {f['carry']:.0f} yd")
 
     def aim(self, fx, fy):
         """Centre the ball search on a spot tapped in the live view (0-1 of the
@@ -268,6 +290,20 @@ class Handler(BaseHTTPRequestHandler):
                     jpeg = STREAM.get()
                     if jpeg is not None:
                         self._send_jpeg(jpeg)
+            elif path in ("/range", "/range.html"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(RANGE_PAGE)
+            elif path == "/history":
+                with K.lock:
+                    body = json.dumps({"rev": K.rev, "shots": K.history}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/frame.png":
                 # The exact picture the ball finder last looked at, for tuning.
                 gray = getattr(K, "latest_gray", None)
@@ -302,6 +338,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         action = self.path.split("?")[0].strip("/")
+        if action == "testshot":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            K.test_shot(q.get("speed"), q.get("launch"))
         if action == "aim":
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             try:
@@ -450,8 +489,17 @@ def _publish(shot, o, r, final):
                           f"{m['ball_speed']} mph (smash {smash:.2f}); not shown")
                 m["club_speed_rejected"] = m.pop("club_speed")
                 m.pop("smash", None)
-        if m.get("ball_speed") and m.get("launch_angle"):
-            m["carry"] = round(carry_estimate(m["ball_speed"], m["launch_angle"]))
+        if m.get("ball_speed"):
+            # Fly the ball: measured ball speed, plus the TI radar's launch angle
+            # when there is one (otherwise the club's typical launch). Spin uses
+            # the club's typical value: the speed radar's spin is experimental.
+            club = getattr(K.args, "club", "52") if K.args else "52"
+            f = shot_flight(m["ball_speed"], club, launch_angle=m.get("launch_angle"))
+            m["carry"] = round(f["carry"])
+            m["carry_estimated"] = "launch" in f["assumed"]
+            m["flight"] = f
+            if final and not any(h.get("shot") == shot for h in K.history):
+                K.history = (K.history + [dict(f, shot=shot, at=time.strftime("%H:%M:%S"))])[-30:]
         elif o and o.get("carry"):
             m["carry"] = round(o["carry"])
         K.metrics = m
@@ -546,6 +594,8 @@ def main():
                    help="use the OPS243-A in rolling-buffer mode through OpenFlight's code "
                         "(ball speed, club speed, spin)")
     p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
+    p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
+                   help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
     p.add_argument("--iwr", action="store_true",
                    help="use the TI radar through OpenFlight's code for launch angle")
     p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
@@ -561,6 +611,8 @@ def main():
     p.add_argument("--iwr-ball-height-m", type=float, default=0.040,
                    help="ball centre height above the floor, m")
     p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
+    p.add_argument("--club", default="52",
+                   help="club being hit, for typical launch and spin: driver, 7i, pw, 52, sw ...")
     p.add_argument("--sim", action="store_true",
                    help="send each shot to a golf simulator (OpenGolfSim by default)")
     p.add_argument("--sim-type", default="opengolfsim", choices=("opengolfsim", "gspro", "partee"))
