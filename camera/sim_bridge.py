@@ -93,8 +93,9 @@ class SimBridge:
         try:
             if launch_angle is not None:
                 shot = _with(shot, launch_angle_vertical=float(launch_angle))
-            if getattr(shot, "club", None) is None:
-                shot = _with(shot, club=self.player.club)
+            # The simulator's club (or --sim-club) decides the typical launch and
+            # spin used for anything the radars didn't measure.
+            shot = _with(shot, club=self.player.club)
             resolved = self._resolve(shot, self.player)
         except Exception as e:
             print(f"Simulator: shot not sent ({type(e).__name__}: {e})")

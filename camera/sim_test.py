@@ -19,15 +19,47 @@ from sim_bridge import SimBridge  # noqa: E402
 
 
 class FakeShot:
-    """Looks like OpenFlight's shot; any field not set here reads as None."""
+    """Stand-in for OpenFlight's shot, used if its own Shot class can't be built."""
 
     def __init__(self, **fields):
         self.__dict__.update(fields)
 
-    def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)   # keep Python's own machinery working
-        return None
+
+def make_shot(club, speed, launch, spin):
+    """A pretend shot, built from OpenFlight's own Shot class when possible so
+    its simulator code sees exactly what a real shot looks like."""
+    values = dict(ball_speed_mph=speed, launch_angle_vertical=launch,
+                  launch_angle_horizontal=0.0, spin_rpm=spin or None,
+                  spin_confidence=1.0 if spin else 0.0, spin_axis_deg=0.0,
+                  club=club, club_speed_mph=None, club_path_deg=0.0,
+                  estimated_carry_yards=0.0, carry_spin_adjusted=None,
+                  has_launch_angle=True, timestamp=time.time(),
+                  impact_timestamp=time.time())
+    try:
+        import dataclasses
+        import inspect
+        from openflight.sim import resolver
+        Shot = getattr(resolver, "Shot", None)
+        if Shot is not None and dataclasses.is_dataclass(Shot):
+            kwargs = {}
+            for f in dataclasses.fields(Shot):
+                if not f.init:
+                    continue
+                if f.name in values:
+                    kwargs[f.name] = values[f.name]
+                elif (f.default is dataclasses.MISSING
+                      and f.default_factory is dataclasses.MISSING):
+                    kwargs[f.name] = 0.0      # a required field we have no value for
+            shot = Shot(**kwargs)
+            for k, v in values.items():       # fields that are properties or init=False
+                try:
+                    setattr(shot, k, v)
+                except Exception:
+                    pass
+            return shot
+    except Exception as e:
+        print(f"(using a stand-in shot: {type(e).__name__}: {e})")
+    return FakeShot(**values)
 
 
 def main():
@@ -53,9 +85,7 @@ def main():
         for i in range(args.count):
             if i:
                 time.sleep(8)
-            shot = FakeShot(ball_speed_mph=args.speed, spin_rpm=args.spin or None,
-                            spin_confidence=1.0 if args.spin else 0.0,
-                            club=sim.player.club)
+            shot = make_shot(sim.player.club, args.speed, args.launch, args.spin)
             sim.send(shot, launch_angle=args.launch)
         time.sleep(1.0)                      # let it go out before closing
     finally:
