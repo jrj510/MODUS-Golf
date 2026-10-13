@@ -67,6 +67,7 @@ canvas{width:100%;display:block;border-radius:12px;background:var(--grass)}
   <canvas id="side-view"></canvas>
 </div>
 <div id="note"></div>
+<div style="text-align:center;margin-top:4px"><a href="/session.csv" style="color:var(--dim);font-size:12px">Download this session (CSV)</a></div>
 <script>
 const $=id=>document.getElementById(id);
 const STATES={READY:['Ready','var(--ready)'],SWINGTEST:['Ready','var(--ready)'],

@@ -92,7 +92,7 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
   <span id="shotno"></span>
   <button id="cam" onclick="show('camera')">Camera</button>
   <button id="rng" onclick="location.href='/range'">Range</button>
-  <button id="quit" onclick="post('quit')">Exit</button>
+  <button id="quit" onclick="post('quit')">Menu</button>
 </div>
 <div id="main" class="view"></div>
 <div id="preview" class="view hide">
@@ -171,8 +171,18 @@ async function tick(){
     $('del').classList.toggle('hide',!has);
     $('vmsg').textContent=video=='kept'?'Saved':(video=='pending'?'Save this video?':'');
     if(view=='preview'&&!has)show('main');
-  }catch(e){}
+    fails=0;
+  }catch(e){
+    // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
+    if(++fails>=3){waitForMenu();return;}
+  }
   setTimeout(tick,250);
+}
+let fails=0;
+async function waitForMenu(){
+  $('stext').textContent='Back to menu...';$('dot').style.background='#9aa7b4';
+  try{const r=await fetch('/ping',{cache:'no-store'});if(r.ok){location.href='/';return;}}catch(e){}
+  setTimeout(waitForMenu,1000);
 }
 tick();
 </script></body></html>"""
@@ -296,6 +306,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(RANGE_PAGE)
+            elif path == "/ping":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"kiosk")
+            elif path == "/session.csv":
+                p = getattr(K, "session_path", None)
+                body = open(p, "rb").read() if p and os.path.exists(p) else \
+                    (",".join(SESSION_COLUMNS) + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition",
+                                 f'attachment; filename="{os.path.basename(p or "session.csv")}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/history":
                 with K.lock:
                     body = json.dumps({"rev": K.rev, "shots": K.history}).encode()
@@ -349,6 +375,11 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         if action == "quit":
             K.quit = True
+            # Make sure the program really ends (camera or radar threads can
+            # hang on shutdown), so the start menu can come back.
+            t = threading.Timer(10.0, lambda: os._exit(0))
+            t.daemon = True
+            t.start()
         elif action in ("keep", "delete"):
             K.decide(action)
         self.send_response(204)
@@ -457,6 +488,38 @@ def save_metrics(folder, metrics, radar_log):
             json.dump({"metrics": metrics, "radar_readings": radar_log}, f, indent=2)
 
 
+SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
+                   "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
+                   "ti_radar"]
+
+
+def _session_path():
+    """This run's shot log, one CSV per kiosk start, in logs/sessions/."""
+    if getattr(K, "session_path", None) is None:
+        os.makedirs(os.path.join("logs", "sessions"), exist_ok=True)
+        K.session_path = os.path.join("logs", "sessions",
+                                      time.strftime("session_%Y%m%d_%H%M%S.csv"))
+    return K.session_path
+
+
+def _log_session(shot, m, f, r):
+    """Add one shot to the session CSV, to compare against another launch monitor."""
+    try:
+        path = _session_path()
+        new = not os.path.exists(path)
+        row = [shot, time.strftime("%H:%M:%S"), f.get("club"), m.get("ball_speed"),
+               m.get("club_speed"), m.get("smash"), f.get("launch"),
+               "no" if "launch" in f.get("assumed", []) else "yes", f.get("spin"),
+               f.get("carry"), f.get("apex"),
+               (r or {}).get("error") or (r or {}).get("quality") or ""]
+        with open(path, "a") as out:
+            if new:
+                out.write(",".join(SESSION_COLUMNS) + "\n")
+            out.write(",".join("" if v is None else str(v) for v in row) + "\n")
+    except OSError as e:
+        print(f"Could not write the session log: {e}")
+
+
 def _publish(shot, o, r, final):
     """Show the radar numbers for this shot. Returns the metrics, or None if a
     newer shot has replaced it."""
@@ -500,6 +563,7 @@ def _publish(shot, o, r, final):
             m["flight"] = f
             if final and not any(h.get("shot") == shot for h in K.history):
                 K.history = (K.history + [dict(f, shot=shot, at=time.strftime("%H:%M:%S"))])[-30:]
+                _log_session(shot, m, f, r)
         elif o and o.get("carry"):
             m["carry"] = round(o["carry"])
         K.metrics = m
@@ -611,6 +675,8 @@ def main():
     p.add_argument("--iwr-ball-height-m", type=float, default=0.040,
                    help="ball centre height above the floor, m")
     p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
+    p.add_argument("--gate-gpio", type=int, default=17,
+                   help="GPIO number the sound sensor's GATE is wired to (17 = pin 11, 26 = pin 37)")
     p.add_argument("--club", default="52",
                    help="club being hit, for typical launch and spin: driver, 7i, pw, 52, sw ...")
     p.add_argument("--sim", action="store_true",
@@ -697,7 +763,7 @@ def main():
     if args.iwr:
         try:
             from iwr_bridge import IWRBridge
-            # OpenFlight's monitor owns GPIO17; each sound trigger is passed on to
+            # OpenFlight's monitor owns the sound trigger pin; each sound trigger is passed on to
             # the camera so it can capture the shot too.
             bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
         except Exception as e:
@@ -705,9 +771,9 @@ def main():
     if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice
-            gate = DigitalInputDevice(17, pull_up=False)
+            gate = DigitalInputDevice(args.gate_gpio, pull_up=False)
             gate.when_activated = lambda: sh.trigger("sound")
-            print("Sound trigger on GPIO17")
+            print(f"Sound trigger on GPIO{args.gate_gpio}")
         except Exception as e:
             print(f"Sound trigger not available ({e}); continuing without it")
 
