@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=MODUS-Golf Kiosk
+Comment=Start the launch monitor kiosk at login
+Exec=/home/modusgolf/MODUS-Golf/start_kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
