@@ -335,13 +335,100 @@ def add_exposure_args(p):
     p.add_argument("--exposure-mode", default="ladder", choices=("ladder", "auto"),
                    help="ladder: pick shutter and gain from tested steps by measuring the area "
                         "around the ball (default); auto: libcamera's own auto exposure")
+    p.add_argument("--sensor", default="binned", choices=("binned", "full"),
+                   help="binned: the sensor's own 640x400 mode, fastest (up to ~250 fps). "
+                        "full: read all 1280x800 pixels (up to 144 fps) so the picture can zoom "
+                        "in 2x on the hitting zone at full detail (see --zoom)")
+    p.add_argument("--full-fps", type=float, default=144.0,
+                   help="highest frame rate of the full 1280x800 sensor mode (OV9281: 144 at 8 bit)")
+    p.add_argument("--zoom", default="auto", choices=("auto", "on", "off"),
+                   help="with --sensor full: auto zooms in on the hitting zone once one is drawn "
+                        "(if it fits), on/off force it. Zoomed, the ball is twice as wide")
 
 
-def start_camera(args):
-    """Open and start the OV9281 at args.fps. Returns (cam, exposure control or None)."""
+SENSOR_W, SENSOR_H = 1280, 800     # the OV9281's full pixel array
+
+
+class View:
+    """Which part of the sensor the 640x400 picture shows.
+
+    wide: the whole sensor (scale 2: one picture pixel is 2x2 sensor pixels,
+    as in the sensor's own binned mode). zoomed: a 640x400 window of the
+    sensor at full detail (scale 1) starting at `origin`: the ball is twice as
+    wide. Picture coordinates (boxes, the hitting zone, taps) depend on the
+    view; sensor coordinates don't, so they are used to move between views."""
+
+    def __init__(self, zoomed=False, origin=(0, 0)):
+        self.zoomed = bool(zoomed)
+        self.origin = (int(origin[0]), int(origin[1])) if zoomed else (0, 0)
+
+    @property
+    def scale(self):
+        return 1 if self.zoomed else SENSOR_W // WIDTH
+
+    @property
+    def tag(self):
+        return f"zoom:{self.origin[0]},{self.origin[1]}" if self.zoomed else "wide"
+
+    @classmethod
+    def from_tag(cls, tag):
+        if tag and tag.startswith("zoom:"):
+            x, y = (int(float(v)) for v in tag[5:].split(","))
+            return cls(True, (x, y))
+        return cls()
+
+    def crop(self):
+        """libcamera ScalerCrop (x, y, w, h) in sensor pixels."""
+        if self.zoomed:
+            return (self.origin[0], self.origin[1], WIDTH, HEIGHT)
+        return (0, 0, SENSOR_W, SENSOR_H)
+
+    def to_sensor(self, x, y):
+        return x * self.scale + self.origin[0], y * self.scale + self.origin[1]
+
+    def from_sensor(self, x, y):
+        return (x - self.origin[0]) / self.scale, (y - self.origin[1]) / self.scale
+
+    def __eq__(self, other):
+        return isinstance(other, View) and (self.zoomed, self.origin) == (other.zoomed, other.origin)
+
+
+def zoom_on(center_sensor):
+    """A zoomed view centred (as far as the sensor allows) on a sensor point."""
+    ox = int(min(max(center_sensor[0] - WIDTH / 2, 0), SENSOR_W - WIDTH))
+    oy = int(min(max(center_sensor[1] - HEIGHT / 2, 0), SENSOR_H - HEIGHT))
+    return View(True, (ox & ~1, oy & ~1))   # even offsets keep the sensor's pixel order
+
+
+def convert_area(area, old, new):
+    """An x0,y0,x1,y1 picture box from one view to another, clipped to the
+    picture. None if too little of it is left (under 40x24 px)."""
+    x0, y0 = new.from_sensor(*old.to_sensor(area[0], area[1]))
+    x1, y1 = new.from_sensor(*old.to_sensor(area[2], area[3]))
+    x0, y0 = max(int(round(x0)), 0), max(int(round(y0)), 0)
+    x1, y1 = min(int(round(x1)), WIDTH), min(int(round(y1)), HEIGHT)
+    if x1 - x0 < 40 or y1 - y0 < 24:
+        return None
+    return x0, y0, x1, y1
+
+
+def fits_zoomed(area, view):
+    """True if a picture box would still fit whole in a zoomed view."""
+    (sx0, sy0), (sx1, sy1) = view.to_sensor(area[0], area[1]), view.to_sensor(area[2], area[3])
+    return sx1 - sx0 <= WIDTH - 16 and sy1 - sy0 <= HEIGHT - 16
+
+
+def _configure(cam, args, sensor_size, controls):
+    cam.configure(cam.create_video_configuration(
+        main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
+        sensor={"output_size": sensor_size, "bit_depth": args.bit_depth},
+        controls=controls, buffer_count=8))
+
+
+def _camera_controls(cam, args):
+    """Frame rate and exposure controls for args.fps. Returns (controls, ae)."""
     frame_us = int(1_000_000 / args.fps)
     controls = {"FrameDurationLimits": (frame_us, frame_us)}
-    cam = Picamera2()
     ae = None
     if args.exposure > 0:                      # fixed by hand
         controls["ExposureTime"] = min(args.exposure, frame_us - 100)
@@ -350,19 +437,121 @@ def start_camera(args):
     elif getattr(args, "exposure_mode", "ladder") == "ladder":
         ae = ExposureControl(getattr(cam, "camera_controls", {}) or {}, args)
         controls.update(ae.controls())
-        us, gain = ae.steps[ae.index]
-        print(f"Exposure: starting at {us} us x{gain:g} (ladder of {len(ae.steps)} steps)")
     elif args.gain > 0:
         controls["AnalogueGain"] = args.gain
-    cam.configure(cam.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
-        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": args.bit_depth},
-        controls=controls, buffer_count=8))
+    return controls, ae
+
+
+def start_camera(args, view=None):
+    """Open and start the OV9281 at args.fps. Returns (cam, exposure control or None).
+
+    With --sensor full the whole 1280x800 sensor is read (args.fps is capped
+    at --full-fps) and the picture can be a zoomed window of it (view, see
+    View); args.full_sensor says whether that worked. If the full mode can't
+    be set up, the binned 640x400 mode is used as before."""
+    cam = Picamera2()
+    args.full_sensor = False
+    wanted_fps = args.fps
+    if getattr(args, "sensor", "binned") == "full":
+        args.fps = min(args.fps, getattr(args, "full_fps", 144.0))
+        controls, ae = _camera_controls(cam, args)
+        controls["ScalerCrop"] = (view or View()).crop()
+        try:
+            _configure(cam, args, (SENSOR_W, SENSOR_H), controls)
+            args.full_sensor = True
+            print(f"Camera: full {SENSOR_W}x{SENSOR_H} sensor at up to {args.fps:g} fps, "
+                  f"showing {(view or View()).tag}")
+        except Exception as e:
+            print(f"Camera: full sensor mode not available ({type(e).__name__}: {e}); "
+                  f"using the binned {WIDTH}x{HEIGHT} mode")
+            args.fps = wanted_fps
+    if not args.full_sensor:
+        controls, ae = _camera_controls(cam, args)
+        _configure(cam, args, (WIDTH, HEIGHT), controls)
+    if ae is not None:
+        us, gain = ae.steps[ae.index]
+        print(f"Exposure: starting at {us} us x{gain:g} (ladder of {len(ae.steps)} steps)")
     cam.start()
     if ae is not None:
         ae.cam = cam
     time.sleep(1.0)
     return cam, ae
+
+
+def set_view(cam, view):
+    """Switch between the wide and zoomed picture while running (full sensor mode only)."""
+    cam.set_controls({"ScalerCrop": view.crop()})
+
+
+def sharpness(gray, box):
+    """How sharp the picture is inside box (higher = sharper): the Laplacian's
+    spread relative to the brightness, so it hardly changes with exposure.
+    For focusing the lens: turn it until this peaks."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, gray.shape[1]), min(y1, gray.shape[0])
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    patch = gray[y0:y1, x0:x1].astype(np.float32)
+    lap = cv2.Laplacian(patch, cv2.CV_32F, ksize=3)
+    return round(1000.0 * float(lap.std()) / max(float(patch.mean()), 10.0), 1)
+
+
+TRAINING_DIR = "training"   # inside the shots folder: images/, labels/, review/
+
+
+def save_training_frame(gray, args, box, out_dir, rng=np.random):
+    """Save what the ball model looks at, for retraining it on this camera.
+
+    box: the ball's box in the picture (the green box, when it is on the
+    ball), or None to save the hitting zone as "no ball here" examples. Saves
+    tile-sized crops (--tile, as the model sees them) to images/ with a YOLO
+    label each in labels/ (class 0, empty for no ball), and the whole picture
+    with the box drawn to review/ so wrong labels can be found and deleted.
+    Returns how many examples were saved."""
+    T = min(getattr(args, "tile", 256) or 256, HEIGHT)
+    root = os.path.join(out_dir, TRAINING_DIR)
+    for sub in ("images", "labels", "review"):
+        os.makedirs(os.path.join(root, sub), exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+    tiles = []
+    if box is not None:
+        bw, bh = box[2] - box[0], box[3] - box[1]
+        cx, cy = _center(box)
+        # The ball somewhere inside the tile, not always in the middle.
+        for k in range(2):
+            ox = int(min(max(cx - T / 2 + rng.uniform(-0.3, 0.3) * T, 0), WIDTH - T))
+            oy = int(min(max(cy - T / 2 + rng.uniform(-0.3, 0.3) * T, 0), HEIGHT - T))
+            ox = int(min(max(ox, box[2] - T + 2), box[0] - 2)) if bw < T - 4 else ox
+            oy = int(min(max(oy, box[3] - T + 2), box[1] - 2)) if bh < T - 4 else oy
+            ox, oy = int(min(max(ox, 0), WIDTH - T)), int(min(max(oy, 0), HEIGHT - T))
+            label = "0 {:.6f} {:.6f} {:.6f} {:.6f}\n".format(
+                (cx - ox) / T, (cy - oy) / T, bw / T, bh / T)
+            tiles.append((ox, oy, label))
+    else:
+        x0, y0, x1, y1 = _search_area(args)
+        for oy in _tile_starts(y0, y1, T, HEIGHT):
+            for ox in _tile_starts(x0, x1, T, WIDTH):
+                tiles.append((ox, oy, ""))
+    for i, (ox, oy, label) in enumerate(tiles):
+        name = f"{stamp}_{'ball' if label else 'empty'}_{i}"
+        cv2.imwrite(os.path.join(root, "images", name + ".png"), gray[oy:oy + T, ox:ox + T])
+        with open(os.path.join(root, "labels", name + ".txt"), "w") as f:
+            f.write(label)
+    view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    if box is not None:
+        cv2.rectangle(view, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 1)
+    cv2.imwrite(os.path.join(root, "review", f"{stamp}_{'ball' if box is not None else 'empty'}.jpg"),
+                view, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return len(tiles)
+
+
+def count_training(out_dir):
+    """(ball examples, empty examples) saved so far."""
+    try:
+        names = os.listdir(os.path.join(out_dir, TRAINING_DIR, "labels"))
+    except OSError:
+        return 0, 0
+    return sum("_ball_" in n for n in names), sum("_empty_" in n for n in names)
 
 
 # --- Ball finding and the READY logic -------------------------------------------

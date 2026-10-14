@@ -51,7 +51,9 @@ from ultralytics import YOLO
 
 from ballflight import club_defaults, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, ZoneWatch, add_blob_args,
+from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, ZoneWatch, add_blob_args,
+                          convert_area, count_training, fits_zoomed, save_training_frame, set_view,
+                          sharpness, zoom_on,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready)
@@ -120,8 +122,10 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
 <div id="camera" class="view hide">
   <img id="live" draggable="false"><div id="sel"></div>
   <div class="bar"><button onclick="show('main')">Back</button>
+    <button id="zoombtn" class="hide" onclick="zoomToggle()">Zoom in</button>
+    <button id="trainbtn" onclick="saveTraining()">Save frame</button>
     <span class="cmsg">Drag a box over where the ball is set down (once). Each ball put down inside it
-      is found by itself.<br>Tap a ball to point it out. <span id="expo"></span></span></div>
+      is found by itself.<br>Tap a ball to point it out. <span id="focus"></span> <span id="expo"></span></span></div>
 </div>
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
@@ -180,6 +184,9 @@ function endDrag(e){
 }
 $('live').addEventListener('pointerup',endDrag);
 $('live').addEventListener('pointercancel',()=>{drag=null;$('sel').style.display='none';});
+let zoomed=false;
+function zoomToggle(){fetch('/view?zoom='+(zoomed?0:1),{method:'POST'});}
+function saveTraining(){fetch('/train_frame',{method:'POST'});}
 function show(v){
   view=v;
   for(const n of ['main','preview','camera'])$(n).classList.toggle('hide',n!=v);
@@ -219,6 +226,13 @@ async function tick(){
     $('expo').textContent=c?('Exposure '+c.exposure_us+' us x'+c.gain+
       (c.median!=null?', ball area brightness '+c.median+(c.clipped_pct?' ('+c.clipped_pct+'% white)':''):'')+
       (c.message?'. '+c.message:'')):'';
+    const vw=s.view||{};zoomed=!!vw.zoomed;
+    $('zoombtn').classList.toggle('hide',!vw.can_zoom);
+    $('zoombtn').textContent=zoomed?'Wide view':'Zoom in';
+    const f=s.focus;
+    $('focus').textContent=f?('Focus '+f.value+' (best '+f.best+', '+f.where+'). '):'';
+    const tr=s.training;
+    $('trainbtn').textContent='Save frame'+(tr?' ('+tr[0]+' ball / '+tr[1]+' empty)':'');
     $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):
       (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
     fails=0;
@@ -273,6 +287,12 @@ class Kiosk:
         self.viewers = 0        # browsers watching the live camera stream
         self.radar_jobs = []    # threads still working out the last shot's numbers
         self.hint = None        # (x, y) of a tap on the live view, for the main loop
+        self.view = View()      # which part of the sensor the picture shows (wide / zoomed)
+        self.can_zoom = False   # full sensor mode running: zooming is possible
+        self.want_view = None   # a view change asked for, applied by the main loop
+        self.train_request = False
+        self.training = None    # (ball, empty) training examples saved
+        self.focus = None       # {"value", "best", "where"} while the Camera view is open
 
     def test_shot(self, speed=None, launch=None):
         """A pretend shot, for trying the screens without hitting a ball."""
@@ -320,17 +340,47 @@ class Kiosk:
             print(f"Hitting zone too small ({x1 - x0}x{y1 - y0} px); ignored")
             return
         self._use_area((x0, y0, x1, y1), "drawn", kind="drawn")
+        if self.can_zoom and not self.view.zoomed and self.args.zoom != "off":
+            self.zoom_to_zone()
+
+    def zoom_to_zone(self):
+        """Ask for a zoomed view on the hitting zone, if it fits in one."""
+        a = [int(float(v)) for v in self.args.search_area.split(",")] if self.args.search_area else None
+        if a is None:          # no zone: zoom on the middle of the picture
+            self.want_view = zoom_on(self.view.to_sensor(WIDTH / 2, HEIGHT / 2))
+        elif fits_zoomed(a, self.view):
+            self.want_view = zoom_on(self.view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2))
+        else:
+            print("Hitting zone is too big to zoom in on (it must be under about half the "
+                  "picture's width and height); staying wide")
+
+    def set_zoom(self, on):
+        """The Zoom in / Wide view button."""
+        if self.args is None or not self.can_zoom:
+            return
+        if on and not self.view.zoomed:
+            self.zoom_to_zone()
+        elif not on and self.view.zoomed:
+            self.want_view = View()
 
     def _use_area(self, area, how, kind="tap"):
         self.args.search_area = ",".join(str(int(v)) for v in area)
+        self.zone_kind = kind
         self.reset_track = True
+        self.save_zone()
+        print(f"Hitting zone ({how}): {self.args.search_area}")
+
+    def save_zone(self):
+        """Remember the hitting zone, how it was made, and which view it is in."""
+        if not self.args.search_area:
+            return
+        kind = getattr(self, "zone_kind", "tap")
         try:
             os.makedirs(self.args.out, exist_ok=True)
             with open(os.path.join(self.args.out, AREA_FILE), "w") as f:
-                f.write(self.args.search_area + "\n" + kind + "\n")
+                f.write(self.args.search_area + "\n" + kind + "\n" + self.view.tag + "\n")
         except OSError as e:
             print(f"Could not save the hitting zone: {e}")
-        print(f"Hitting zone ({how}): {self.args.search_area}")
 
     def decide(self, action):
         """Save or delete the latest shot's video."""
@@ -379,7 +429,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps({"state": K.state, "shot": K.shot, "rev": K.rev,
                                    "metrics": K.metrics, "video": K.video,
                                    "camera": getattr(K, "camera", None),
-                                   "zone": bool(K.args is not None and K.args.search_area)}).encode()
+                                   "zone": bool(K.args is not None and K.args.search_area),
+                                   "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
+                                   "focus": K.focus, "training": K.training}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -474,6 +526,11 @@ class Handler(BaseHTTPRequestHandler):
                 K.set_zone(float(q["x0"]), float(q["y0"]), float(q["x1"]), float(q["y1"]))
             except (KeyError, ValueError):
                 pass
+        if action == "view":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            K.set_zoom(q.get("zoom") == "1")
+        if action == "train_frame":
+            K.train_request = True
         if action == "quit":
             K.quit = True
             # Make sure the program really ends (camera or radar threads can
@@ -870,19 +927,22 @@ def main():
     # The hitting zone set last time wins over --search-area. An older saved
     # area from a tap (just round one ball) is widened to a zone, so the next
     # ball doesn't have to land in exactly the same spot.
+    saved_view = View()            # the view the saved zone was drawn in
     try:
         with open(os.path.join(args.out, AREA_FILE)) as f:
             lines = f.read().split()
         if lines:
             a = [int(float(v)) for v in lines[0].split(",")]
             kind = lines[1] if len(lines) > 1 else "tap"
+            saved_view = View.from_tag(lines[2] if len(lines) > 2 else "wide")
             if kind != "drawn" and (a[2] - a[0] < TAP_ZONE[0] or a[3] - a[1] < TAP_ZONE[1]):
                 w = max(a[2] - a[0], TAP_ZONE[0])
                 h = max(a[3] - a[1], TAP_ZONE[1])
                 a = zone_around((a[0] + a[2]) / 2, (a[1] + a[3]) / 2, (w, h))
                 print("Widened the saved tap area into a hitting zone")
             args.search_area = ",".join(str(int(v)) for v in a)
-            print(f"Using the hitting zone set last time: {args.search_area}")
+            K.zone_kind = kind
+            print(f"Using the hitting zone set last time: {args.search_area} ({saved_view.tag})")
     except (OSError, ValueError, IndexError):
         pass
     K.args = args
@@ -903,8 +963,32 @@ def main():
 
     # Exposure is picked by measuring the area around the ball (see
     # ExposureControl in shot_capture.py); --exposure fixes it by hand.
-    cam, ae = start_camera(args)
+    # With --sensor full the picture can zoom in 2x on the hitting zone (the
+    # ball twice as wide). Start in the view the zone was saved in, or zoom on
+    # it now (--zoom auto/on); the zone is converted to whichever view is used.
+    view = View()
+    if args.sensor == "full" and args.zoom != "off":
+        if saved_view.zoomed:
+            view = saved_view
+        elif args.search_area:
+            a = [int(float(v)) for v in args.search_area.split(",")]
+            if fits_zoomed(a, saved_view) or args.zoom == "on":
+                view = zoom_on(saved_view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2))
+        elif args.zoom == "on":
+            view = zoom_on((640, 400))
+    cam, ae = start_camera(args, view)
     K.camera = None
+    K.can_zoom = bool(args.full_sensor)
+    K.view = view if args.full_sensor else View()
+    if args.search_area and K.view != saved_view:
+        a = convert_area([int(float(v)) for v in args.search_area.split(",")], saved_view, K.view)
+        args.search_area = ",".join(str(v) for v in a) if a else None
+        if a:
+            print(f"Hitting zone in this view ({K.view.tag}): {args.search_area}")
+            K.save_zone()
+        else:
+            print("The saved hitting zone is outside this view: drag a new one")
+    K.training = count_training(args.out)
 
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
     threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
@@ -968,10 +1052,34 @@ def main():
     rates = {"SEARCHING": args.search_checks_per_second, "BALL": args.checks_per_second,
              "READY": args.ready_checks_per_second, "MEASURING": 4.0}
     K.state = "SEARCHING"
+    view_settle_until = 0.0     # frames from before a zoom change are still arriving
+    focus_best, focus_where = None, None
 
     try:
         while not K.quit:
             loop_start = time.monotonic()
+            want, K.want_view = K.want_view, None
+            if want is not None and want != K.view and K.can_zoom \
+                    and sh.trigger_time is None and sh.pending is None:
+                # Zoom in on the hitting zone, or back out to the wide view.
+                try:
+                    set_view(cam, want)
+                except Exception as e:
+                    print(f"Could not change the view ({e}); staying {K.view.tag}")
+                else:
+                    old, K.view = K.view, want
+                    if args.search_area:
+                        a = convert_area([int(float(v)) for v in args.search_area.split(",")], old, want)
+                        args.search_area = ",".join(str(v) for v in a) if a else None
+                        K.save_zone()
+                    print(f"View: {want.tag}" + (f", hitting zone {args.search_area}"
+                                                 if args.search_area else ", no hitting zone in view"))
+                    K.reset_track = True
+                    K.hint = None
+                    if zone is not None:
+                        zone.ball_d = None            # the ball is a different size now
+                    view_settle_until = time.monotonic() + 0.4
+                    focus_best = None
             if K.reset_track:             # the zone was drawn, or a ball tapped
                 K.reset_track = False
                 trk.update(new_track())
@@ -980,7 +1088,7 @@ def main():
                 sh.armed = False
                 sh.roi = sh.roi_ref = None
                 if ae is not None:
-                    ae.next_check = 0.0       # re-meter on the (new) zone now
+                    ae.next_check = max(view_settle_until, time.monotonic())  # re-meter on the (new) zone
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
@@ -1054,7 +1162,7 @@ def main():
                 K.camera = ae.summary(sh.exposure)
 
             now = time.monotonic()
-            if zone is not None and sh.trigger_time is None:
+            if zone is not None and sh.trigger_time is None and now >= view_settle_until:
                 following = trk.get("box") is not None and trk["center"] is not None
                 zone.update(gray, now, protect=trk["box"] if following else None,
                             allow_new=ae is None or ae.state in ("ok", "limit"))
@@ -1067,6 +1175,8 @@ def main():
                 # processing is the heaviest moment for the battery). Don't run
                 # the ball finder on top of it; the next ball is being set down.
                 K.state = "MEASURING"
+            elif now < view_settle_until:
+                K.state = "SEARCHING"         # the picture is still switching views
             elif args.swing_test:
                 # No ball needed: arm shortly after start-up or the last shot.
                 if not sh.armed and time.monotonic() >= rearm_at:
@@ -1098,6 +1208,43 @@ def main():
                         print(f"Could not change the frame rate ({e}); staying at full speed")
                         idle_fps = 0
 
+            if K.train_request:
+                # "Save frame" on the Camera view: training pictures for the
+                # ball model. With the box on a ball: that ball; with no ball
+                # found: the hitting zone as "no ball here".
+                K.train_request = False
+                box = trk["box"] if K.state in ("BALL", "READY") and trk.get("box") else None
+                if box is None and not args.search_area:
+                    print("Save frame: draw a hitting zone first (or wait for the box on the ball)")
+                else:
+                    try:
+                        n = save_training_frame(gray, args, box, args.out)
+                        K.training = count_training(args.out)
+                        print(f"Saved {n} training example(s) ({'ball' if box else 'no ball'}); "
+                              f"{K.training[0]} ball / {K.training[1]} empty so far")
+                    except OSError as e:
+                        print(f"Could not save the training frame: {e}")
+
+            if K.viewers > 0 and now >= view_settle_until:
+                # Focus meter for turning the lens: sharpness round the ball
+                # (or of the hitting zone while no ball is boxed).
+                b = trk.get("box") if K.state in ("BALL", "READY") else None
+                if b is not None:
+                    d = max(b[2] - b[0], b[3] - b[1])
+                    region, where = (b[0] - d, b[1] - d, b[2] + d, b[3] + d), "ball"
+                elif args.search_area:
+                    region, where = [int(float(v)) for v in args.search_area.split(",")], "zone"
+                else:
+                    region, where = (WIDTH // 4, HEIGHT // 4, 3 * WIDTH // 4, 3 * HEIGHT // 4), "middle"
+                value = sharpness(gray, region)
+                if where != focus_where:
+                    focus_best, focus_where = None, where
+                if value is not None:
+                    focus_best = value if focus_best is None else max(focus_best, value)
+                    K.focus = {"value": value, "best": focus_best, "where": where}
+            else:
+                K.focus = None
+
             K.latest_gray = gray
             # Live picture for the Camera view, with a box round the ball (eased
             # so it doesn't flicker; it still jumps if the ball really moves).
@@ -1112,7 +1259,8 @@ def main():
             if args.search_area:                          # the hitting zone, in yellow
                 a = [int(float(v)) for v in args.search_area.split(",")]
                 cv2.rectangle(view, (a[0], a[1]), (a[2], a[3]), (0, 210, 255), 1)
-                cv2.putText(view, "hitting zone", (a[0] + 3, a[1] + 12), cv2.FONT_HERSHEY_SIMPLEX,
+                cv2.putText(view, "hitting zone" + (" (zoomed 2x)" if K.view.zoomed else ""),
+                            (a[0] + 3, a[1] + 12), cv2.FONT_HERSHEY_SIMPLEX,
                             0.4, (0, 210, 255), 1, cv2.LINE_AA)
             if zone is not None and K.state == "SEARCHING":
                 for b, _ in zone.placed:                  # something just set down: being checked
