@@ -373,7 +373,8 @@ def new_track():
             "misses": 0,          # checks in a row the followed ball wasn't found
             "spots": [],          # new-ball candidates: [center, checks seen, diameter, box]
             "rivals": [],         # the same, for things other than the followed ball
-            "mine": None}         # (sum, count) of the followed ball's model confidence
+            "mine": None,         # (sum, count) of the followed ball's model confidence
+            "source": None}       # which finder placed the box, for the screen and log
 
 
 def _patch_diff(sh, gray):
@@ -436,10 +437,12 @@ def _search_area(args):
 
 
 def _inside_area(args, box):
-    """True if a box from the model could be the ball: roughly square, not
-    huge, and (with --search-area) entirely inside the search area."""
+    """True if a box from the model could be the ball: not much taller than
+    wide, at most twice as wide as tall (a ball sitting down in turf shows
+    only its top, so its box comes out wide and short), not huge, and (with
+    --search-area) entirely inside the search area."""
     w, h = box[2] - box[0], box[3] - box[1]
-    if w <= 0 or h <= 0 or not (0.6 <= w / h <= 1.6) or max(w, h) > 120:
+    if w <= 0 or h <= 0 or not (0.6 <= w / h <= 2.0) or max(w, h) > 120:
         return False
     x0, y0, x1, y1 = _search_area(args)
     m = 4   # small allowance at the edges
@@ -524,16 +527,18 @@ def _diameter(box):
     return ((box[2] - box[0]) + (box[3] - box[1])) / 2.0
 
 
-def _matches_track(box, trk):
+def _matches_track(box, trk, strict=False):
     """True if box is plausibly the ball being followed: close to where it was
-    last seen (within 2.5 ball widths, at least 20 px) and about the same size."""
+    last seen (within 2.5 ball widths, at least 20 px) and about the same size.
+    strict (used for the small-ball finder): within about half a ball width,
+    so it can't creep sideways onto a bump in the turf next to the ball."""
     ref = trk.get("box")
     if ref is None:
         return False
     d_ref, d = max(_diameter(ref), 1.0), _diameter(box)
     (cx, cy), (rx, ry) = _center(box), _center(ref)
-    return (np.hypot(cx - rx, cy - ry) <= max(2.5 * d_ref, 20.0)
-            and 0.6 <= d / d_ref <= 1.7)
+    reach = max(0.6 * d_ref, 5.0) if strict else max(2.5 * d_ref, 20.0)
+    return np.hypot(cx - rx, cy - ry) <= reach and 0.6 <= d / d_ref <= 1.7
 
 
 def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0):
@@ -565,9 +570,10 @@ def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0
     return max(ready, key=lambda s: s["total"] / s["n"])["box"] if ready else None
 
 
-def _seen(trk, box, blob=False, keep_rivals=False):
+def _seen(trk, box, blob=False, keep_rivals=False, conf=None):
     """The followed (or newly confirmed) ball was found."""
     trk["misses"], trk["spots"], trk["blob"] = 0, [], blob
+    trk["source"] = "spot finder" if blob else (f"model {conf:.2f}" if conf is not None else "model")
     if not keep_rivals:
         trk["rivals"], trk["mine"] = [], None
     return box
@@ -586,18 +592,13 @@ def detect_ball(model, gray, args, trk):
       - while the followed ball is still seen, the box only moves to something
         else that has been seen --switch-checks times and that the model rates
         clearly higher on average (the box had settled on a tee, say).
-    The model looks first; the small-ball finder (--blob) only when it finds
-    nothing. With --search-area, anything outside the area is ignored, and
+    The model always looks first; the small-ball finder (--blob) only fills in
+    when it finds nothing, must stay within half a ball width of the followed
+    ball, and needs two extra sightings to start on a ball of its own. With --search-area, anything outside the area is ignored, and
     tapping the ball on the Camera view is the surest way to keep the box on it.
     """
     following = trk.get("box") is not None and trk["center"] is not None
     use_blob = getattr(args, "blob", False)
-
-    # Following a small ball the blob finder found: a cheap look right around it.
-    if use_blob and following and trk.get("blob"):
-        box = find_ball_spot(gray, args, near=_center(trk["box"]))
-        if box and _matches_track(box, trk):
-            return _seen(trk, box, blob=True)
 
     cands = list(_model_candidates(model, gray, args, trk, following)) if model is not None else []
     strong = [c for c in cands if c[1] >= args.conf]
@@ -619,15 +620,15 @@ def detect_ball(model, gray, args, trk):
             if rival is not None:
                 trk["far"] = next(f for b, _, f in others if b is rival)
                 trk["switched"] = True          # update_ready starts over on it
-                return _seen(trk, rival)
+                return _seen(trk, rival, conf=next(c for b, c, _ in others if b is rival))
             trk["far"] = far
-            return _seen(trk, box, keep_rivals=True)
+            return _seen(trk, box, keep_rivals=True, conf=conf)
 
-    if following and use_blob and not trk.get("blob"):
+    if following and use_blob:
         # The model missed the ball it was following: try the small-ball
-        # finder right where it was.
+        # finder right where it was, and only accept a spot right there.
         box = find_ball_spot(gray, args, near=_center(trk["box"]))
-        if box and _matches_track(box, trk):
+        if box and _matches_track(box, trk, strict=True):
             return _seen(trk, box, blob=True)
 
     if following and trk["misses"] < getattr(args, "miss_checks", 3):
@@ -640,13 +641,14 @@ def detect_ball(model, gray, args, trk):
         box = _confirmed(trk, [(b, c) for b, c, _ in strong], args, hold=2)
         if box is not None:
             trk["far"] = next(f for b, _, f in strong if b is box)
-            return _seen(trk, box)
+            return _seen(trk, box, conf=next(c for b, c, _ in strong if b is box))
         trk["misses"] += 1
         return None
 
     if use_blob:
         box = find_ball_spot(gray, args)
-        confirmed = _confirmed(trk, [(box, 1.0)] if box else [], args, hold=0)
+        confirmed = _confirmed(trk, [(box, 1.0)] if box else [], args, hold=0,
+                               need=getattr(args, "confirm_checks", 2) + 2)
         if confirmed is not None:
             return _seen(trk, confirmed, blob=True)
     else:

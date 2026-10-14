@@ -75,15 +75,26 @@ def _empty(error):
             "quality": None, "error": error}
 
 
-def openflight_club(name):
-    """OpenFlight's ClubType for one of our club names ('52', '7i', 'driver')."""
+def openflight_club_name(name):
+    """OpenFlight's club name for one of ours ('52' -> 'gw', '7i' -> '7-iron')."""
     from ballflight import club_defaults
-    from openflight.clubs import ClubType
-    _, _, ours = club_defaults(name)
+    return OPENFLIGHT_CLUBS.get(club_defaults(name)[2], "unknown")
+
+
+def openflight_club(name):
+    """OpenFlight's ClubType for one of our club names, or None if this copy of
+    OpenFlight doesn't have one that matches (then nothing is set)."""
     try:
-        return ClubType(OPENFLIGHT_CLUBS.get(ours, "unknown"))
+        from openflight.clubs import ClubType
+    except ImportError:
+        try:                                  # older OpenFlight layouts
+            from openflight.launch_monitor import ClubType
+        except ImportError:
+            return None
+    try:
+        return ClubType(openflight_club_name(name))
     except ValueError:
-        return ClubType.UNKNOWN
+        return None
 
 
 def _number(v):
@@ -177,7 +188,7 @@ class IWRBridge:
         self.on_trigger = on_trigger
         self.lock = threading.Lock()
         self.events = []   # one per speed-radar shot
-        self.club = openflight_club(getattr(args, "club", None)).value
+        self.club = openflight_club_name(getattr(args, "club", None))
 
         out = os.path.join(args.out, "iwr")
         os.makedirs(out, exist_ok=True)
@@ -308,10 +319,13 @@ class OPSBridge:
         # Without this OpenFlight assumes a driver for every shot. Its shots
         # also carry this club to the TI radar (see OPENFLIGHT_CLUBS).
         self.club = openflight_club(getattr(args, "club", None))
-        self.monitor.set_club(self.club)
+        if self.club is not None and hasattr(self.monitor, "set_club"):
+            self.monitor.set_club(self.club)
+            club_text = f"club {self.club.value}"
+        else:
+            club_text = "club NOT set: this OpenFlight copy has no matching club setting"
         self.monitor.start(shot_callback=self._on_shot)
-        print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
-              f"club {self.club.value})")
+        print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, {club_text})")
 
     def _on_shot(self, shot):
         now = time.monotonic()

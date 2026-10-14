@@ -902,8 +902,13 @@ def main():
                 K.state = "SWINGTEST" if sh.armed else "WAIT"
             else:
                 ball = detect_ball(model, gray, args, trk)
+                was = K.state
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"] if K.state in ("BALL", "READY") else None
+                if K.state == "READY" and was != "READY":
+                    # Logged so a box on the wrong spot can be traced to its finder.
+                    print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
+                          f"({trk.get('source')}), exposure {sh.exposure[0]} us x{sh.exposure[1]}")
 
             K.latest_gray = gray
             # Live picture for the Camera view, with a box round the ball (eased
@@ -916,6 +921,9 @@ def main():
             if drawn and K.state in ("BALL", "READY"):
                 color = (0, 255, 0) if K.state == "READY" else (0, 200, 255)
                 cv2.rectangle(view, (drawn[0], drawn[1]), (drawn[2], drawn[3]), color, 2)
+                # Which finder placed the box: "model 0.72" or "spot finder".
+                cv2.putText(view, str(trk.get("source") or ""), (drawn[0], max(drawn[1] - 5, 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
             ok, jpeg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 STREAM.put(jpeg.tobytes())
