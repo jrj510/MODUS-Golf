@@ -143,7 +143,13 @@ EXPOSURE_STEPS = (
     (500, 12.0),    # indoor bright
     (500, 15.0),
     (650, 15.0),    # indoor dark
-    (800, 18.0), (1000, 20.0), (1250, 16.0))
+    (800, 18.0), (1000, 20.0), (1250, 16.0),
+    # Dim rooms (a lab under ceiling lights). The camera only finds the ball
+    # and notices it leave; no measurement comes from these frames, so a
+    # longer shutter costs nothing, while gain this high mostly adds noise that
+    # hides the ball. Longer shutters with less gain give a cleaner, brighter
+    # picture. Capped automatically at the frame time (about 6.8 ms at 144 fps).
+    (2000, 12.0), (3000, 12.0), (4500, 12.0), (6500, 12.0))
 DEFAULT_STEP = (500, 12.0)
 EXPOSURE_FILE = "exposure.json"   # last good setting, kept in the shots folder
 
