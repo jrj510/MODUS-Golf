@@ -19,6 +19,14 @@ BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the g
 AZIMUTH_DEG=0      # radars point this far right of the target line (left = negative), degrees
 GATE_GPIO=17       # GPIO the sound sensor GATE is wired to (17 = pin 11, 26 = pin 37)
 
+# Power. The moment after a shot is the heaviest load (the TI radar's
+# processing, plus whatever the camera saves); on a battery pack that spike
+# can shut the Pi off. These keep it down:
+RECORDING=flight   # flight = only the ball leaving, no preview video (least power);
+                   # full = slow-motion Shot Preview with Save/Delete; off = save nothing
+TI_DUMPS=0         # 1 = also save the TI radar's raw captures (for debugging angles only)
+export OPENBLAS_NUM_THREADS=1   # math on one core at a time instead of all four at once
+
 cd ~/MODUS-Golf || exit 1
 mkdir -p logs
 
@@ -54,9 +62,13 @@ while true; do
     else
         DETECT="'--trigger','motion,sound','--blob'"
     fi
+    DUMPS=""
+    if [ "$TI_DUMPS" = "1" ]; then
+        DUMPS="'--iwr-save-dumps',"
+    fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     echo "Starting kiosk: $MODE detection, club $CLUB (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG','--iwr-save-dumps','--gate-gpio','$GATE_GPIO','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS'--recording','$RECORDING','--gate-gpio','$GATE_GPIO','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"

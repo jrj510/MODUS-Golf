@@ -46,8 +46,9 @@ from ultralytics import YOLO
 
 from ballflight import club_defaults, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, add_blob_args, add_exposure_args,
-                          add_tracking_args, camera_thread, detect_ball, new_track, save_shot,
+from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, add_blob_args,
+                          add_exposure_args, add_tracking_args, camera_thread, detect_ball,
+                          new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
@@ -81,6 +82,8 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
 .unit{color:#7c8894;font-size:2.8vh;min-height:3.4vh}
 .fresh .val{color:#4dabf7}
 #preview,#camera{display:flex;flex-direction:column;align-items:center;gap:8px}
+#camera{position:relative}#live{touch-action:none}
+#sel{position:absolute;display:none;border:2px dashed #ffd23f;pointer-events:none}
 #preview img,#camera img{flex:1;min-height:0;max-width:100%;object-fit:contain;border-radius:8px}
 .bar{display:flex;align-items:center;gap:14px;height:13vh;min-height:48px;width:100%;
   justify-content:center}
@@ -110,9 +113,9 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
   </div>
 </div>
 <div id="camera" class="view hide">
-  <img id="live">
+  <img id="live"><div id="sel"></div>
   <div class="bar"><button onclick="show('main')">Back</button>
-    <span class="cmsg">Tap the ball to aim the camera there<br><span id="expo"></span></span></div>
+    <span class="cmsg">Drag a box over the hitting area (or tap the ball)<br><span id="expo"></span></span></div>
 </div>
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
@@ -121,7 +124,7 @@ const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph
   ['spin','Spin Rate','rpm',0],['club_path','Club Path','deg',1]];
 const STATUS={STARTING:['Starting','#9aa7b4'],SEARCHING:['Looking for Ball','#f0b429'],
   BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
-  CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],
+  CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],MEASURING:['Measuring','#4dabf7'],
   SWINGTEST:['Ready','#2ecc71']};
 const $=id=>document.getElementById(id);
 const main=$('main');
@@ -133,14 +136,43 @@ for(const [k,label,unit] of TILES){
 }
 let view='main',shot=-1,rev=-1,video='none';
 function post(a){fetch('/'+a,{method:'POST'});}
-// Tap the ball in the live view: the ball search moves to that spot.
-$('live').addEventListener('click',e=>{
-  const img=e.target,r=img.getBoundingClientRect();
+// Live view: drag a box over the hitting area and the camera keeps looking for a
+// ball anywhere inside it (remembered across restarts); or tap the ball for a
+// small area round it.
+let drag=null;
+function imgXY(e){
+  const img=$('live'),r=img.getBoundingClientRect();
   const s=Math.min(r.width/img.naturalWidth,r.height/img.naturalHeight);
   const w=img.naturalWidth*s,h=img.naturalHeight*s;
-  const x=(e.clientX-r.left-(r.width-w)/2)/w,y=(e.clientY-r.top-(r.height-h)/2)/h;
-  if(x>=0&&x<=1&&y>=0&&y<=1)fetch('/aim?x='+x.toFixed(4)+'&y='+y.toFixed(4),{method:'POST'});
+  return [(e.clientX-r.left-(r.width-w)/2)/w,(e.clientY-r.top-(r.height-h)/2)/h];
+}
+const clip=v=>Math.min(Math.max(v,0),1).toFixed(4);
+$('live').addEventListener('pointerdown',e=>{
+  if(!$('live').naturalWidth)return;
+  e.preventDefault();drag={x:e.clientX,y:e.clientY,p:imgXY(e)};
+  try{$('live').setPointerCapture(e.pointerId);}catch(err){}
 });
+$('live').addEventListener('pointermove',e=>{
+  if(!drag)return;
+  const c=$('camera').getBoundingClientRect(),st=$('sel').style;
+  st.display='block';
+  st.left=(Math.min(drag.x,e.clientX)-c.left)+'px';st.top=(Math.min(drag.y,e.clientY)-c.top)+'px';
+  st.width=Math.abs(e.clientX-drag.x)+'px';st.height=Math.abs(e.clientY-drag.y)+'px';
+});
+function endDrag(e){
+  if(!drag)return;
+  const a=drag.p,b=imgXY(e),moved=Math.hypot(e.clientX-drag.x,e.clientY-drag.y);
+  drag=null;$('sel').style.display='none';
+  if(moved<12){
+    if(a[0]>=0&&a[0]<=1&&a[1]>=0&&a[1]<=1)
+      fetch('/aim?x='+clip(a[0])+'&y='+clip(a[1]),{method:'POST'});
+  }else{
+    fetch('/zone?x0='+clip(Math.min(a[0],b[0]))+'&y0='+clip(Math.min(a[1],b[1]))+
+          '&x1='+clip(Math.max(a[0],b[0]))+'&y1='+clip(Math.max(a[1],b[1])),{method:'POST'});
+  }
+}
+$('live').addEventListener('pointerup',endDrag);
+$('live').addEventListener('pointercancel',()=>{drag=null;$('sel').style.display='none';});
 function show(v){
   view=v;
   for(const n of ['main','preview','camera'])$(n).classList.toggle('hide',n!=v);
@@ -204,7 +236,7 @@ def empty_metrics():
             "spin": None, "club_path": None}
 
 
-AREA_FILE = "search_area.txt"   # where a tapped search area is remembered
+AREA_FILE = "search_area.txt"   # where the search area (tapped or dragged) is remembered
 
 
 class Kiosk:
@@ -221,6 +253,8 @@ class Kiosk:
         self.args = None
         self.reset_track = False
         self.history = []       # flights of the last shots, for the range view
+        self.viewers = 0        # browsers watching the live camera stream
+        self.radar_jobs = []    # threads still working out the last shot's numbers
 
     def test_shot(self, speed=None, launch=None):
         """A pretend shot, for trying the screens without hitting a ball."""
@@ -247,7 +281,23 @@ class Kiosk:
             return
         x, y = int(fx * WIDTH), int(fy * HEIGHT)
         area = (max(x - 110, 0), max(y - 25, 0), min(x + 110, WIDTH), min(y + 30, HEIGHT))
-        self.args.search_area = ",".join(str(v) for v in area)
+        self._use_area(area, "tap")
+
+    def set_zone(self, fx0, fy0, fx1, fy1):
+        """Look for the ball anywhere inside a box dragged over the hitting area
+        (0-1 of the picture's width and height). Remembered for the next start."""
+        if self.args is None:
+            return
+        x0, x1 = sorted((int(fx0 * WIDTH), int(fx1 * WIDTH)))
+        y0, y1 = sorted((int(fy0 * HEIGHT), int(fy1 * HEIGHT)))
+        x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, WIDTH), min(y1, HEIGHT)
+        if x1 - x0 < 40 or y1 - y0 < 24:
+            print(f"Hitting zone too small ({x1 - x0}x{y1 - y0} px); ignored")
+            return
+        self._use_area((x0, y0, x1, y1), "drawn zone")
+
+    def _use_area(self, area, how):
+        self.args.search_area = ",".join(str(int(v)) for v in area)
         self.reset_track = True
         try:
             os.makedirs(self.args.out, exist_ok=True)
@@ -255,13 +305,17 @@ class Kiosk:
                 f.write(self.args.search_area)
         except OSError as e:
             print(f"Could not save the search area: {e}")
-        print(f"Search area set by tap: {self.args.search_area}")
+        print(f"Search area set ({how}): {self.args.search_area}")
 
     def decide(self, action):
         """Save or delete the latest shot's video."""
         with self.lock:
             if action == "keep" and self.video == "pending":
                 self.video = "kept"
+                try:                    # never pruned by --keep-shots
+                    open(os.path.join(self.folder, KEEP_MARKER), "w").close()
+                except (OSError, TypeError):
+                    pass
                 print(f"Kept {self.folder}")
             elif action == "delete" and self.video in ("pending", "kept"):
                 if self.folder:
@@ -307,10 +361,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
             elif path == "/stream.mjpg":
                 self._mjpeg_headers()
-                while not K.quit:
-                    jpeg = STREAM.get()
-                    if jpeg is not None:
-                        self._send_jpeg(jpeg)
+                K.viewers += 1              # the live picture is only drawn while watched
+                try:
+                    while not K.quit:
+                        jpeg = STREAM.get()
+                        if jpeg is not None:
+                            self._send_jpeg(jpeg)
+                finally:
+                    K.viewers -= 1
             elif path in ("/range", "/range.html"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
@@ -382,6 +440,12 @@ class Handler(BaseHTTPRequestHandler):
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             try:
                 K.aim(float(q["x"]), float(q["y"]))
+            except (KeyError, ValueError):
+                pass
+        if action == "zone":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            try:
+                K.set_zone(float(q["x0"]), float(q["y0"]), float(q["x1"]), float(q["y1"]))
             except (KeyError, ValueError):
                 pass
         if action == "quit":
@@ -633,6 +697,20 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
              if m.get(x) is not None}
     print(f"Shot {shot}: {shown if shown else 'no radar numbers'}")
 
+def _write_flight(pending, folder, args):
+    """Save a shot's ball-flight frames (no video) at low priority, then prune
+    old shot folders."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)   # this thread only
+    except (AttributeError, OSError):
+        pass
+    try:
+        save_shot(pending, args.out, video=False, folder=folder)
+        prune_shots(args.out, args.keep_shots)
+    except Exception as e:
+        print(f"Could not save the shot frames: {type(e).__name__}: {e}")
+
+
 def open_browser(url):
     """Open Chromium full screen on the Pi's own display."""
     exe = shutil.which("chromium") or shutil.which("chromium-browser")
@@ -662,13 +740,31 @@ def main():
     p.add_argument("--tile", type=int, default=256,
                    help="size of the full-detail tiles used to find a distant ball (0 = whole frame only)")
     p.add_argument("--fps", type=float, default=200.0, help="camera frame rate to request")
-    p.add_argument("--checks-per-second", type=float, default=8.0)
+    p.add_argument("--checks-per-second", type=float, default=8.0,
+                   help="ball checks a second while a ball is being confirmed")
+    p.add_argument("--search-checks-per-second", type=float, default=4.0,
+                   help="ball checks a second while no ball is in view (saves power)")
+    p.add_argument("--ready-checks-per-second", type=float, default=2.0,
+                   help="ball checks a second while READY; the motion trigger watches every frame anyway")
     p.add_argument("--still-pixels", type=float, default=12.0)
     p.add_argument("--still-seconds", type=float, default=1.0)
     p.add_argument("--hold-seconds", type=float, default=3.0,
                    help="how long to stay Ready when the ball is covered")
-    p.add_argument("--pre", type=float, default=0.25, help="seconds kept from before the trigger")
-    p.add_argument("--post", type=float, default=0.5, help="seconds recorded after the trigger")
+    p.add_argument("--recording", default="flight", choices=("flight", "full", "off"),
+                   help="flight: keep just the ball leaving (0.03 s before to 0.15 s after impact), "
+                        "saved quietly, no preview video (default, least power); full: 0.25 s + 0.5 s "
+                        "with the slow-motion Shot Preview; off: save nothing")
+    p.add_argument("--pre", type=float, default=None,
+                   help="seconds kept from before the trigger (default: by --recording)")
+    p.add_argument("--post", type=float, default=None,
+                   help="seconds recorded after the trigger (default: by --recording)")
+    p.add_argument("--keep-shots", type=int, default=30,
+                   help="keep only the newest this many shot folders (Saved ones are never deleted; 0 = all)")
+    p.add_argument("--idle-fps", type=float, default=60.0,
+                   help="camera frame rate while no ball is READY (full --fps once READY); 0 = always full")
+    p.add_argument("--settle-seconds", type=float, default=8.0,
+                   help="after a shot, pause ball finding while the radars work out the numbers, "
+                        "up to this long (spreads out the power draw)")
     p.add_argument("--trigger", default="motion", help="motion, sound, or both: motion,sound")
     p.add_argument("--motion-threshold", type=float, default=25.0)
     p.add_argument("--bit-depth", type=int, default=8, choices=(8, 10),
@@ -738,6 +834,10 @@ def main():
     p.add_argument("--no-browser", action="store_true", help="do not open the full-screen browser")
     args = p.parse_args()
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
+    if args.pre is None:
+        args.pre = 0.25 if args.recording == "full" else 0.03
+    if args.post is None:
+        args.post = 0.5 if args.recording == "full" else 0.15
     args.swing_test = args.no_ball
     if args.swing_test:
         args.triggers.discard("motion")  # there is no ball patch to watch
@@ -747,7 +847,7 @@ def main():
             saved = f.read().strip()
         if saved:
             args.search_area = saved
-            print(f"Using the search area you last tapped: {saved}")
+            print(f"Using the search area set last time: {saved}")
     except OSError:
         pass
     K.args = args
@@ -822,7 +922,14 @@ def main():
 
     ball, trk, drawn = None, new_track(), None
     rearm_at = time.monotonic() + 2.0
-    period = 1.0 / args.checks_per_second
+    settle_until = 0.0          # after a shot: let the radars work before looking again
+    # Lower frame rate while no ball is READY (only with a fixed/ladder exposure:
+    # libcamera's auto exposure would change brightness with the frame rate).
+    idle_fps = args.idle_fps if (0 < args.idle_fps < args.fps and not args.swing_test
+                                 and (ae is not None or args.exposure > 0)) else 0
+    fps_now = args.fps
+    rates = {"SEARCHING": args.search_checks_per_second, "BALL": args.checks_per_second,
+             "READY": args.ready_checks_per_second, "MEASURING": 4.0}
     K.state = "SEARCHING"
 
     try:
@@ -841,10 +948,19 @@ def main():
                 K.state = "CAPTURING"
                 K.drop_undecided()           # the previous video defaults to deleted
                 trigger_time, _, window = sh.pending
-                folder = save_shot(sh.pending, args.out)
-                replay = [cv2.imencode(".jpg", np.ascontiguousarray(f[2]),
-                                       [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
-                          for f in window]
+                folder, replay = None, []
+                if args.recording == "full":
+                    # Frames, a preview video and the replay: the heaviest option.
+                    folder = save_shot(sh.pending, args.out)
+                    replay = [cv2.imencode(".jpg", np.ascontiguousarray(f[2]),
+                                           [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes()
+                              for f in window]
+                elif args.recording == "flight" and window:
+                    # Just the ball leaving, as raw frames: no video, no JPEGs,
+                    # written by a background thread so nothing else waits.
+                    folder = shot_folder(args.out)
+                    threading.Thread(target=_write_flight, args=(sh.pending, folder, args),
+                                     daemon=True).start()
                 metrics = shot_metrics(radar, trigger_time, args)
                 # Every radar reading around the shot, as (milliseconds from the
                 # trigger, mph). Printed and saved so the club/ball rule can be tuned.
@@ -859,13 +975,16 @@ def main():
                 save_metrics(folder, metrics, radar_log)
                 with K.lock:
                     K.replay, K.folder, K.metrics = replay, folder, metrics
-                    K.video = "pending" if folder else "none"
+                    K.video = "pending" if (folder and replay) else "none"
                     K.shot += 1
                     K.rev += 1
                 if bridge is not None or ops is not None:
-                    threading.Thread(target=add_radar_results,
-                                     args=(bridge, ops, K.shot, trigger_time, folder, radar_log),
-                                     daemon=True).start()
+                    job = threading.Thread(target=add_radar_results,
+                                           args=(bridge, ops, K.shot, trigger_time, folder, radar_log),
+                                           daemon=True)
+                    job.start()
+                    K.radar_jobs = [j for j in K.radar_jobs if j.is_alive()] + [job]
+                    settle_until = time.monotonic() + args.settle_seconds
                 shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
                 print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'}")
                 with sh.lock:
@@ -893,8 +1012,16 @@ def main():
                     rearm_at = time.monotonic() + 0.5
                 K.camera = ae.summary(sh.exposure)
 
+            now = time.monotonic()
+            measuring = (now < settle_until and not args.swing_test
+                         and any(j.is_alive() for j in K.radar_jobs))
             if sh.trigger_time is not None:
                 K.state = "CAPTURING"
+            elif measuring:
+                # The radars are still working out the last shot (the TI radar's
+                # processing is the heaviest moment for the battery). Don't run
+                # the ball finder on top of it; the next ball is being set down.
+                K.state = "MEASURING"
             elif args.swing_test:
                 # No ball needed: arm shortly after start-up or the last shot.
                 if not sh.armed and time.monotonic() >= rearm_at:
@@ -910,10 +1037,28 @@ def main():
                     print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
                           f"({trk.get('source')}), exposure {sh.exposure[0]} us x{sh.exposure[1]}")
 
+            # Full frame rate only while READY or recording; slower otherwise.
+            if idle_fps:
+                want = args.fps if (sh.armed or sh.trigger_time is not None
+                                    or sh.pending is not None) else idle_fps
+                if want != fps_now:
+                    try:
+                        set_frame_rate(cam, want)
+                        fps_now = want
+                    except Exception as e:
+                        print(f"Could not change the frame rate ({e}); staying at full speed")
+                        idle_fps = 0
+
             K.latest_gray = gray
             # Live picture for the Camera view, with a box round the ball (eased
             # so it doesn't flicker; it still jumps if the ball really moves).
+            # Only drawn while someone has the Camera view open.
             drawn = smooth_box(drawn, ball)
+            if K.viewers <= 0:
+                spare = 1.0 / rates.get(K.state, args.checks_per_second) - (time.monotonic() - loop_start)
+                if spare > 0:
+                    time.sleep(spare)
+                continue
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             if args.search_area:
                 a = [int(float(v)) for v in args.search_area.split(",")]
@@ -928,7 +1073,7 @@ def main():
             if ok:
                 STREAM.put(jpeg.tobytes())
 
-            spare = period - (time.monotonic() - loop_start)
+            spare = 1.0 / rates.get(K.state, args.checks_per_second) - (time.monotonic() - loop_start)
             if spare > 0:
                 time.sleep(spare)
     except KeyboardInterrupt:

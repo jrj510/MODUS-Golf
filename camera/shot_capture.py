@@ -30,6 +30,7 @@ import argparse
 import collections
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -657,12 +658,15 @@ def detect_ball(model, gray, args, trk):
     return None
 
 
-def _tile_starts(a0, a1, size, limit):
-    """Start positions of size-long windows covering a0..a1 within 0..limit."""
+def _tile_starts(a0, a1, size, limit, overlap=40):
+    """Start positions of size-long windows covering a0..a1 within 0..limit,
+    evenly spread and overlapping by at least `overlap` pixels so a ball on a
+    seam is still whole in one of them."""
     if a1 - a0 <= size:
         return [int(min(max((a0 + a1) / 2 - size / 2, 0), limit - size))]
-    starts = list(range(int(a0), int(a1 - size), int(size * 0.75))) + [int(a1 - size)]
-    return sorted({min(max(s, 0), limit - size) for s in starts})
+    n = int(np.ceil((a1 - a0 - size) / float(size - overlap))) + 1
+    starts = np.linspace(a0, a1 - size, n)
+    return sorted({int(min(max(round(v), 0), limit - size)) for v in starts})
 
 
 def _model_regions(gray, args, trk):
@@ -908,12 +912,23 @@ def camera_thread(cam, sh, args):
             count, t0 = 0, now
 
 
-def save_shot(pending, out_dir):
+SHOT_FOLDER = "shot_%Y%m%d_%H%M%S"
+KEEP_MARKER = "KEEP"       # a shot folder holding this file is never pruned
+
+
+def shot_folder(out_dir):
+    """A new folder name for a shot (not created yet)."""
+    return os.path.join(out_dir, time.strftime(SHOT_FOLDER))
+
+
+def save_shot(pending, out_dir, video=True, folder=None):
+    """Write a shot's frames (frames.npy, times.npy, sensor_ns.npy) and, with
+    video=True, a slow-motion preview.avi. Returns the folder."""
     tt, source, window = pending
     if not window:
         print("Trigger fired but no frames were in memory.")
-        return
-    folder = os.path.join(out_dir, time.strftime("shot_%Y%m%d_%H%M%S"))
+        return None
+    folder = folder or shot_folder(out_dir)
     os.makedirs(folder, exist_ok=True)
     frames = np.stack([f[2] for f in window])
     times = np.array([f[0] - tt for f in window])          # seconds relative to trigger
@@ -922,12 +937,13 @@ def save_shot(pending, out_dir):
     np.save(os.path.join(folder, "times.npy"), times)
     np.save(os.path.join(folder, "sensor_ns.npy"), sensor)
 
-    # Slow-motion preview that plays in any video player.
-    writer = cv2.VideoWriter(os.path.join(folder, "preview.avi"),
-                             cv2.VideoWriter_fourcc(*"MJPG"), 30, (WIDTH, HEIGHT), False)
-    for img in frames:
-        writer.write(np.ascontiguousarray(img))
-    writer.release()
+    if video:
+        # Slow-motion preview that plays in any video player.
+        writer = cv2.VideoWriter(os.path.join(folder, "preview.avi"),
+                                 cv2.VideoWriter_fourcc(*"MJPG"), 30, (WIDTH, HEIGHT), False)
+        for img in frames:
+            writer.write(np.ascontiguousarray(img))
+        writer.release()
 
     span = times[-1] - times[0]
     rate = (len(times) - 1) / span if span > 0 else 0
@@ -935,6 +951,28 @@ def save_shot(pending, out_dir):
           f"{times[0] * 1000:.0f} ms to +{times[-1] * 1000:.0f} ms, "
           f"about {rate:.0f} fps, in {folder}")
     return folder
+
+
+def prune_shots(out_dir, keep):
+    """Delete the oldest shot folders beyond the newest `keep`, except any a
+    person chose to keep (they hold a KEEP file). keep <= 0 keeps everything."""
+    if keep <= 0:
+        return
+    try:
+        names = sorted(n for n in os.listdir(out_dir) if n.startswith("shot_")
+                       and os.path.isdir(os.path.join(out_dir, n)))
+    except OSError:
+        return
+    for name in names[:-keep]:
+        path = os.path.join(out_dir, name)
+        if not os.path.exists(os.path.join(path, KEEP_MARKER)):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def set_frame_rate(cam, fps):
+    """Change the camera's frame rate while it runs (manual exposure only)."""
+    us = int(1_000_000 / fps)
+    cam.set_controls({"FrameDurationLimits": (us, us)})
 
 
 def main():
