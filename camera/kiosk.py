@@ -10,6 +10,11 @@ Top left is the status indicator (Looking for Ball / Ready / Recording).
 After a shot the numbers fill in and a "Shot Preview" button appears beside
 the status. Tapping it opens the slow-motion replay with Save and Delete.
 
+Hitting zone: open Camera and drag a box over where the ball is set down,
+once (it is remembered). The camera then keeps watching that zone and finds
+each ball put down in it by itself, then goes Ready once the ball is still.
+Tapping a ball on the Camera view points it out if it is ever missed.
+
 Nothing needs to be tapped between shots. The numbers and the replay stay
 until the next shot replaces them. A replay that was neither saved nor
 deleted is deleted when the next shot arrives, or when the kiosk exits.
@@ -46,7 +51,7 @@ from ultralytics import YOLO
 
 from ballflight import club_defaults, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, add_blob_args,
+from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, ZoneWatch, add_blob_args,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready)
@@ -113,9 +118,10 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
   </div>
 </div>
 <div id="camera" class="view hide">
-  <img id="live"><div id="sel"></div>
+  <img id="live" draggable="false"><div id="sel"></div>
   <div class="bar"><button onclick="show('main')">Back</button>
-    <span class="cmsg">Drag a box over the hitting area (or tap the ball)<br><span id="expo"></span></span></div>
+    <span class="cmsg">Drag a box over where the ball is set down (once). Each ball put down inside it
+      is found by itself.<br>Tap a ball to point it out. <span id="expo"></span></span></div>
 </div>
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
@@ -136,10 +142,11 @@ for(const [k,label,unit] of TILES){
 }
 let view='main',shot=-1,rev=-1,video='none';
 function post(a){fetch('/'+a,{method:'POST'});}
-// Live view: drag a box over the hitting area and the camera keeps looking for a
-// ball anywhere inside it (remembered across restarts); or tap the ball for a
-// small area round it.
+// Live view: drag a box over the hitting area (the hitting zone) and the camera
+// keeps looking for a ball set down anywhere inside it (remembered across
+// restarts). A tap points out a ball; with no zone yet it also makes one round it.
 let drag=null;
+$('live').addEventListener('dragstart',e=>e.preventDefault());   // mouse: no image drag
 function imgXY(e){
   const img=$('live'),r=img.getBoundingClientRect();
   const s=Math.min(r.width/img.naturalWidth,r.height/img.naturalHeight);
@@ -212,7 +219,8 @@ async function tick(){
     $('expo').textContent=c?('Exposure '+c.exposure_us+' us x'+c.gain+
       (c.median!=null?', ball area brightness '+c.median+(c.clipped_pct?' ('+c.clipped_pct+'% white)':''):'')+
       (c.message?'. '+c.message:'')):'';
-    $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):'';
+    $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):
+      (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
     fails=0;
   }catch(e){
     // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
@@ -236,7 +244,16 @@ def empty_metrics():
             "spin": None, "club_path": None}
 
 
-AREA_FILE = "search_area.txt"   # where the search area (tapped or dragged) is remembered
+AREA_FILE = "search_area.txt"   # where the hitting zone is remembered
+TAP_ZONE = (320, 120)           # size of the hitting zone made round a tapped ball, pixels
+
+
+def zone_around(x, y, size=TAP_ZONE):
+    """A hitting zone of the given size centred on (x, y), kept inside the picture."""
+    w, h = min(size[0], WIDTH), min(size[1], HEIGHT)
+    x0 = int(min(max(x - w / 2, 0), WIDTH - w))
+    y0 = int(min(max(y - h / 2, 0), HEIGHT - h))
+    return x0, y0, x0 + w, y0 + h
 
 
 class Kiosk:
@@ -255,6 +272,7 @@ class Kiosk:
         self.history = []       # flights of the last shots, for the range view
         self.viewers = 0        # browsers watching the live camera stream
         self.radar_jobs = []    # threads still working out the last shot's numbers
+        self.hint = None        # (x, y) of a tap on the live view, for the main loop
 
     def test_shot(self, speed=None, launch=None):
         """A pretend shot, for trying the screens without hitting a ball."""
@@ -275,13 +293,20 @@ class Kiosk:
         print(f"Test shot {self.shot}: {speed:.1f} mph, carry {f['carry']:.0f} yd")
 
     def aim(self, fx, fy):
-        """Centre the ball search on a spot tapped in the live view (0-1 of the
-        picture's width and height), and remember it for the next start."""
+        """A tap on the live view (0-1 of the picture's width and height): "the
+        ball is here". The ball found right there is taken at once. A tap
+        inside the hitting zone leaves the zone as it is; with no zone yet, or
+        a tap outside it, a zone is made round the tapped ball."""
         if self.args is None:
             return
         x, y = int(fx * WIDTH), int(fy * HEIGHT)
-        area = (max(x - 110, 0), max(y - 25, 0), min(x + 110, WIDTH), min(y + 30, HEIGHT))
-        self._use_area(area, "tap")
+        area = [int(float(v)) for v in self.args.search_area.split(",")] \
+            if self.args.search_area else None
+        if not area or not (area[0] <= x <= area[2] and area[1] <= y <= area[3]):
+            self._use_area(zone_around(x, y), "made round the tapped ball")
+        self.hint = (x, y)
+        self.reset_track = True
+        print(f"Tapped at ({x}, {y}): looking for the ball there")
 
     def set_zone(self, fx0, fy0, fx1, fy1):
         """Look for the ball anywhere inside a box dragged over the hitting area
@@ -294,18 +319,18 @@ class Kiosk:
         if x1 - x0 < 40 or y1 - y0 < 24:
             print(f"Hitting zone too small ({x1 - x0}x{y1 - y0} px); ignored")
             return
-        self._use_area((x0, y0, x1, y1), "drawn zone")
+        self._use_area((x0, y0, x1, y1), "drawn", kind="drawn")
 
-    def _use_area(self, area, how):
+    def _use_area(self, area, how, kind="tap"):
         self.args.search_area = ",".join(str(int(v)) for v in area)
         self.reset_track = True
         try:
             os.makedirs(self.args.out, exist_ok=True)
             with open(os.path.join(self.args.out, AREA_FILE), "w") as f:
-                f.write(self.args.search_area)
+                f.write(self.args.search_area + "\n" + kind + "\n")
         except OSError as e:
-            print(f"Could not save the search area: {e}")
-        print(f"Search area set ({how}): {self.args.search_area}")
+            print(f"Could not save the hitting zone: {e}")
+        print(f"Hitting zone ({how}): {self.args.search_area}")
 
     def decide(self, action):
         """Save or delete the latest shot's video."""
@@ -353,7 +378,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/state":
                 body = json.dumps({"state": K.state, "shot": K.shot, "rev": K.rev,
                                    "metrics": K.metrics, "video": K.video,
-                                   "camera": getattr(K, "camera", None)}).encode()
+                                   "camera": getattr(K, "camera", None),
+                                   "zone": bool(K.args is not None and K.args.search_area)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -841,14 +867,23 @@ def main():
     args.swing_test = args.no_ball
     if args.swing_test:
         args.triggers.discard("motion")  # there is no ball patch to watch
-    # A search area set by tapping the ball last time wins over --search-area.
+    # The hitting zone set last time wins over --search-area. An older saved
+    # area from a tap (just round one ball) is widened to a zone, so the next
+    # ball doesn't have to land in exactly the same spot.
     try:
         with open(os.path.join(args.out, AREA_FILE)) as f:
-            saved = f.read().strip()
-        if saved:
-            args.search_area = saved
-            print(f"Using the search area set last time: {saved}")
-    except OSError:
+            lines = f.read().split()
+        if lines:
+            a = [int(float(v)) for v in lines[0].split(",")]
+            kind = lines[1] if len(lines) > 1 else "tap"
+            if kind != "drawn" and (a[2] - a[0] < TAP_ZONE[0] or a[3] - a[1] < TAP_ZONE[1]):
+                w = max(a[2] - a[0], TAP_ZONE[0])
+                h = max(a[3] - a[1], TAP_ZONE[1])
+                a = zone_around((a[0] + a[2]) / 2, (a[1] + a[3]) / 2, (w, h))
+                print("Widened the saved tap area into a hitting zone")
+            args.search_area = ",".join(str(int(v)) for v in a)
+            print(f"Using the hitting zone set last time: {args.search_area}")
+    except (OSError, ValueError, IndexError):
         pass
     K.args = args
 
@@ -921,6 +956,8 @@ def main():
             print(f"Sound trigger not available ({e}); continuing without it")
 
     ball, trk, drawn = None, new_track(), None
+    # Notices a ball being set down in the hitting zone (see ZoneWatch).
+    zone = None if args.swing_test else ZoneWatch(args)
     rearm_at = time.monotonic() + 2.0
     settle_until = 0.0          # after a shot: let the radars work before looking again
     # Lower frame rate while no ball is READY (only with a fixed/ladder exposure:
@@ -935,13 +972,15 @@ def main():
     try:
         while not K.quit:
             loop_start = time.monotonic()
-            if K.reset_track:             # the search area was just moved by a tap
+            if K.reset_track:             # the zone was drawn, or a ball tapped
                 K.reset_track = False
                 trk.update(new_track())
+                hint, K.hint = K.hint, None
+                trk["hint"] = (hint[0], hint[1], 6) if hint else None
                 sh.armed = False
                 sh.roi = sh.roi_ref = None
                 if ae is not None:
-                    ae.next_check = 0.0       # re-meter on the newly tapped area now
+                    ae.next_check = 0.0       # re-meter on the (new) zone now
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
@@ -990,6 +1029,8 @@ def main():
                 with sh.lock:
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
+                if zone is not None:              # retake the empty zone once the ball has gone
+                    zone.shot_taken(trk.get("box"), time.monotonic())
                 ball, trk = None, new_track()
                 rearm_at = time.monotonic() + 2.0
                 K.state = "SEARCHING"
@@ -1013,6 +1054,10 @@ def main():
                 K.camera = ae.summary(sh.exposure)
 
             now = time.monotonic()
+            if zone is not None and sh.trigger_time is None:
+                following = trk.get("box") is not None and trk["center"] is not None
+                zone.update(gray, now, protect=trk["box"] if following else None,
+                            allow_new=ae is None or ae.state in ("ok", "limit"))
             measuring = (now < settle_until and not args.swing_test
                          and any(j.is_alive() for j in K.radar_jobs))
             if sh.trigger_time is not None:
@@ -1028,14 +1073,18 @@ def main():
                     sh.armed = True
                 K.state = "SWINGTEST" if sh.armed else "WAIT"
             else:
-                ball = detect_ball(model, gray, args, trk)
+                ball = detect_ball(model, gray, args, trk, zone)
                 was = K.state
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"] if K.state in ("BALL", "READY") else None
                 if K.state == "READY" and was != "READY":
+                    b = trk["box"]
+                    if zone is not None:          # set-down spots must be about this size
+                        zone.ball_d = ((b[2] - b[0]) + (b[3] - b[1])) / 2.0
                     # Logged so a box on the wrong spot can be traced to its finder.
                     print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
-                          f"({trk.get('source')}), exposure {sh.exposure[0]} us x{sh.exposure[1]}")
+                          f"(found by {trk.get('found_by') or trk.get('source')}; now {trk.get('source')}), "
+                          f"exposure {sh.exposure[0]} us x{sh.exposure[1]}")
 
             # Full frame rate only while READY or recording; slower otherwise.
             if idle_fps:
@@ -1060,9 +1109,18 @@ def main():
                     time.sleep(spare)
                 continue
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            if args.search_area:
+            if args.search_area:                          # the hitting zone, in yellow
                 a = [int(float(v)) for v in args.search_area.split(",")]
-                cv2.rectangle(view, (a[0], a[1]), (a[2], a[3]), (255, 200, 0), 1)
+                cv2.rectangle(view, (a[0], a[1]), (a[2], a[3]), (0, 210, 255), 1)
+                cv2.putText(view, "hitting zone", (a[0] + 3, a[1] + 12), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.4, (0, 210, 255), 1, cv2.LINE_AA)
+            if zone is not None and K.state == "SEARCHING":
+                for b, _ in zone.placed:                  # something just set down: being checked
+                    cv2.circle(view, ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2),
+                               max((b[2] - b[0]) // 2 + 4, 6), (0, 140, 255), 1)
+            if trk.get("hint"):                           # where the screen was tapped
+                hx, hy = trk["hint"][:2]
+                cv2.drawMarker(view, (int(hx), int(hy)), (255, 0, 255), cv2.MARKER_CROSS, 14, 1)
             if drawn and K.state in ("BALL", "READY"):
                 color = (0, 255, 0) if K.state == "READY" else (0, 200, 255)
                 cv2.rectangle(view, (drawn[0], drawn[1]), (drawn[2], drawn[3]), color, 2)

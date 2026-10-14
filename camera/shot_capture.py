@@ -373,9 +373,13 @@ def new_track():
             "far": False, "confirmed_at": None, "blob": False,
             "misses": 0,          # checks in a row the followed ball wasn't found
             "spots": [],          # new-ball candidates: [center, checks seen, diameter, box]
+            "blobs": [],          # the same, from the small-ball finder alone
             "rivals": [],         # the same, for things other than the followed ball
+            "takeover": [],       # balls set down elsewhere while following an unsure one
+            "sure": False,        # the followed ball was more than a small-ball-finder guess
             "mine": None,         # (sum, count) of the followed ball's model confidence
-            "source": None}       # which finder placed the box, for the screen and log
+            "source": None,       # which finder placed the box, for the screen and log
+            "found_by": None}     # which finder first took this ball on, for the log
 
 
 def _patch_diff(sh, gray):
@@ -426,6 +430,12 @@ def add_tracking_args(p):
     p.add_argument("--switch-checks", type=int, default=4,
                    help="times something else must be seen, rated clearly higher on average "
                         "(0.1 more confidence) than the followed ball, before the box moves to it")
+    p.add_argument("--place-contrast", type=float, default=0.2,
+                   help="hitting zone: how much brighter than the empty zone (relative to the "
+                        "pixels around it, 0.2 = 20%%) a spot must become to count as a ball set down")
+    p.add_argument("--assist-conf", type=float, default=0.15,
+                   help="lowest model confidence that still backs up a ball seen being set down "
+                        "(or one that was tapped)")
 
 
 def _search_area(args):
@@ -451,7 +461,14 @@ def _inside_area(args, box):
 
 
 def find_ball_spot(gray, args, near=None):
-    """Find a small ball the model misses. Returns a box or None.
+    """The most ball-like spot (see find_ball_spots), as a box, or None."""
+    spots = find_ball_spots(gray, args, near=near, limit=1)
+    return spots[0][0] if spots else None
+
+
+def find_ball_spots(gray, args, near=None, limit=3):
+    """Find a small ball the model misses. Returns up to `limit` (box, score)
+    pairs, most ball-like first.
 
     Lit from above, a ball on the mat has a bright top and a dark, shadowed
     bottom, so it is found as a small, roughly round spot that differs from the
@@ -468,7 +485,7 @@ def find_ball_spot(gray, args, near=None):
         x0, y0 = max(x0, int(near[0]) - r), max(y0, int(near[1]) - r)
         x1, y1 = min(x1, int(near[0]) + r), min(y1, int(near[1]) + r)
     if x1 - x0 < 8 or y1 - y0 < 8:
-        return None
+        return []
     img = cv2.GaussianBlur(gray[y0:y1, x0:x1].astype(np.float32), (5, 5), 0)  # calm the noise
     dev = img - cv2.blur(img, (51, 1))
     # The threshold follows the picture's brightness, so a dark, fast-exposure
@@ -498,7 +515,7 @@ def find_ball_spot(gray, args, near=None):
                 joined = (min(b[0], d[0]), b[1], max(b[2], d[2]), d[3], b[4] + d[4])
                 candidates.append((joined, True))
 
-    best, best_score = None, 0.0
+    found = []
     for (bx0, by0, bx1, by1, count), pair in candidates:
         bw, bh = bx1 - bx0, by1 - by0
         r = (bw + bh) / 4.0
@@ -514,10 +531,18 @@ def find_ball_spot(gray, args, near=None):
         if near is not None:
             cx, cy = (bx0 + bx1) / 2 + x0, (by0 + by1) / 2 + y0
             score /= 1.0 + np.hypot(cx - near[0], cy - near[1]) / 20.0
-        if score > best_score:
-            best_score = score
-            best = [int(bx0 + x0), int(by0 + y0), int(bx1 + x0), int(by1 + y0)]
-    return best
+        if score > 0:
+            found.append(([int(bx0 + x0), int(by0 + y0), int(bx1 + x0), int(by1 + y0)], score))
+    # Best first; a bright cap and the pair it belongs to are one ball, so a
+    # spot overlapping a better one is dropped.
+    found.sort(key=lambda f: -f[1])
+    kept = []
+    for box, score in found:
+        if all(np.hypot(*np.subtract(_center(box), _center(k))) > 0.5 * _diameter(k) for k, _ in kept):
+            kept.append((box, score))
+        if len(kept) >= limit:
+            break
+    return kept
 
 
 def _center(box):
@@ -542,10 +567,11 @@ def _matches_track(box, trk, strict=False):
     return np.hypot(cx - rx, cy - ry) <= reach and 0.6 <= d / d_ref <= 1.7
 
 
-def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0):
+def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0, slow=None):
     """Count sightings per spot; return the box of a spot seen at least `need`
     times (default --confirm-checks) whose average confidence is at least
-    better_than, else None.
+    better_than, else None. slow=(n, rating): a spot rated lower is still
+    accepted once it has been seen n times with at least that average.
 
     found: (box, confidence) pairs from this check. A spot not seen keeps its
     count for `hold` checks (the real ball is missed now and then), then is
@@ -566,21 +592,26 @@ def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0
     kept += [dict(s, seen=False, idle=s["idle"] + 1) for s in old if s["idle"] < hold]
     trk[key] = kept
     need = max(need if need is not None else getattr(args, "confirm_checks", 2), 1)
-    ready = [s for s in kept if s["seen"] and s["n"] >= need
-             and s["total"] / s["n"] >= better_than]
+    ready = [s for s in kept if s["seen"] and (
+        (s["n"] >= need and s["total"] / s["n"] >= better_than)
+        or (slow is not None and s["n"] >= slow[0] and s["total"] / s["n"] >= slow[1]))]
     return max(ready, key=lambda s: s["total"] / s["n"])["box"] if ready else None
 
 
-def _seen(trk, box, blob=False, keep_rivals=False, conf=None):
-    """The followed (or newly confirmed) ball was found."""
-    trk["misses"], trk["spots"], trk["blob"] = 0, [], blob
-    trk["source"] = "spot finder" if blob else (f"model {conf:.2f}" if conf is not None else "model")
+def _seen(trk, box, blob=False, keep_rivals=False, conf=None, source=None, sure=None):
+    """The followed (or newly confirmed) ball was found. sure (set when a new
+    ball is taken on): False if only the small-ball finder vouched for it."""
+    trk["misses"], trk["spots"], trk["blobs"], trk["blob"] = 0, [], [], blob
+    trk["source"] = source or ("spot finder" if blob else
+                               (f"model {conf:.2f}" if conf is not None else "model"))
+    if sure is not None:                      # a new ball taken on
+        trk["sure"], trk["takeover"], trk["found_by"] = sure, [], trk["source"]
     if not keep_rivals:
         trk["rivals"], trk["mine"] = [], None
     return box
 
 
-def detect_ball(model, gray, args, trk):
+def detect_ball(model, gray, args, trk, zone=None):
     """The ball's box [x0, y0, x1, y1], or None.
 
     The box stays on one ball:
@@ -588,23 +619,65 @@ def detect_ball(model, gray, args, trk):
         size, counts (at a lower confidence, --keep-conf);
       - if it goes unseen, nothing else is taken for --miss-checks checks (the
         READY logic keeps the old box meanwhile);
-      - a new ball needs the full --conf and must be seen at the same spot
-        --confirm-checks times (one or two misses in between are allowed);
+      - a new ball must be seen at the same spot --confirm-checks times (one
+        or two misses in between are allowed);
       - while the followed ball is still seen, the box only moves to something
         else that has been seen --switch-checks times and that the model rates
         clearly higher on average (the box had settled on a tee, say).
-    The model always looks first; the small-ball finder (--blob) only fills in
-    when it finds nothing, must stay within half a ball width of the followed
-    ball, and needs two extra sightings to start on a ball of its own. With --search-area, anything outside the area is ignored, and
-    tapping the ball on the Camera view is the surest way to keep the box on it.
+
+    How a new ball is recognised:
+      - the model on its own needs its full --conf;
+      - with a hitting zone (zone: a ZoneWatch, see below), a ball being SET
+        DOWN in the zone is noticed: a still, ball-sized spot that wasn't
+        there in the empty zone. It is taken once the model (at any
+        confidence) or the small-ball finder also sees a ball right there,
+        or on its own after a few more checks;
+      - the small-ball finder (--blob) on its own needs two extra sightings,
+        and isn't used on its own once the zone is known to be empty (then
+        anything it finds there is part of the mat).
+    A tap on the Camera view (trk["hint"]) takes the ball found right there
+    at once. With --search-area, anything outside the area is ignored.
     """
     following = trk.get("box") is not None and trk["center"] is not None
     use_blob = getattr(args, "blob", False)
+    in_zone = (zone is not None and zone.active and getattr(args, "search_area", None)
+               and 0 < getattr(args, "tile", 0) < WIDTH)
 
-    cands = list(_model_candidates(model, gray, args, trk, following)) if model is not None else []
+    if trk.get("hint") is not None:
+        box = _ball_at_hint(model, gray, args, trk)
+        if box is not None:
+            return box
+
+    placed = zone.placed if (in_zone and not following) else []
+    if model is None:
+        cands = []
+    elif in_zone:
+        cands = _zone_model_candidates(model, gray, args, trk, following, placed)
+    else:
+        cands = list(_model_candidates(model, gray, args, trk, following))
     strong = [c for c in cands if c[1] >= args.conf]
+
+    if following and in_zone and not trk.get("sure"):
+        # The box is on something only the small-ball finder vouched for (at
+        # start-up it may be a look-alike on the mat). A ball seen being set
+        # down elsewhere in the zone takes over.
+        elsewhere = [p for p in zone.placed if not _matches_track(p[0], trk)]
+        found = _new_ball_evidence(gray, args, [], elsewhere, use_blob)
+        box = _confirmed(trk, [(b, s) for b, s, _ in found], args, key="takeover", hold=2,
+                         better_than=args.conf, slow=(getattr(args, "confirm_checks", 2) + 3, 0.4))
+        if box is not None:
+            _, rating, source = next(f for f in found if f[0] is box)
+            trk["switched"], trk["far"] = True, True     # update_ready starts over on it
+            return _seen(trk, box, blob=source.endswith("spot finder"), conf=rating,
+                         source=source, sure=True)
+
     if following:
-        mine = [c for c in cands if _matches_track(c[0], trk)]
+        # A ball that is lying still doesn't move: only a find right on it
+        # counts, so a missed check can't hand the box to a look-alike a ball
+        # or two away. (A new ball is only taken once it was seen at the same
+        # spot twice, so it is lying still from the start; one that rolls off
+        # is dropped after --miss-checks and found again where it stops.)
+        mine = [c for c in cands if _matches_track(c[0], trk, strict=True)]
         if mine:
             box, conf, far = max(mine, key=lambda c: c[1])
             total, n = trk.get("mine") or (0.0, 0)
@@ -621,7 +694,7 @@ def detect_ball(model, gray, args, trk):
             if rival is not None:
                 trk["far"] = next(f for b, _, f in others if b is rival)
                 trk["switched"] = True          # update_ready starts over on it
-                return _seen(trk, rival, conf=next(c for b, c, _ in others if b is rival))
+                return _seen(trk, rival, conf=next(c for b, c, _ in others if b is rival), sure=True)
             trk["far"] = far
             return _seen(trk, box, keep_rivals=True, conf=conf)
 
@@ -632,29 +705,112 @@ def detect_ball(model, gray, args, trk):
         if box and _matches_track(box, trk, strict=True):
             return _seen(trk, box, blob=True)
 
+    if following and in_zone and any(_matches_track(b, trk, strict=True) for b, _ in zone.placed):
+        # Neither finder saw it this time, but the zone still shows a ball
+        # set down right there: keep the box where it is.
+        return _seen(trk, trk["box"], blob=trk.get("blob", False), keep_rivals=True,
+                     source=trk.get("source"))
+
     if following and trk["misses"] < getattr(args, "miss_checks", 3):
         # The ball we follow wasn't seen this time. Don't jump to anything else
         # yet; it is usually just a missed detection.
         trk["misses"] += 1
         return None
 
-    if strong:
-        box = _confirmed(trk, [(b, c) for b, c, _ in strong], args, hold=2)
-        if box is not None:
-            trk["far"] = next(f for b, _, f in strong if b is box)
-            return _seen(trk, box, conf=next(c for b, c, _ in strong if b is box))
+    # A new ball: a confident model find, or a spot where one was set down.
+    found = _new_ball_evidence(gray, args, cands, placed, use_blob)
+    need = getattr(args, "confirm_checks", 2)
+    # The zone's tiles are looked at in turn, so a find may only come back
+    # every few checks: keep it in mind that long.
+    hold = max(2, min(len(_zone_tiles(args)), 4)) if in_zone else 2
+    box = _confirmed(trk, [(b, s) for b, s, _ in found], args, hold=hold,
+                     better_than=args.conf, slow=(need + 3, 0.4))
+    if box is not None:
+        _, rating, source = next(f for f in found if f[0] is box)
+        trk["far"] = next((fl for b, _, fl in cands if b is box), True)
+        return _seen(trk, box, blob=source.endswith("spot finder"), conf=rating, source=source,
+                     sure=True)
+    if found:                       # something is being confirmed: wait for it
         trk["misses"] += 1
         return None
 
-    if use_blob:
-        box = find_ball_spot(gray, args)
-        confirmed = _confirmed(trk, [(box, 1.0)] if box else [], args, hold=0,
-                               need=getattr(args, "confirm_checks", 2) + 2)
-        if confirmed is not None:
-            return _seen(trk, confirmed, blob=True)
+    if use_blob and not (in_zone and zone.trusted):
+        spots = find_ball_spots(gray, args)
+        if in_zone and len(spots) > 1:
+            # Several ball-like spots in the zone and none seen being set
+            # down: don't guess (most are marks on the mat). The ball is
+            # taken when it's set down, or tapped.
+            spots = []
+        box = _confirmed(trk, spots, args, key="blobs", hold=1, need=need + 2)
+        if box is not None:
+            return _seen(trk, box, blob=True, sure=False)
     else:
-        trk["spots"] = []
+        trk["blobs"] = []
     trk["misses"] += 1
+    return None
+
+
+def _new_ball_evidence(gray, args, cands, placed, use_blob):
+    """Possible new balls this check, as (box, rating, source). Ratings are on
+    the model's 0-1 scale; --conf (0.5) or more counts after --confirm-checks
+    sightings, 0.4 or more after three more.
+
+    A spot set down in the zone rates 0.45 on its own, 0.6 when the small-ball
+    finder sees a ball right there and at least 0.75 when the model does, at
+    any confidence (two independent signs agreeing). The model on its own
+    rates what it says, and only counts from --conf up."""
+    found, used = [], []
+    for pbox, _ in placed:
+        pc, pd = _center(pbox), max(_diameter(pbox), 6.0)
+        reach = max(0.8 * pd, 8.0)
+        near = [c for c in cands if np.hypot(*np.subtract(_center(c[0]), pc)) <= reach
+                and 0.4 <= _diameter(c[0]) / pd <= 2.5]
+        if near:
+            b, c, _ = max(near, key=lambda f: f[1])
+            used += [n[0] for n in near]
+            found.append((b, max(0.75, c), f"set down + model {c:.2f}"))
+            continue
+        if use_blob:
+            spot = find_ball_spot(gray, args, near=pc)
+            if spot is not None and np.hypot(*np.subtract(_center(spot), pc)) <= reach:
+                found.append((spot, 0.6, "set down + spot finder"))
+                continue
+        found.append((pbox, 0.45, "set down"))
+    for b, c, _ in cands:
+        if c >= args.conf and not any(b is u for u in used):
+            found.append((b, c, f"model {c:.2f}"))
+    return found
+
+
+def _ball_at_hint(model, gray, args, trk):
+    """A tap on the Camera view said "the ball is here": take the ball found
+    within 40 px of the tap straight away (the model at any confidence, else
+    the small-ball finder). Tried for a few checks, then given up."""
+    hx, hy, tries = trk["hint"]
+    trk["hint"] = (hx, hy, tries - 1) if tries > 1 else None
+    reach = 40.0
+
+    def dist(box):
+        return float(np.hypot(*np.subtract(_center(box), (hx, hy))))
+
+    if model is not None and 0 < getattr(args, "tile", 0) < WIDTH:
+        T = min(args.tile, HEIGHT)
+        ox, oy = _tile_at((hx, hy), T)
+        low = min(getattr(args, "assist_conf", 0.15), args.conf)
+        near = [(b, c) for b, c, _ in _run_model(model, gray, args, ox, oy, T, low)
+                if dist(b) <= reach]
+        if near:
+            b, c = max(near, key=lambda f: f[1] / (1.0 + dist(f[0]) / reach))
+            trk["hint"], trk["far"] = None, True
+            print(f"Ball found where you tapped: {b} (model {c:.2f})")
+            return _seen(trk, b, conf=c, source=f"tapped + model {c:.2f}", sure=True)
+    spot = find_ball_spot(gray, args, near=(hx, hy))
+    if spot is not None and dist(spot) <= reach:
+        trk["hint"], trk["far"] = None, True
+        print(f"Ball found where you tapped: {spot} (spot finder)")
+        return _seen(trk, spot, blob=True, source="tapped + spot finder", sure=True)
+    if trk["hint"] is None:
+        print(f"No ball seen where you tapped ({hx}, {hy}); still searching the zone")
     return None
 
 
@@ -718,6 +874,278 @@ def _model_candidates(model, gray, args, trk, following):
             return
 
 
+# --- The hitting zone ---------------------------------------------------------
+
+_ROTATION = [0]     # which of the zone's tiles the model looks at next
+
+
+def _zone_tiles(args):
+    """Top-left corners of the full-detail tiles covering the hitting zone."""
+    if not getattr(args, "search_area", None) or not 0 < getattr(args, "tile", 0) < WIDTH:
+        return []
+    T = min(args.tile, HEIGHT)
+    x0, y0, x1, y1 = _search_area(args)
+    return [(ox, oy) for oy in _tile_starts(y0, y1, T, HEIGHT) for ox in _tile_starts(x0, x1, T, WIDTH)]
+
+
+def _tile_at(point, T):
+    """Top-left corner of a T x T tile centred (as far as the frame allows) on point."""
+    ox = int(min(max(point[0] - T / 2, 0), WIDTH - T))
+    oy = int(min(max(point[1] - T / 2, 0), HEIGHT - T))
+    return ox, oy
+
+
+def _run_model(model, gray, args, ox, oy, T, low):
+    """The model on one tile: (box, confidence, True) for each find inside the area."""
+    bgr = cv2.cvtColor(np.ascontiguousarray(gray[oy:oy + T, ox:ox + T]), cv2.COLOR_GRAY2BGR)
+    r = model.predict(bgr, imgsz=args.imgsz, conf=low, verbose=False)[0]
+    found = []
+    for i in range(len(r.boxes)):
+        x0, y0, x1, y1 = [float(v) for v in r.boxes.xyxy[i]]
+        box = [int(x0 + ox), int(y0 + oy), int(x1 + ox), int(y1 + oy)]
+        if _inside_area(args, box):
+            found.append((box, float(r.boxes.conf[i]), True))
+    return found
+
+
+def _zone_model_candidates(model, gray, args, trk, following, placed):
+    """The model's finds inside the hitting zone, best first, as (box, confidence, True).
+
+    Each check the model looks at one tile centred on the followed ball; or,
+    while no ball is followed, at tiles centred on up to two spots where
+    something was just set down, plus one or two of the zone's own tiles in
+    turn (so a ball already lying there is found too). That keeps it to one
+    to three looks a check however big the zone is. Low confidences are kept
+    (down to --assist-conf): on their own they don't count, but they back up
+    a set-down spot."""
+    T = min(args.tile, HEIGHT)
+    zone = _zone_tiles(args)
+    if following:
+        tiles = [_tile_at(trk["center"], T)]
+        low = min(getattr(args, "keep_conf", 0.3), args.conf)
+    else:
+        low = min(getattr(args, "assist_conf", 0.15), args.conf)
+        if len(zone) <= 1:
+            tiles = list(zone)                 # one tile already covers the whole zone
+        else:
+            tiles = [_tile_at(_center(b), T) for b, _ in placed[:2]]
+            per = 1 if tiles else 2
+            start = _ROTATION[0] % len(zone)
+            _ROTATION[0] = (start + per) % len(zone)
+            tiles += [zone[(start + i) % len(zone)] for i in range(min(per, len(zone)))]
+    done, found = [], []
+    for ox, oy in tiles:
+        if any(abs(ox - a) < 32 and abs(oy - b) < 32 for a, b in done):
+            continue                           # practically the same tile
+        done.append((ox, oy))
+        for box, conf, tile in _run_model(model, gray, args, ox, oy, T, low):
+            same = next((i for i, f in enumerate(found) if np.hypot(*np.subtract(
+                _center(f[0]), _center(box))) < 0.5 * max(_diameter(f[0]), 1.0)), None)
+            if same is None:
+                found.append((box, conf, tile))
+            elif conf > found[same][1]:
+                found[same] = (box, conf, tile)
+    found.sort(key=lambda f: -f[1])
+    return found
+
+
+class ZoneWatch:
+    """Notices a ball being set down in the hitting zone.
+
+    It keeps a picture of the empty zone and compares each check with it. A
+    ball put down shows up as a small, roundish spot that has become clearly
+    brighter than it was (a white ball on turf or a mat). Every pixel is
+    measured against the pixels around it rather than by its raw brightness,
+    so an exposure change, a cloud or the golfer's soft shadow hardly
+    registers, while a ball does. A ball taken away (darker than before) is
+    ignored.
+
+    The empty picture is taken:
+      - at start-up, at the first quiet moment once the exposure is set (if a
+        ball is already lying there it becomes part of the picture; the
+        model, the small-ball finder or a tap still find it);
+      - after each shot, at the first quiet moment once the ball has left;
+      - again if much of the zone has changed and stayed that way for a few
+        seconds with no ball followed (the box was bumped, say).
+    In between it slowly follows gradual light changes, except on a spot
+    being watched (a ball just set down, or the ball being followed).
+
+    `trusted` means the empty picture is known to have no ball in it, so the
+    small-ball finder on its own is no longer needed there.
+    """
+
+    QUIET = 0.003     # share of the zone that may change between two checks and still be "quiet"
+    BUSY = 0.05       # more than this share changed: someone is in the zone (or the camera moved)
+    BLEND = 0.05      # how fast the empty picture follows slow light changes, per check
+    _K3 = np.ones((3, 3), np.uint8)
+
+    def __init__(self, args):
+        self.args = args
+        self.area = None
+        self.ball_d = None        # size of the last ball followed, pixels (set by the caller)
+        self.reset()
+
+    def reset(self):
+        self.bg = None            # neighbourhood-relative picture of the empty zone
+        self.prev = None
+        self.quiet = 0            # checks in a row with (almost) nothing moving
+        self.placed = []          # (box, strength) of spots set down, most distinct first
+        self.trusted = False
+        self.after_shot = None    # (earliest time to retake the picture, where the ball was)
+        self.leftover = None      # box of a ball still lying where it was after a "shot"
+        self.busy_since = None
+        self.noise = None         # picture noise, in the same relative units
+
+    @property
+    def active(self):
+        return self.area is not None
+
+    def _relative(self, gray):
+        """Each pixel's brightness relative to its surroundings (1.0 = like
+        them). The surroundings are wide (at least 41 px, several ball widths)
+        so a ball set down hardly changes them: only the ball itself shows."""
+        k = int(max(41, 3.5 * (self.ball_d or 0))) | 1
+        x0, y0, x1, y1 = self.area
+        m = k // 2
+        X0, Y0, X1, Y1 = max(x0 - m, 0), max(y0 - m, 0), min(x1 + m, WIDTH), min(y1 + m, HEIGHT)
+        z = cv2.GaussianBlur(gray[Y0:Y1, X0:X1].astype(np.float32), (5, 5), 0)
+        rel = z / (cv2.blur(z, (k, k)) + 8.0)
+        return rel[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
+
+    def shot_taken(self, ball_box, now):
+        """A shot was just recorded: take a new empty picture once the zone is quiet."""
+        self.after_shot = (now + 0.3, ball_box)
+        self.placed = []
+
+    def update(self, gray, now, protect=None, allow_new=True):
+        """Call once per check with the latest frame. protect: the box of the
+        ball being followed, never blended into the empty picture.
+        allow_new=False holds off a new empty picture (exposure still being set)."""
+        area = _search_area(self.args) if getattr(self.args, "search_area", None) else None
+        if area != self.area:
+            self.area = area
+            self.reset()
+        if area is None or gray is None:
+            return
+        rel = self._relative(gray)
+        thr = getattr(self.args, "place_contrast", 0.2)
+        if self.prev is None or self.prev.shape != rel.shape:
+            moved = 1.0
+        else:
+            step = np.abs(rel - self.prev)
+            # Noise, measured from frame to frame (the median ignores anything
+            # that really moved). In a dim, noisy picture every threshold is
+            # raised with it, so noise can't look like a ball or like motion.
+            n = 1.4826 * float(np.median(step)) / 1.414
+            self.noise = n if self.noise is None else 0.8 * self.noise + 0.2 * n
+            thr = max(thr, 4.0 * self.noise)
+            moved = float(np.mean(step > 1.414 * thr))
+        self.prev = rel
+        self.quiet = self.quiet + 1 if moved <= self.QUIET else 0
+
+        if self.bg is None or self.after_shot is not None:
+            self.placed = []
+            if allow_new and self.quiet >= 2 and (self.after_shot is None or now >= self.after_shot[0]):
+                self._take(gray, rel)
+            return
+
+        diff = rel - self.bg
+        busy = float(np.mean(np.abs(diff) > thr))
+        if protect is not None:
+            self.leftover = None              # a ball is being followed again
+        if busy <= self.BUSY:
+            # Follow slow light changes, except where a ball is (or may be)
+            # lying. Not while someone is in the zone: they would be blended
+            # in, and so would a ball they have just put down.
+            blend = np.ones(diff.shape, bool)
+            x0, y0 = area[:2]
+            for b in [p for p, _ in self.placed] + ([protect] if protect is not None else []):
+                blend[max(b[1] - y0 - 4, 0):max(b[3] - y0 + 4, 0),
+                      max(b[0] - x0 - 4, 0):max(b[2] - x0 + 4, 0)] = False
+            self.bg[blend] += self.BLEND * diff[blend]
+        else:
+            # Someone is in the zone or the camera moved: no "set down" spots
+            # now. If it stays like this, quietly, for 3 s with no ball being
+            # followed, the zone itself has changed: start again from it.
+            self.placed = []
+            if protect is None and self.quiet >= 2:
+                self.busy_since = self.busy_since or now
+                if now - self.busy_since >= 3.0:
+                    print("Hitting zone: the picture changed and stayed changed; "
+                          "taking a new picture of the empty zone")
+                    self._take(gray, rel)
+            else:
+                self.busy_since = None
+            return
+        self.busy_since = None
+        self.placed = self._spots(diff, thr)
+        if self.leftover is not None and not any(
+                np.hypot(*np.subtract(_center(b), _center(self.leftover))) <= _diameter(self.leftover)
+                for b, _ in self.placed):
+            self.placed.insert(0, (list(self.leftover), 1.0))
+
+    def _take(self, gray, rel):
+        """Remember the zone as it is now as "empty"."""
+        self.bg = rel.copy()
+        self.placed = []
+        self.busy_since = None
+        lying = find_ball_spots(gray, self.args, limit=8)   # anything ball-like there now
+        if self.after_shot is not None:
+            old = self.after_shot[1]
+            still = None if old is None else next(
+                (b for b, _ in lying
+                 if np.hypot(*np.subtract(_center(b), _center(old))) <= max(0.6 * _diameter(old), 5.0)),
+                None)
+            # The rest of the zone is known to be empty either way. A ball
+            # still lying where it was (the trigger fired but it wasn't hit)
+            # is offered again as if just set down.
+            self.trusted, self.leftover = True, still
+            if still is not None:
+                print("Hitting zone: the ball still seems to be where it was; looking at it again")
+        else:
+            self.trusted, self.leftover = not lying, None
+        self.after_shot = None
+        print(f"Hitting zone: empty picture taken ({'no ball in it' if self.trusted else 'a ball may be in it'})")
+
+    def _spots(self, diff, thr):
+        """Ball-sized spots that have become brighter than the empty zone, with
+        nothing else changed around them: (box, strength). (The edge of a hand
+        or club can look like a small bright spot; a ball sits on its own.)"""
+        changed = np.abs(diff) > thr
+        mask = (diff > thr).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._K3)    # lone noisy pixels
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._K3)
+        n, _, st, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        lo = 2 * getattr(self.args, "blob_min_radius", 3.0)
+        hi = 2 * getattr(self.args, "blob_max_radius", 25.0)
+        if self.ball_d:                        # about the size of the last ball
+            lo, hi = max(lo, 0.5 * self.ball_d), min(hi, 1.8 * self.ball_d)
+        x0, y0 = self.area[:2]
+        out = []
+        for i in range(1, n):
+            x, y, w, h, count = (int(v) for v in st[i])
+            # A ball lit from above can show just its bright top: wider than tall.
+            if not (lo <= (w + h) / 2.0 <= hi) or not (0.5 <= w / float(h) <= 2.5) \
+                    or count < 0.4 * w * h:
+                continue
+            # On its own: hardly anything else changed in a ring round it.
+            r = max(w, h, 10)
+            rx0, ry0 = max(x - r, 0), max(y - r, 0)
+            rx1, ry1 = min(x + w + r, diff.shape[1]), min(y + h + r, diff.shape[0])
+            ring = int(changed[ry0:ry1, rx0:rx1].sum()) - int(changed[y:y + h, x:x + w].sum())
+            ring_px = (rx1 - rx0) * (ry1 - ry0) - w * h
+            if ring > 0.06 * ring_px:
+                continue
+            strength = float(diff[y:y + h, x:x + w][mask[y:y + h, x:x + w] > 0].mean())
+            side = max(w, h)
+            cx = x0 + x + w / 2.0
+            box = [int(max(cx - side / 2.0, 0)), int(y0 + y),
+                   int(min(cx + side / 2.0, WIDTH)), int(min(y0 + y + side, HEIGHT))]
+            out.append((box, strength))
+        out.sort(key=lambda s: -s[1])
+        return out[:3]
+
+
 def smooth_box(shown, box, weight=0.4):
     """The box to draw on screen: eased towards the latest detection so it
     doesn't flicker by a pixel or two; jumps straight there if the ball moved."""
@@ -743,7 +1171,9 @@ def update_ready(sh, args, gray, ball, trk, now):
         # higher (the old box was on a look-alike): start over on the new one.
         sh.armed = False
         sh.roi = sh.roi_ref = None
+        keep = {k: trk.get(k) for k in ("source", "found_by", "sure", "blob", "far")}
         trk.update(new_track())
+        trk.update(keep)
 
     if sh.armed and trk["center"] is not None:
         diff = _patch_diff(sh, gray)
@@ -772,9 +1202,9 @@ def update_ready(sh, args, gray, ball, trk, now):
     if center is None:
         if trk["center"] is not None and trk.get("misses", 0) <= getattr(args, "miss_checks", 3):
             return "BALL"   # missed for a moment: keep the box where it was, don't arm
-        spots = trk.get("spots", [])     # new-ball sightings still being confirmed
+        spots, blobs = trk.get("spots", []), trk.get("blobs", [])  # new-ball sightings being confirmed
         trk.update(new_track())
-        trk["spots"] = spots
+        trk["spots"], trk["blobs"] = spots, blobs
         sh.armed = False
         return "SEARCHING"
     if trk["center"] is not None and np.hypot(
