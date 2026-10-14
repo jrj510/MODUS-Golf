@@ -28,6 +28,7 @@ Run (inside vision-env):
 
 import argparse
 import collections
+import json
 import os
 import sys
 import threading
@@ -108,6 +109,7 @@ class Shared:
         self.trigger_source = None
         self.pending = None       # frames handed over for saving
         self.camera_fps = 0.0
+        self.exposure = (None, None)  # (microseconds, gain) the sensor last used
 
     def trigger(self, source, need_armed=True):
         with self.lock:
@@ -119,10 +121,259 @@ class Shared:
             self.trigger_source = source
 
 
+# --- Exposure ---------------------------------------------------------------
+#
+# libcamera's own auto exposure meters the whole picture and keeps changing
+# while the ball sits READY. Outdoors that left the picture washed out, and any
+# change while READY also alters the patch the motion trigger compares against.
+# So exposure is set by hand from a ladder of shutter/gain pairs, picked by
+# measuring the area around the ball, and held still while armed or recording.
+#
+# The ladder and brightness limits are OpenFlight's (camera/auto_exposure.py),
+# tested on the same OV9281, with two darker steps added for full sun. Short
+# shutters also keep a flying ball sharp; gain is raised before shutter.
+EXPOSURE_STEPS = (
+    (50, 1.0), (100, 1.0), (100, 2.0), (150, 3.0), (200, 3.0),
+    (250, 4.0),     # outdoor sun
+    (300, 5.0),
+    (350, 6.0),     # outdoor shade
+    (400, 8.0),
+    (450, 10.0),    # evening
+    (500, 12.0),    # indoor bright
+    (500, 15.0),
+    (650, 15.0),    # indoor dark
+    (800, 18.0), (1000, 20.0), (1250, 16.0))
+DEFAULT_STEP = (500, 12.0)
+EXPOSURE_FILE = "exposure.json"   # last good setting, kept in the shots folder
+
+
+def _metering_area(args):
+    """Where brightness is measured: the tapped search area plus a margin (the
+    mat around the ball), or the centre-lower part of the picture."""
+    if getattr(args, "search_area", None):
+        x0, y0, x1, y1 = _search_area(args)
+        return (max(x0 - 60, 0), max(y0 - 40, 0), min(x1 + 60, WIDTH), min(y1 + 40, HEIGHT))
+    return (int(WIDTH * 0.2), int(HEIGHT * 0.45), int(WIDTH * 0.8), int(HEIGHT * 0.9))
+
+
+def measure_exposure(gray, area):
+    """Rate the brightness inside area: (status, stats). Status is "good",
+    "marginal", "too_bright" or "too_dark"."""
+    x0, y0, x1, y1 = area
+    region = gray[y0:y1:2, x0:x1:2]
+    if region.size == 0:
+        return "marginal", {}
+    p10, median, p90 = (float(v) for v in np.percentile(region, (10, 50, 90)))
+    clipped = float(np.mean(region >= 250)) * 100.0
+    stats = {"median": round(median), "p10": round(p10), "p90": round(p90),
+             "clipped_pct": round(clipped, 1)}
+    if clipped >= 8.0 or median >= 205.0:
+        return "too_bright", stats
+    if median < 35.0 or p90 < 70.0:
+        return "too_dark", stats
+    if clipped <= 2.0 and 45.0 <= median <= 180.0:
+        return "good", stats
+    return "marginal", stats
+
+
+class ExposureControl:
+    """Picks the camera's shutter and gain from EXPOSURE_STEPS.
+
+    At start-up it jumps quickly (a check every 0.3 s) until the ball area is
+    well exposed. After that it checks every 2 s and only moves when the area
+    has been too bright or too dark twice in a row, so it doesn't hunt. Nothing
+    changes while the ball is READY or a shot is being recorded.
+    """
+
+    STARTUP_ADJUSTMENTS = 8
+    SETTLE_S = 0.3
+    CHECK_S = 2.0
+
+    def __init__(self, camera_controls, args):
+        self.args, self.cam = args, None
+        frame_us = int(1_000_000 / args.fps)
+        lo_us, hi_us = _limits(camera_controls, "ExposureTime", 1, frame_us - 100)
+        lo_g, hi_g = _limits(camera_controls, "AnalogueGain", 1.0, 16.0)
+        hi_us = min(hi_us, frame_us - 100)    # a shutter can't outlast its frame
+        steps = []
+        for us, gain in EXPOSURE_STEPS:
+            step = (int(min(max(us, lo_us), hi_us)), float(min(max(gain, lo_g), hi_g)))
+            if not steps or step[0] * step[1] > steps[-1][0] * steps[-1][1]:
+                steps.append(step)
+        self.steps = steps
+        self.index = self._nearest(self._saved() or DEFAULT_STEP)
+        self.startup_left = self.STARTUP_ADJUSTMENTS
+        self.bad_checks = 0
+        self.next_check = 0.0
+        self.state, self.message, self.stats = "starting", "Setting exposure", {}
+        self._saved_index = None
+
+    # Settings ----------------------------------------------------------------
+    def controls(self):
+        """libcamera controls for the current step (manual: auto exposure off)."""
+        us, gain = self.steps[self.index]
+        return {"AeEnable": False, "ExposureTime": us, "AnalogueGain": gain}
+
+    def _nearest(self, step):
+        signal = max(step[0] * step[1], 1.0)
+        return min(range(len(self.steps)),
+                   key=lambda i: abs(np.log(self.steps[i][0] * self.steps[i][1] / signal)))
+
+    def _path(self):
+        return os.path.join(getattr(self.args, "out", "shots"), EXPOSURE_FILE)
+
+    def _saved(self):
+        try:
+            with open(self._path()) as f:
+                s = json.load(f)
+            if int(s.get("fps", 0)) == int(self.args.fps):
+                return (float(s["exposure_us"]), float(s["gain"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    def _save(self):
+        if self._saved_index == self.index:
+            return
+        us, gain = self.steps[self.index]
+        try:
+            os.makedirs(os.path.dirname(self._path()) or ".", exist_ok=True)
+            with open(self._path(), "w") as f:
+                json.dump({"fps": self.args.fps, "exposure_us": us, "gain": gain}, f)
+            self._saved_index = self.index
+        except OSError as e:
+            print(f"Could not save the exposure setting: {e}")
+
+    # Control loop --------------------------------------------------------------
+    def update(self, gray, now, hold=False):
+        """Call a few times a second with the latest frame. hold=True while the
+        ball is READY or a shot is being recorded. Returns True when the
+        exposure was just changed (frames for the next ~0.1 s are in between)."""
+        if self.cam is None or gray is None or hold or now < self.next_check:
+            return False
+        status, self.stats = measure_exposure(gray, _metering_area(self.args))
+        startup = self.startup_left > 0
+        if status in ("good", "marginal"):
+            self.state = "ok"
+            self.message = "" if status == "good" else "Exposure usable"
+            self.startup_left, self.bad_checks = 0, 0
+            if status == "good":
+                self._save()
+            self.next_check = now + self.CHECK_S
+            return False
+        if not startup:
+            self.bad_checks += 1
+            if self.bad_checks < 2:            # wait for a second opinion
+                self.next_check = now + 0.5
+                return False
+        self.bad_checks = 0
+        target = self._target(status, self.stats, big_jumps=startup)
+        if target == self.index:               # already at the end of the ladder
+            self.state = "limit"
+            self.message = ("Too bright for the camera even at its shortest exposure: "
+                            "shade the hitting area or fit an ND filter to the lens"
+                            if status == "too_bright" else
+                            "Too dark for the camera even at its longest exposure: "
+                            "add light on the ball")
+            self.startup_left = 0
+            self.next_check = now + self.CHECK_S
+            print(f"Exposure: {self.message} ({self.stats})")
+            return False
+        old = self.steps[self.index]
+        self.index = target
+        self.startup_left = max(self.startup_left - 1, 0)
+        self.state = "adjusting"
+        self.message = "Adjusting exposure"
+        self.cam.set_controls(self.controls())
+        self.next_check = now + self.SETTLE_S
+        us, gain = self.steps[self.index]
+        print(f"Exposure: {old[0]} us x{old[1]:g} -> {us} us x{gain:g} "
+              f"({status.replace('_', ' ')}: median {self.stats.get('median')}, "
+              f"{self.stats.get('clipped_pct')}% clipped)")
+        return True
+
+    def _target(self, status, stats, big_jumps):
+        """The step to move to: aims the area's median at about 110. A clipped
+        picture hides how bright it really is, so it steps down hard."""
+        us, gain = self.steps[self.index]
+        median = max(float(stats.get("median", 110)), 1.0)
+        factor = min(max(110.0 / median, 1 / 8), 8.0)
+        if stats.get("clipped_pct", 0) > 40:
+            factor = min(factor, 0.25)
+            big_jumps = True
+        want = self._nearest((us * gain * factor, 1.0))
+        if status == "too_bright":
+            want = min(want, self.index - 1)
+        else:
+            want = max(want, self.index + 1)
+        if not big_jumps:                      # small, steady corrections
+            want = min(max(want, self.index - 2), self.index + 2)
+        return min(max(want, 0), len(self.steps) - 1)
+
+    def summary(self, actual=(None, None)):
+        """For the screen: what is set, what the sensor used, and any warning."""
+        us, gain = self.steps[self.index]
+        return {"exposure_us": us, "gain": gain, "state": self.state,
+                "message": self.message, "median": self.stats.get("median"),
+                "clipped_pct": self.stats.get("clipped_pct"),
+                "actual_us": actual[0], "actual_gain": actual[1]}
+
+
+def _limits(camera_controls, name, lo, hi):
+    """(min, max) of a camera control as picamera2 reports it."""
+    try:
+        cmin, cmax = camera_controls[name][0], camera_controls[name][1]
+        return (max(lo, cmin) if cmin else lo), (min(hi, cmax) if cmax else hi)
+    except (KeyError, TypeError, IndexError):
+        return lo, hi
+
+
+def add_exposure_args(p):
+    """Exposure options (shared with kiosk.py). --exposure / --gain still fix
+    the exposure by hand."""
+    p.add_argument("--exposure-mode", default="ladder", choices=("ladder", "auto"),
+                   help="ladder: pick shutter and gain from tested steps by measuring the area "
+                        "around the ball (default); auto: libcamera's own auto exposure")
+
+
+def start_camera(args):
+    """Open and start the OV9281 at args.fps. Returns (cam, exposure control or None)."""
+    frame_us = int(1_000_000 / args.fps)
+    controls = {"FrameDurationLimits": (frame_us, frame_us)}
+    cam = Picamera2()
+    ae = None
+    if args.exposure > 0:                      # fixed by hand
+        controls["ExposureTime"] = min(args.exposure, frame_us - 100)
+        if args.gain > 0:
+            controls["AnalogueGain"] = args.gain
+    elif getattr(args, "exposure_mode", "ladder") == "ladder":
+        ae = ExposureControl(getattr(cam, "camera_controls", {}) or {}, args)
+        controls.update(ae.controls())
+        us, gain = ae.steps[ae.index]
+        print(f"Exposure: starting at {us} us x{gain:g} (ladder of {len(ae.steps)} steps)")
+    elif args.gain > 0:
+        controls["AnalogueGain"] = args.gain
+    cam.configure(cam.create_video_configuration(
+        main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
+        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": args.bit_depth},
+        controls=controls, buffer_count=8))
+    cam.start()
+    if ae is not None:
+        ae.cam = cam
+    time.sleep(1.0)
+    return cam, ae
+
+
+# --- Ball finding and the READY logic -------------------------------------------
+
 def new_track():
     """Bookkeeping for the ready logic."""
     return {"center": None, "still_since": None, "lost_since": None, "box": None,
-            "far": False, "confirmed_at": None, "blob": False}
+            "far": False, "confirmed_at": None, "blob": False,
+            "misses": 0,          # checks in a row the followed ball wasn't found
+            "spots": [],          # new-ball candidates: [center, checks seen, diameter, box]
+            "rivals": [],         # the same, for things other than the followed ball
+            "mine": None}         # (sum, count) of the followed ball's model confidence
 
 
 def _patch_diff(sh, gray):
@@ -162,6 +413,19 @@ def add_blob_args(p):
                    help="only look for the ball inside x0,y0,x1,y1 (pixels): the mat")
 
 
+def add_tracking_args(p):
+    """Options that keep the ball box on the ball (shared with kiosk.py)."""
+    p.add_argument("--confirm-checks", type=int, default=2,
+                   help="times a NEW ball must be seen at the same spot before the box goes on it")
+    p.add_argument("--miss-checks", type=int, default=3,
+                   help="checks the followed ball may go unseen before the box is dropped")
+    p.add_argument("--keep-conf", type=float, default=0.3,
+                   help="lower model confidence accepted for the ball already being followed")
+    p.add_argument("--switch-checks", type=int, default=4,
+                   help="times something else must be seen, rated clearly higher on average "
+                        "(0.1 more confidence) than the followed ball, before the box moves to it")
+
+
 def _search_area(args):
     """The --search-area box (x0,y0,x1,y1 in pixels), or the whole frame."""
     area = getattr(args, "search_area", None)
@@ -190,6 +454,9 @@ def find_ball_spot(gray, args, near=None):
     mat around it (brighter or darker). The mat's own edges run across the
     picture, so each pixel is compared with the average of its own row; long
     edges then vanish while the ball stands out.
+
+    A dark spot on its own (a divot, a shadow, a hole in the mat) is only
+    accepted right next to a ball already being followed, never as a new ball.
     """
     x0, y0, x1, y1 = _search_area(args)
     if near is not None:   # only look around where the ball was last seen
@@ -216,7 +483,9 @@ def find_ball_spot(gray, args, near=None):
     bright, dark = parts(dev > c), parts(dev < -c)
     # A ball lit from above is a bright cap with its own shadow right under it:
     # join each such pair into one candidate.
-    candidates = [(b, False) for b in bright] + [(d, False) for d in dark]
+    candidates = [(b, False) for b in bright]
+    if near is not None:
+        candidates += [(d, False) for d in dark]
     for b in bright:
         for d in dark:
             overlap = min(b[2], d[2]) - max(b[0], d[0])
@@ -247,68 +516,209 @@ def find_ball_spot(gray, args, near=None):
     return best
 
 
+def _center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _diameter(box):
+    return ((box[2] - box[0]) + (box[3] - box[1])) / 2.0
+
+
+def _matches_track(box, trk):
+    """True if box is plausibly the ball being followed: close to where it was
+    last seen (within 2.5 ball widths, at least 20 px) and about the same size."""
+    ref = trk.get("box")
+    if ref is None:
+        return False
+    d_ref, d = max(_diameter(ref), 1.0), _diameter(box)
+    (cx, cy), (rx, ry) = _center(box), _center(ref)
+    return (np.hypot(cx - rx, cy - ry) <= max(2.5 * d_ref, 20.0)
+            and 0.6 <= d / d_ref <= 1.7)
+
+
+def _confirmed(trk, found, args, key="spots", need=None, hold=1, better_than=0.0):
+    """Count sightings per spot; return the box of a spot seen at least `need`
+    times (default --confirm-checks) whose average confidence is at least
+    better_than, else None.
+
+    found: (box, confidence) pairs from this check. A spot not seen keeps its
+    count for `hold` checks (the real ball is missed now and then), then is
+    forgotten. Only a spot seen this check can be returned, and of several the
+    one the model rates highest on average wins. So a one-off false detection
+    never gets the box, and of two look-alikes the more ball-like one is chosen.
+    """
+    old, kept = list(trk.get(key, [])), []
+    for box, conf in found:
+        c = _center(box)
+        prev = next((s for s in old if np.hypot(c[0] - s["c"][0], c[1] - s["c"][1])
+                     <= max(1.5 * s["d"], 12.0)), None)
+        if prev is not None:
+            old.remove(prev)
+        kept.append({"c": c, "d": _diameter(box), "box": box, "seen": True, "idle": 0,
+                     "n": (prev["n"] if prev else 0) + 1,
+                     "total": (prev["total"] if prev else 0.0) + conf})
+    kept += [dict(s, seen=False, idle=s["idle"] + 1) for s in old if s["idle"] < hold]
+    trk[key] = kept
+    need = max(need if need is not None else getattr(args, "confirm_checks", 2), 1)
+    ready = [s for s in kept if s["seen"] and s["n"] >= need
+             and s["total"] / s["n"] >= better_than]
+    return max(ready, key=lambda s: s["total"] / s["n"])["box"] if ready else None
+
+
+def _seen(trk, box, blob=False, keep_rivals=False):
+    """The followed (or newly confirmed) ball was found."""
+    trk["misses"], trk["spots"], trk["blob"] = 0, [], blob
+    if not keep_rivals:
+        trk["rivals"], trk["mine"] = [], None
+    return box
+
+
 def detect_ball(model, gray, args, trk):
-    """The ball's box [x0, y0, x1, y1], or None: the model first, then (with
-    --blob) the small-ball finder. With --search-area, anything found outside
-    that area is ignored."""
+    """The ball's box [x0, y0, x1, y1], or None.
+
+    The box stays on one ball:
+      - while a ball is being followed, only a detection near it, of about its
+        size, counts (at a lower confidence, --keep-conf);
+      - if it goes unseen, nothing else is taken for --miss-checks checks (the
+        READY logic keeps the old box meanwhile);
+      - a new ball needs the full --conf and must be seen at the same spot
+        --confirm-checks times (one or two misses in between are allowed);
+      - while the followed ball is still seen, the box only moves to something
+        else that has been seen --switch-checks times and that the model rates
+        clearly higher on average (the box had settled on a tee, say).
+    The model looks first; the small-ball finder (--blob) only when it finds
+    nothing. With --search-area, anything outside the area is ignored, and
+    tapping the ball on the Camera view is the surest way to keep the box on it.
+    """
+    following = trk.get("box") is not None and trk["center"] is not None
     use_blob = getattr(args, "blob", False)
-    if use_blob and trk.get("blob") and trk["center"] is not None:
-        ball = find_ball_spot(gray, args, near=trk["center"])   # cheap: keep following it
-        if ball:
-            return ball
-    ball = _detect_with_model(model, gray, args, trk)
-    if ball and _inside_area(args, ball):
-        trk["blob"] = False
-        return ball
+
+    # Following a small ball the blob finder found: a cheap look right around it.
+    if use_blob and following and trk.get("blob"):
+        box = find_ball_spot(gray, args, near=_center(trk["box"]))
+        if box and _matches_track(box, trk):
+            return _seen(trk, box, blob=True)
+
+    cands = list(_model_candidates(model, gray, args, trk, following)) if model is not None else []
+    strong = [c for c in cands if c[1] >= args.conf]
+    if following:
+        mine = [c for c in cands if _matches_track(c[0], trk)]
+        if mine:
+            box, conf, far = max(mine, key=lambda c: c[1])
+            total, n = trk.get("mine") or (0.0, 0)
+            trk["mine"] = (total + conf, n + 1)          # the followed ball's average rating
+            # Something else at a steady spot takes over once it has been seen
+            # --switch-checks times and the model rates it, on average, clearly
+            # higher (0.1) than the followed ball: e.g. the box had settled on
+            # a tee before the ball was put down. Two equally ball-like things
+            # never trade places.
+            others = [c for c in cands if not _matches_track(c[0], trk)]
+            rival = _confirmed(trk, [(b, c) for b, c, _ in others], args, key="rivals",
+                               need=getattr(args, "switch_checks", 4), hold=8,
+                               better_than=max(args.conf, (total + conf) / (n + 1) + 0.1))
+            if rival is not None:
+                trk["far"] = next(f for b, _, f in others if b is rival)
+                trk["switched"] = True          # update_ready starts over on it
+                return _seen(trk, rival)
+            trk["far"] = far
+            return _seen(trk, box, keep_rivals=True)
+
+    if following and use_blob and not trk.get("blob"):
+        # The model missed the ball it was following: try the small-ball
+        # finder right where it was.
+        box = find_ball_spot(gray, args, near=_center(trk["box"]))
+        if box and _matches_track(box, trk):
+            return _seen(trk, box, blob=True)
+
+    if following and trk["misses"] < getattr(args, "miss_checks", 3):
+        # The ball we follow wasn't seen this time. Don't jump to anything else
+        # yet; it is usually just a missed detection.
+        trk["misses"] += 1
+        return None
+
+    if strong:
+        box = _confirmed(trk, [(b, c) for b, c, _ in strong], args, hold=2)
+        if box is not None:
+            trk["far"] = next(f for b, _, f in strong if b is box)
+            return _seen(trk, box)
+        trk["misses"] += 1
+        return None
+
     if use_blob:
-        ball = find_ball_spot(gray, args)
-        if ball:
-            trk["blob"] = True
-            return ball
+        box = find_ball_spot(gray, args)
+        confirmed = _confirmed(trk, [(box, 1.0)] if box else [], args, hold=0)
+        if confirmed is not None:
+            return _seen(trk, confirmed, blob=True)
+    else:
+        trk["spots"] = []
+    trk["misses"] += 1
     return None
 
 
-def _detect_with_model(model, gray, args, trk):
-    """Ask the model where the ball is. Returns [x0, y0, x1, y1] or None.
+def _tile_starts(a0, a1, size, limit):
+    """Start positions of size-long windows covering a0..a1 within 0..limit."""
+    if a1 - a0 <= size:
+        return [int(min(max((a0 + a1) / 2 - size / 2, 0), limit - size))]
+    starts = list(range(int(a0), int(a1 - size), int(size * 0.75))) + [int(a1 - size)]
+    return sorted({min(max(s, 0), limit - size) for s in starts})
 
-    The model looks at a small square picture. Shrinking the whole frame down
-    to that size makes a distant ball only a few pixels wide, too small to
-    recognise. So besides the whole frame, the frame is also cut into
-    overlapping tiles that are checked at full detail. Once a distant ball is
-    found, only the tile around it is checked, which keeps things fast.
+
+def _model_regions(gray, args, trk):
+    """Where the model looks, most likely first: (image, x offset, y offset, tile?).
+
+    The model sees a small square picture. Shrinking the whole frame to that size
+    makes a distant ball a few pixels wide, too small to recognise, so the frame
+    is also cut into overlapping tiles looked at in full detail. With a tapped
+    search area, only the tile(s) covering that area are used: faster, and
+    nothing outside it can be mistaken for the ball.
     """
-    def run(img, ox, oy):
-        bgr = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_GRAY2BGR)
-        r = model.predict(bgr, imgsz=args.imgsz, conf=args.conf, verbose=False)[0]
-        if not len(r.boxes):
-            return None
-        i = int(r.boxes.conf.argmax())
-        x0, y0, x1, y1 = [float(v) for v in r.boxes.xyxy[i]]
-        return [int(x0 + ox), int(y0 + oy), int(x1 + ox), int(y1 + oy)]
-
     T = min(args.tile, HEIGHT)
     if T <= 0 or T >= WIDTH:
-        return run(gray, 0, 0)
-
-    # Already following a distant ball: look only around where it was.
-    if trk["far"] and trk["center"] is not None:
+        yield gray, 0, 0, False
+        return
+    if getattr(args, "search_area", None):
+        x0, y0, x1, y1 = _search_area(args)
+        for oy in _tile_starts(y0, y1, T, HEIGHT):
+            for ox in _tile_starts(x0, x1, T, WIDTH):
+                yield gray[oy:oy + T, ox:ox + T], ox, oy, True
+        return
+    if trk["far"] and trk["center"] is not None:     # following a distant ball
         ox = int(min(max(trk["center"][0] - T / 2, 0), WIDTH - T))
         oy = int(min(max(trk["center"][1] - T / 2, 0), HEIGHT - T))
-        ball = run(gray[oy:oy + T, ox:ox + T], ox, oy)
-        if ball:
-            return ball
-
-    ball = run(gray, 0, 0)          # whole frame: finds a close, large ball
-    if ball:
-        trk["far"] = False
-        return ball
+        yield gray[oy:oy + T, ox:ox + T], ox, oy, True
+    yield gray, 0, 0, False                           # whole frame: a close, large ball
     for oy in sorted({0, HEIGHT - T}):
         for ox in sorted({0, (WIDTH - T) // 2, WIDTH - T}):
-            ball = run(gray[oy:oy + T, ox:ox + T], ox, oy)
-            if ball:
-                trk["far"] = True
-                return ball
-    return None
+            yield gray[oy:oy + T, ox:ox + T], ox, oy, True
+
+
+def _model_candidates(model, gray, args, trk, following):
+    """Every plausible ball the model reports, as (box, confidence, tile?),
+    region by region. Stops early once a region has a confident find (or,
+    when following, the caller has what it needs)."""
+    low = min(getattr(args, "keep_conf", 0.3), args.conf) if following else args.conf
+    for img, ox, oy, tile in _model_regions(gray, args, trk):
+        bgr = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_GRAY2BGR)
+        r = model.predict(bgr, imgsz=args.imgsz, conf=low, verbose=False)[0]
+        found = []
+        for i in range(len(r.boxes)):
+            x0, y0, x1, y1 = [float(v) for v in r.boxes.xyxy[i]]
+            box = [int(x0 + ox), int(y0 + oy), int(x1 + ox), int(y1 + oy)]
+            if _inside_area(args, box):
+                found.append((box, float(r.boxes.conf[i]), tile))
+        found.sort(key=lambda f: -f[1])
+        yield from found
+        if any(c >= args.conf or (following and _matches_track(b, trk)) for b, c, _ in found):
+            return
+
+
+def smooth_box(shown, box, weight=0.4):
+    """The box to draw on screen: eased towards the latest detection so it
+    doesn't flicker by a pixel or two; jumps straight there if the ball moved."""
+    if shown is None or box is None or np.hypot(*np.subtract(_center(box), _center(shown))) \
+            > max(_diameter(box), 10.0):
+        return list(box) if box is not None else None
+    return [int(round(s + weight * (b - s))) for s, b in zip(shown, box)]
 
 
 def update_ready(sh, args, gray, ball, trk, now):
@@ -321,6 +731,13 @@ def update_ready(sh, args, gray, ball, trk, now):
     center = None
     if ball is not None:
         center = ((ball[0] + ball[2]) / 2, (ball[1] + ball[3]) / 2)
+
+    if trk.pop("switched", False) and ball is not None:
+        # detect_ball moved the box to something the model rates clearly
+        # higher (the old box was on a look-alike): start over on the new one.
+        sh.armed = False
+        sh.roi = sh.roi_ref = None
+        trk.update(new_track())
 
     if sh.armed and trk["center"] is not None:
         diff = _patch_diff(sh, gray)
@@ -347,7 +764,11 @@ def update_ready(sh, args, gray, ball, trk, now):
         trk.update(new_track())
 
     if center is None:
+        if trk["center"] is not None and trk.get("misses", 0) <= getattr(args, "miss_checks", 3):
+            return "BALL"   # missed for a moment: keep the box where it was, don't arm
+        spots = trk.get("spots", [])     # new-ball sightings still being confirmed
         trk.update(new_track())
+        trk["spots"] = spots
         sh.armed = False
         return "SEARCHING"
     if trk["center"] is not None and np.hypot(
@@ -431,7 +852,9 @@ def camera_thread(cam, sh, args):
         req = cam.capture_request()
         try:
             img = req.make_array("main")[:HEIGHT, :WIDTH]
-            sensor_ns = req.get_metadata().get("SensorTimestamp", 0)
+            md = req.get_metadata()
+            sensor_ns = md.get("SensorTimestamp", 0)
+            sh.exposure = (md.get("ExposureTime"), md.get("AnalogueGain"))
         finally:
             req.release()
         now = time.monotonic()
@@ -533,11 +956,14 @@ def main():
                    help="how much the ball's patch must change to count as a shot (0-255)")
     p.add_argument("--bit-depth", type=int, default=8, choices=(8, 10),
                    help="sensor bit depth; 8 allows the fastest frame rates")
-    p.add_argument("--exposure", type=int, default=0, help="exposure in microseconds (0 = auto)")
-    p.add_argument("--gain", type=float, default=0.0, help="analogue gain (0 = auto)")
+    p.add_argument("--exposure", type=int, default=0,
+                   help="fix the exposure in microseconds (0 = automatic, see --exposure-mode)")
+    p.add_argument("--gain", type=float, default=0.0, help="analogue gain with --exposure (0 = auto)")
     p.add_argument("--out", default="shots", help="folder to save shots into")
     p.add_argument("--port", type=int, default=8000, help="web stream port")
     add_blob_args(p)
+    add_tracking_args(p)
+    add_exposure_args(p)
     args = p.parse_args()
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
 
@@ -545,19 +971,7 @@ def main():
     model = YOLO(os.path.expanduser(args.model), task="detect")
     model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
 
-    frame_us = int(1_000_000 / args.fps)
-    controls = {"FrameDurationLimits": (frame_us, frame_us)}
-    if args.exposure > 0:
-        controls["ExposureTime"] = min(args.exposure, frame_us - 100)
-    if args.gain > 0:
-        controls["AnalogueGain"] = args.gain
-    cam = Picamera2()
-    cam.configure(cam.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
-        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": args.bit_depth},
-        controls=controls, buffer_count=8))
-    cam.start()
-    time.sleep(1.0)
+    cam, ae = start_camera(args)
 
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
     threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
@@ -582,7 +996,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"Live view: http://modus.local:{args.port}   (Ctrl+C to stop)")
 
-    state, ball = None, None
+    state, ball, shown = None, None, None
     trk = new_track()
     period = 1.0 / args.checks_per_second
 
@@ -605,10 +1019,12 @@ def main():
                 continue
 
             capturing = sh.trigger_time is not None
+            if ae is not None:
+                ae.update(gray, time.monotonic(), hold=sh.armed or capturing)
             if not capturing:
                 ball = detect_ball(model, gray, args, trk)
                 new_state = update_ready(sh, args, gray, ball, trk, time.monotonic())
-                ball = trk["box"]
+                ball = trk["box"] if new_state in ("BALL", "READY") else None
             else:
                 new_state = "CAPTURING"
 
@@ -619,9 +1035,12 @@ def main():
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             color = {"SEARCHING": (0, 0, 255), "BALL": (0, 200, 255),
                      "READY": (0, 255, 0), "CAPTURING": (255, 0, 255)}[state]
-            if ball:
-                cv2.rectangle(view, (ball[0], ball[1]), (ball[2], ball[3]), color, 2)
-            cv2.putText(view, f"{state}  camera {sh.camera_fps:.0f} fps", (10, 25),
+            shown = smooth_box(shown, ball)
+            if shown:
+                cv2.rectangle(view, (shown[0], shown[1]), (shown[2], shown[3]), color, 2)
+            us, gain = sh.exposure
+            expo = f"  {us} us x{gain:.1f}" if us and gain else ""
+            cv2.putText(view, f"{state}  camera {sh.camera_fps:.0f} fps{expo}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             ok, jpeg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:

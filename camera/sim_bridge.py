@@ -95,13 +95,19 @@ class SimBridge:
             print(f"[{time.strftime('%H:%M:%S')}] Simulator {name} error: "
                   f"{getattr(event, 'message', '')}")
 
-    def send(self, shot, launch_angle=None):
-        """Send one speed-radar shot, with the TI radar's launch angle if any."""
+    def send(self, shot, launch_angle=None, ball_speed=None, launch_dir=None):
+        """Send one speed-radar shot, with the TI radar's launch angle and
+        direction if any, and the kiosk's corrected ball speed if given (the
+        same number shown on the screen)."""
         if shot is None:
             return
         try:
             if launch_angle is not None:
                 shot = _with(shot, launch_angle_vertical=float(launch_angle))
+            if launch_dir is not None:
+                shot = _with(shot, launch_angle_horizontal=float(launch_dir))
+            if ball_speed:
+                shot = _with(shot, ball_speed_mph=float(ball_speed))
             # The simulator's club (or --sim-club) decides the typical launch and
             # spin used for anything the radars didn't measure.
             shot = _with(shot, club=self.player.club)

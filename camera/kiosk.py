@@ -44,10 +44,11 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from ballflight import shot_flight
+from ballflight import club_defaults, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, add_blob_args, camera_thread,
-                          detect_ball, new_track, save_shot, update_ready)
+from shot_capture import (HEIGHT, STREAM, WIDTH, Shared, add_blob_args, add_exposure_args,
+                          add_tracking_args, camera_thread, detect_ball, new_track, save_shot,
+                          smooth_box, start_camera, update_ready)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 REPLAY_FPS = 30
@@ -85,10 +86,14 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
   justify-content:center}
 #keep{background:#1f9d55}#del{background:#c0392b}
 #vmsg{font-size:3.4vh;color:#9aa7b4}
+.cmsg{font-size:3vh;color:#9aa7b4;text-align:center}
+#expo{font-size:2.6vh;color:#7c8894}
+#camwarn{color:#f0b429;font-size:2.6vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style></head><body>
 <div id="top">
   <div id="status"><span id="dot"></span><span id="stext">Starting</span></div>
   <button id="pv" class="hide" onclick="show('preview')">Shot Preview</button>
+  <span id="camwarn"></span>
   <span id="shotno"></span>
   <button id="cam" onclick="show('camera')">Camera</button>
   <button id="rng" onclick="location.href='/range'">Range</button>
@@ -107,7 +112,7 @@ button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
 <div id="camera" class="view hide">
   <img id="live">
   <div class="bar"><button onclick="show('main')">Back</button>
-    <span id="vmsg">Tap the ball to aim the camera there</span></div>
+    <span class="cmsg">Tap the ball to aim the camera there<br><span id="expo"></span></span></div>
 </div>
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
@@ -171,6 +176,11 @@ async function tick(){
     $('del').classList.toggle('hide',!has);
     $('vmsg').textContent=video=='kept'?'Saved':(video=='pending'?'Save this video?':'');
     if(view=='preview'&&!has)show('main');
+    const c=s.camera;
+    $('expo').textContent=c?('Exposure '+c.exposure_us+' us x'+c.gain+
+      (c.median!=null?', ball area brightness '+c.median+(c.clipped_pct?' ('+c.clipped_pct+'% white)':''):'')+
+      (c.message?'. '+c.message:'')):'';
+    $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):'';
     fails=0;
   }catch(e){
     // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
@@ -288,7 +298,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/state":
                 body = json.dumps({"state": K.state, "shot": K.shot, "rev": K.rev,
-                                   "metrics": K.metrics, "video": K.video}).encode()
+                                   "metrics": K.metrics, "video": K.video,
+                                   "camera": getattr(K, "camera", None)}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -490,7 +501,7 @@ def save_metrics(folder, metrics, radar_log):
 
 SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
                    "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
-                   "ti_radar"]
+                   "ti_radar", "ball_speed_raw_mph", "launch_dir_deg"]
 
 
 def _session_path():
@@ -511,7 +522,8 @@ def _log_session(shot, m, f, r):
                m.get("club_speed"), m.get("smash"), f.get("launch"),
                "no" if "launch" in f.get("assumed", []) else "yes", f.get("spin"),
                f.get("carry"), f.get("apex"),
-               (r or {}).get("error") or (r or {}).get("quality") or ""]
+               (r or {}).get("error") or (r or {}).get("quality") or "",
+               m.get("ball_speed_raw"), m.get("launch_dir")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
@@ -528,6 +540,7 @@ def _publish(shot, o, r, final):
             return None
         m = dict(K.metrics)
         m["radar_pending"] = not final
+        club = getattr(K.args, "club", "52") if K.args else "52"
         if o:
             if o["ball_speed"] is not None:
                 m["ball_speed"] = round(o["ball_speed"], 1)
@@ -539,8 +552,26 @@ def _publish(shot, o, r, final):
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:
                 m["launch_angle"] = round(r["launch_angle"], 1)
+            if r.get("launch_dir") is not None:
+                m["launch_dir"] = round(r["launch_dir"], 1)
             if m.get("ball_speed") is None and r["ball_speed"] is not None:
                 m["ball_speed"] = round(r["ball_speed"], 1)
+        fix = getattr(K, "correct_speed", None)
+        if fix is not None and o and o.get("ball_speed"):
+            # The OPS reads the ball's speed along its line of sight, which is
+            # low for a ball climbing away at the launch angle. Correct it with
+            # the TI's angle, or the club's typical launch until that arrives
+            # (as OpenFlight does). Always from the raw reading, so the second
+            # pass with the TI angle replaces the first.
+            raw = float(o["ball_speed"])
+            launch = m.get("launch_angle")
+            if launch is None:
+                launch = club_defaults(club)[0]
+            try:
+                m["ball_speed"] = round(fix(raw, launch), 1)
+                m["ball_speed_raw"] = round(raw, 1)
+            except Exception as e:
+                print(f"Shot {shot}: ball-speed correction failed ({type(e).__name__}: {e})")
         if m.get("ball_speed") and m.get("club_speed"):
             smash = m["ball_speed"] / m["club_speed"]
             if 0.8 <= smash <= 1.6:
@@ -556,7 +587,6 @@ def _publish(shot, o, r, final):
             # Fly the ball: measured ball speed, plus the TI radar's launch angle
             # when there is one (otherwise the club's typical launch). Spin uses
             # the club's typical value: the speed radar's spin is experimental.
-            club = getattr(K.args, "club", "52") if K.args else "52"
             f = shot_flight(m["ball_speed"], club, launch_angle=m.get("launch_angle"))
             m["carry"] = round(f["carry"])
             m["carry_estimated"] = "launch" in f["assumed"]
@@ -584,20 +614,22 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
         # The TI radar is guided by the speed radar's shot, so without one there
         # is nothing to wait for.
         r = iwr.result_for(trigger_time, wait_s=30.0) if o else {
-            "launch_angle": None, "ball_speed": None, "quality": None,
+            "launch_angle": None, "launch_dir": None, "ball_speed": None, "quality": None,
             "error": "no speed-radar shot to guide the TI radar"}
         m = _publish(shot, o, r, final=True)
         if m is None:
             return
     save_metrics(folder if K.folder == folder else None, m, radar_log)
     if getattr(K, "sim", None) is not None and o:
-        K.sim.send(o.get("shot"), r.get("launch_angle") if r else None)
+        K.sim.send(o.get("shot"), r.get("launch_angle") if r else None,
+                   ball_speed=m.get("ball_speed"), launch_dir=m.get("launch_dir"))
 
     if ops is not None and not o:
         print(f"Shot {shot}: speed radar gave no reading (no ball seen flying away from it)")
     if r and r["error"]:
         print(f"Shot {shot}: TI radar gave no angle ({r['error']})")
-    shown = {x: m[x] for x in ("ball_speed", "club_speed", "smash", "launch_angle", "spin", "carry")
+    shown = {x: m[x] for x in ("ball_speed", "ball_speed_raw", "club_speed", "smash",
+                               "launch_angle", "launch_dir", "spin", "carry")
              if m.get(x) is not None}
     print(f"Shot {shot}: {shown if shown else 'no radar numbers'}")
 
@@ -641,11 +673,14 @@ def main():
     p.add_argument("--motion-threshold", type=float, default=25.0)
     p.add_argument("--bit-depth", type=int, default=8, choices=(8, 10),
                    help="sensor bit depth; 8 allows the fastest frame rates")
-    p.add_argument("--exposure", type=int, default=0)
-    p.add_argument("--gain", type=float, default=0.0)
+    p.add_argument("--exposure", type=int, default=0,
+                   help="fix the exposure in microseconds (0 = automatic, see --exposure-mode)")
+    p.add_argument("--gain", type=float, default=0.0, help="analogue gain with --exposure")
     p.add_argument("--out", default="shots", help="folder to save shots into")
     p.add_argument("--port", type=int, default=8000)
     add_blob_args(p)
+    add_tracking_args(p)
+    add_exposure_args(p)
     p.add_argument("--no-ball", action="store_true",
                    help="swing test: skip ball detection and record when a fast swing passes")
     p.add_argument("--swing-fraction", type=float, default=0.015,
@@ -667,13 +702,22 @@ def main():
     p.add_argument("--iwr-config", default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg")
     p.add_argument("--iwr-cal", default="config/iwr6843_calibration_reference.json",
                    help="TI radar calibration file (inside the OpenFlight folder)")
-    p.add_argument("--iwr-tee-m", type=float, default=1.575, help="radar to tee distance, m")
-    p.add_argument("--iwr-net-m", type=float, default=4.6, help="radar to net distance, m")
-    p.add_argument("--iwr-tilt-deg", type=float, default=10.4, help="radar upward tilt, degrees")
-    p.add_argument("--iwr-radar-height-m", type=float, default=0.1524,
-                   help="antenna centre height above the floor, m")
-    p.add_argument("--iwr-ball-height-m", type=float, default=0.040,
-                   help="ball centre height above the floor, m")
+    # TI geometry. start_kiosk.sh passes the measured values; these defaults
+    # match it so a hand-started kiosk uses the same numbers.
+    p.add_argument("--iwr-tee-m", type=float, default=1.575,
+                   help="slant distance, TI antenna centre to ball centre, m")
+    p.add_argument("--iwr-net-m", type=float, default=4.6,
+                   help="TI antenna centre to the net, m")
+    p.add_argument("--iwr-tilt-deg", type=float, default=10.0,
+                   help="TI antenna face tilt: degrees it leans back from vertical (boresight up)")
+    p.add_argument("--iwr-radar-height-m", type=float, default=0.076,
+                   help="TI antenna centre height above the ground under the ball, m")
+    p.add_argument("--iwr-ball-height-m", type=float, default=0.021,
+                   help="ball centre height above the same ground, m (0.021 = ball on the ground)")
+    p.add_argument("--iwr-azimuth-offset-deg", type=float, default=0.0,
+                   help="degrees the radars point right of the target line (left = negative)")
+    p.add_argument("--no-speed-correction", action="store_true",
+                   help="show the speed radar's raw ball speed (no launch-angle cosine correction)")
     p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
     p.add_argument("--gate-gpio", type=int, default=17,
                    help="GPIO number the sound sensor's GATE is wired to (17 = pin 11, 26 = pin 37)")
@@ -722,19 +766,10 @@ def main():
         model = YOLO(os.path.expanduser(args.model), task="detect")
         model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
 
-    frame_us = int(1_000_000 / args.fps)
-    controls = {"FrameDurationLimits": (frame_us, frame_us)}
-    if args.exposure > 0:
-        controls["ExposureTime"] = min(args.exposure, frame_us - 100)
-    if args.gain > 0:
-        controls["AnalogueGain"] = args.gain
-    cam = Picamera2()
-    cam.configure(cam.create_video_configuration(
-        main={"size": (WIDTH, HEIGHT), "format": "YUV420"},
-        sensor={"output_size": (WIDTH, HEIGHT), "bit_depth": args.bit_depth},
-        controls=controls, buffer_count=8))
-    cam.start()
-    time.sleep(1.0)
+    # Exposure is picked by measuring the area around the ball (see
+    # ExposureControl in shot_capture.py); --exposure fixes it by hand.
+    cam, ae = start_camera(args)
+    K.camera = None
 
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
     threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
@@ -768,6 +803,14 @@ def main():
             bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
         except Exception as e:
             print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
+    # Ball-speed cosine correction: on whenever the TI radar is running, as in
+    # OpenFlight. The raw reading is kept in the session log.
+    K.correct_speed = None
+    if bridge is not None and ops is not None and not args.no_speed_correction:
+        from iwr_bridge import ops_speed_corrector
+        K.correct_speed = ops_speed_corrector(args)
+        if K.correct_speed is not None:
+            print("Ball speed: corrected for launch angle (raw OPS reading kept in the log)")
     if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice
@@ -777,7 +820,7 @@ def main():
         except Exception as e:
             print(f"Sound trigger not available ({e}); continuing without it")
 
-    ball, trk = None, new_track()
+    ball, trk, drawn = None, new_track(), None
     rearm_at = time.monotonic() + 2.0
     period = 1.0 / args.checks_per_second
     K.state = "SEARCHING"
@@ -790,6 +833,8 @@ def main():
                 trk.update(new_track())
                 sh.armed = False
                 sh.roi = sh.roi_ref = None
+                if ae is not None:
+                    ae.next_check = 0.0       # re-meter on the newly tapped area now
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
@@ -836,6 +881,18 @@ def main():
                 time.sleep(0.01)
                 continue
 
+            # Exposure: never changed while a shot is being recorded, nor while
+            # the ball is READY (the motion trigger compares against a fixed
+            # picture of it). In the swing test a change briefly disarms, so the
+            # brightness step itself can't look like a swing.
+            if ae is not None:
+                busy = sh.trigger_time is not None or sh.pending is not None
+                hold = busy or (sh.armed and not args.swing_test)
+                if ae.update(gray, time.monotonic(), hold=hold) and args.swing_test:
+                    sh.armed = False
+                    rearm_at = time.monotonic() + 0.5
+                K.camera = ae.summary(sh.exposure)
+
             if sh.trigger_time is not None:
                 K.state = "CAPTURING"
             elif args.swing_test:
@@ -846,17 +903,19 @@ def main():
             else:
                 ball = detect_ball(model, gray, args, trk)
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
-                ball = trk["box"]
+                ball = trk["box"] if K.state in ("BALL", "READY") else None
 
             K.latest_gray = gray
-            # Live picture for the Camera view, with a box round the ball.
+            # Live picture for the Camera view, with a box round the ball (eased
+            # so it doesn't flicker; it still jumps if the ball really moves).
+            drawn = smooth_box(drawn, ball)
             view = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             if args.search_area:
                 a = [int(float(v)) for v in args.search_area.split(",")]
                 cv2.rectangle(view, (a[0], a[1]), (a[2], a[3]), (255, 200, 0), 1)
-            if ball and K.state in ("BALL", "READY"):
+            if drawn and K.state in ("BALL", "READY"):
                 color = (0, 255, 0) if K.state == "READY" else (0, 200, 255)
-                cv2.rectangle(view, (ball[0], ball[1]), (ball[2], ball[3]), color, 2)
+                cv2.rectangle(view, (drawn[0], drawn[1]), (drawn[2], drawn[3]), color, 2)
             ok, jpeg = cv2.imencode(".jpg", view, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 STREAM.put(jpeg.tobytes())
