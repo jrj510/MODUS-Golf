@@ -259,7 +259,18 @@ def empty_metrics():
 
 
 AREA_FILE = "search_area.txt"   # where the hitting zone is remembered
-TAP_ZONE = (320, 120)           # size of the hitting zone made round a tapped ball, pixels
+# Size of the hitting zone made round a tapped ball, in wide-view pixels. With
+# the ball 5 ft 2 in from the camera it always sits in about the same spot, so
+# the zone is kept small (about 5 ball widths across, 4 tall): other balls on
+# a range mat, or marks on the floor, stay outside it and are never looked at.
+TAP_ZONE = (80, 60)
+
+
+def tap_zone(view):
+    """TAP_ZONE in the given view's pixels: twice as many when zoomed in, so the
+    zone covers the same patch of ground either way."""
+    k = 2 // view.scale
+    return TAP_ZONE[0] * k, TAP_ZONE[1] * k
 
 
 def zone_around(x, y, size=TAP_ZONE):
@@ -323,7 +334,7 @@ class Kiosk:
         area = [int(float(v)) for v in self.args.search_area.split(",")] \
             if self.args.search_area else None
         if not area or not (area[0] <= x <= area[2] and area[1] <= y <= area[3]):
-            self._use_area(zone_around(x, y), "made round the tapped ball")
+            self._use_area(zone_around(x, y, tap_zone(self.view)), "made round the tapped ball")
         self.hint = (x, y)
         self.reset_track = True
         print(f"Tapped at ({x}, {y}): looking for the ball there")
@@ -924,9 +935,10 @@ def main():
     args.swing_test = args.no_ball
     if args.swing_test:
         args.triggers.discard("motion")  # there is no ball patch to watch
-    # The hitting zone set last time wins over --search-area. An older saved
-    # area from a tap (just round one ball) is widened to a zone, so the next
-    # ball doesn't have to land in exactly the same spot.
+    # The hitting zone set last time wins over --search-area. A saved zone
+    # made from a tap is resized to TAP_ZONE round its centre (older ones were
+    # either just round one ball or much bigger). A box dragged by hand is
+    # kept exactly as drawn.
     saved_view = View()            # the view the saved zone was drawn in
     try:
         with open(os.path.join(args.out, AREA_FILE)) as f:
@@ -935,11 +947,10 @@ def main():
             a = [int(float(v)) for v in lines[0].split(",")]
             kind = lines[1] if len(lines) > 1 else "tap"
             saved_view = View.from_tag(lines[2] if len(lines) > 2 else "wide")
-            if kind != "drawn" and (a[2] - a[0] < TAP_ZONE[0] or a[3] - a[1] < TAP_ZONE[1]):
-                w = max(a[2] - a[0], TAP_ZONE[0])
-                h = max(a[3] - a[1], TAP_ZONE[1])
-                a = zone_around((a[0] + a[2]) / 2, (a[1] + a[3]) / 2, (w, h))
-                print("Widened the saved tap area into a hitting zone")
+            size = tap_zone(saved_view)
+            if kind != "drawn" and (a[2] - a[0], a[3] - a[1]) != size:
+                a = zone_around((a[0] + a[2]) / 2, (a[1] + a[3]) / 2, size)
+                print(f"Resized the saved tap zone to {size[0]}x{size[1]} px")
             args.search_area = ",".join(str(int(v)) for v in a)
             K.zone_kind = kind
             print(f"Using the hitting zone set last time: {args.search_area} ({saved_view.tag})")
