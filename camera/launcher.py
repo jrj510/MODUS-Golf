@@ -9,10 +9,10 @@ kiosk's Menu button brings you back here.
 
     python3 camera/launcher.py [--open-browser]
 
-Prints one line when Start is pressed, for example "saver,7i", "wall,driver" or "sound,52".
-Modes: saver = camera + sound, no shot preview video (for the power bank);
-       wall  = camera + sound with the slow-motion shot preview (wall power);
-       sound = sound trigger only, no ball finding.
+Prints one line when Start is pressed, for example "outside,7i" or "inside,driver".
+Modes (both use the camera + sound trigger and the slow-motion shot preview):
+       outside = Outside Golf: slower camera so a battery pack lasts and doesn't cut out;
+       inside  = Inside Golf: fastest camera, needs a wall outlet.
 """
 
 import argparse
@@ -25,7 +25,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SETTINGS = os.path.expanduser("~/MODUS-Golf/shots/launcher.json")
-MODES = ("saver", "wall", "sound")
+MODES = ("outside", "inside")
 CLUBS = ["driver", "3w", "hybrid", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
 CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "5i": "5 Iron",
               "6i": "6 Iron", "7i": "7 Iron", "8i": "8 Iron", "9i": "9 Iron", "pw": "PW",
@@ -43,7 +43,7 @@ h1{margin:0;font-size:5.5vh;letter-spacing:.5px}
 h1 span{color:#2ecc71}
 .lbl{color:#8a97a5;font-size:2.8vh;margin-bottom:1vh;font-weight:600}
 .row{display:grid;gap:1.5vw}
-.modes{grid-template-columns:1fr 1fr 1fr}
+.modes{grid-template-columns:1fr 1fr}
 .mode{background:#141b24;border:3px solid #141b24;border-radius:16px;padding:2vh 2vw;color:#eef3f7;
   text-align:left;font:inherit}
 .mode b{display:block;font-size:3.6vh;margin-bottom:.6vh}
@@ -61,14 +61,12 @@ h1 span{color:#2ecc71}
 </style></head><body>
 <h1>MODUS <span>Golf</span></h1>
 <div>
-  <div class="lbl">Shot detection</div>
+  <div class="lbl">Where are you playing?</div>
   <div class="row modes">
-    <button class="mode" data-mode="saver"><b>Power saver</b>
-      <small>Camera + sound, no shot preview video. Use on the power bank.</small></button>
-    <button class="mode" data-mode="wall"><b>Wall power</b>
-      <small>Camera + sound with the slow-motion shot preview. Needs the wall plug.</small></button>
-    <button class="mode" data-mode="sound"><b>Sound only</b>
-      <small>Every impact counts as a shot. Bright sun, or if the camera can't find the ball.</small></button>
+    <button class="mode" data-mode="outside"><b>Outside Golf</b>
+      <small>Runs on the battery pack. Slower camera to save power.</small></button>
+    <button class="mode" data-mode="inside"><b>Inside Golf</b>
+      <small>Fastest camera. Plug into a wall outlet (won't work on the battery).</small></button>
   </div>
 </div>
 <div>
@@ -113,7 +111,7 @@ def load_settings():
         s = {}
     mode = s.get("mode")
     if mode not in MODES:
-        mode = "wall" if mode == "camera" else "saver"   # older saved choice
+        mode = "outside"                               # older saved choice
     club = s.get("club") if s.get("club") in CLUBS else "52"
     return mode, club
 
@@ -205,7 +203,7 @@ def main():
             path, _, query = self.path.partition("?")
             q = dict(x.split("=", 1) for x in query.split("&") if "=" in x)
             if path == "/start":
-                m = q.get("mode") if q.get("mode") in MODES else "saver"
+                m = q.get("mode") if q.get("mode") in MODES else "outside"
                 c = q.get("club") if q.get("club") in CLUBS else "52"
                 choice.update(mode=m, club=c)
                 done.set()
