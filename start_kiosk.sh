@@ -29,7 +29,7 @@ GATE_GPIO=17       # GPIO the sound sensor GATE is wired to (17 = pin 11, 26 = p
 # flight = only the ball leaving, no preview (least power); off = save nothing.
 #   Outside Golf: the settings that ran on the battery pack without cutting out.
 OUTSIDE_SENSOR=full
-OUTSIDE_FPS=144      # drop to 120 if the battery pack ever cuts out
+OUTSIDE_FPS=60       # 144 cut out the battery pack; 60 keeps the load down
 OUTSIDE_RECORDING=full
 #   Inside Golf: wall outlet only. Asks for 300 fps; the sensor gives its
 #   fastest (about 250). Set INSIDE_SENSOR=full to keep the zoom at 144 fps.
