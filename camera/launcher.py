@@ -64,7 +64,7 @@ h1 span{color:#2ecc71}
   <div class="lbl">Where are you playing?</div>
   <div class="row modes">
     <button class="mode" data-mode="outside"><b>Outside Golf</b>
-      <small>Runs on the battery pack. Slower camera to save power.</small></button>
+      <small>Runs on the battery pack. Slower camera and no shot replay to save power.</small></button>
     <button class="mode" data-mode="inside"><b>Inside Golf</b>
       <small>Fastest camera. Plug into a wall outlet (won't work on the battery).</small></button>
   </div>
