@@ -875,13 +875,17 @@ def main():
                    help="swing test: skip ball detection and record when a fast swing passes")
     p.add_argument("--swing-fraction", type=float, default=0.015,
                    help="share of the picture that must change in one frame to count as a swing")
-    p.add_argument("--radar-port", default="/dev/ttyACM0", help="OPS243-A serial port")
+    p.add_argument("--radar-port", default="/dev/ttyAMA0",
+                   help="OPS243-A serial port (/dev/ttyAMA0 = Pi UART on the J3 header, /dev/ttyACM0 = USB)")
     p.add_argument("--ops-speed-mode", action="store_true",
                    help="read plain speed readings from the OPS243-A. Only for a radar NOT set up in "
                         "rolling-buffer mode; this sends it setup commands")
     p.add_argument("--ops", action="store_true",
                    help="use the OPS243-A in rolling-buffer mode through OpenFlight's code "
                         "(ball speed, club speed, spin)")
+    p.add_argument("--ops-trigger", choices=("sound", "speed"), default="sound",
+                   help="what starts a shot capture: sound = SEN-14262 GATE on OPS J3-3 and GPIO17; "
+                        "speed = the OPS243-A's own speed trigger (no sound detector; ball must be 35+ mph)")
     p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
     p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
                    help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
@@ -1144,7 +1148,8 @@ def main():
                     K.radar_jobs = [j for j in K.radar_jobs if j.is_alive()] + [job]
                     settle_until = time.monotonic() + args.settle_seconds
                 shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
-                print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'}")
+                print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'} "
+                      f"(camera running at {sh.camera_fps:.0f} fps)")
                 with sh.lock:
                     sh.pending = None
                     sh.roi = sh.roi_ref = None
