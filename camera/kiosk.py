@@ -65,42 +65,49 @@ NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
+/* Same look as the start menu (launcher.py): dark cards, green for "on". */
 *{box-sizing:border-box}
-html,body{margin:0;height:100%;background:#0b0f14;color:#fff;
-  font-family:system-ui,sans-serif;overflow:hidden;user-select:none}
-body{display:flex;flex-direction:column}
-#top{display:flex;align-items:center;gap:10px;padding:8px 10px;height:15vh;min-height:52px}
-#status{display:flex;align-items:center;gap:10px;background:#141b24;border-radius:999px;
-  padding:0 18px;height:100%;font-size:4.4vh;font-weight:700;white-space:nowrap}
-#dot{width:2.6vh;height:2.6vh;border-radius:50%;background:#9aa7b4}
-#shotno{color:#7c8894;font-size:3vh;margin-left:auto;white-space:nowrap}
-button{border:0;border-radius:12px;color:#fff;font-size:3.6vh;font-weight:600;
-  padding:0 18px;height:100%;background:#22303f}
-#pv{background:#2563a8}
-#quit{background:#1c232c;color:#7c8894;font-size:2.6vh}
+html,body{margin:0;height:100%;background:#0b0f14;color:#eef3f7;
+  font-family:system-ui,-apple-system,sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
+body{display:flex;flex-direction:column;padding:2vh 2.2vw;gap:1.8vh}
+#top{display:flex;align-items:center;gap:1vw;height:11vh;min-height:48px}
+#brand{margin:0;font-size:4.4vh;font-weight:800;letter-spacing:.5px;white-space:nowrap}
+#brand span{color:#2ecc71}
+#status{display:flex;align-items:center;gap:1vw;background:#141b24;border:3px solid #141b24;
+  border-radius:16px;padding:0 1.6vw;height:100%;font-size:3.8vh;font-weight:700;white-space:nowrap}
+#dot{width:2.4vh;height:2.4vh;border-radius:50%;background:#8a97a5}
+#shotno{color:#8a97a5;font-size:2.8vh;font-weight:600;margin-left:auto;white-space:nowrap}
+button{background:#141b24;border:3px solid #141b24;border-radius:12px;color:#eef3f7;font:inherit;
+  font-size:3vh;font-weight:700;padding:0 1.6vw;height:100%}
+button:active{border-color:#2ecc71;background:#132519}
+#pv{border-color:#2ecc71;background:#132519}
+#quit{color:#8a97a5}
 .hide{display:none!important}
-.view{flex:1;min-height:0;padding:0 10px 10px}
-#main{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:1fr 1fr;gap:10px}
-.tile{background:#141b24;border-radius:14px;display:flex;flex-direction:column;
-  align-items:center;justify-content:center;padding:6px;min-width:0}
-.lbl{color:#9aa7b4;font-size:3.1vh;text-align:center}
-.val{font-size:11.5vh;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
-.val.none{color:#3d4a59}
-.unit{color:#7c8894;font-size:2.8vh;min-height:3.4vh}
-.fresh .val{color:#4dabf7}
-#preview,#camera{display:flex;flex-direction:column;align-items:center;gap:8px}
+.view{flex:1;min-height:0}
+#main{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:1fr 1fr;gap:1.5vw}
+.tile{background:#141b24;border:3px solid #141b24;border-radius:16px;display:flex;flex-direction:column;
+  align-items:flex-start;justify-content:space-between;padding:1.8vh 1.4vw;min-width:0;
+  transition:border-color .3s,background .3s}
+.lbl{color:#2ecc71;font-size:3.6vh;font-weight:700}
+.val{font-size:10.5vh;font-weight:800;line-height:1;font-variant-numeric:tabular-nums;align-self:center}
+.val.none{color:#2f3b48}
+.unit{color:#2ecc71;font-size:3.4vh;font-weight:700;min-height:4vh;align-self:flex-end}
+.fresh{border-color:#2ecc71;background:#132519}
+#preview,#camera{display:flex;flex-direction:column;align-items:center;gap:1.5vh}
 #camera{position:relative}#live{touch-action:none}
-#sel{position:absolute;display:none;border:2px dashed #ffd23f;pointer-events:none}
-#preview img,#camera img{flex:1;min-height:0;max-width:100%;object-fit:contain;border-radius:8px}
-.bar{display:flex;align-items:center;gap:14px;height:13vh;min-height:48px;width:100%;
-  justify-content:center}
-#keep{background:#1f9d55}#del{background:#c0392b}
-#vmsg{font-size:3.4vh;color:#9aa7b4}
-.cmsg{font-size:3vh;color:#9aa7b4;text-align:center}
-#expo{font-size:2.6vh;color:#7c8894}
-#camwarn{color:#f0b429;font-size:2.6vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#sel{position:absolute;display:none;border:2px dashed #2ecc71;pointer-events:none}
+#preview img,#camera img{flex:1;min-height:0;max-width:100%;object-fit:contain;border-radius:16px;
+  border:3px solid #141b24}
+.bar{display:flex;align-items:center;gap:1.5vw;height:11vh;min-height:48px;width:100%;justify-content:center}
+#keep{background:#2ecc71;border-color:#2ecc71;color:#06210f;font-weight:800}
+#del{border-color:#c0392b;color:#ff8a80}
+#vmsg{font-size:3vh;color:#8a97a5;font-weight:600}
+.cmsg{font-size:2.4vh;color:#8a97a5;text-align:center}
+#expo{font-size:2.2vh;color:#6f7c89}
+#camwarn{color:#f0b429;font-size:2.4vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style></head><body>
 <div id="top">
+  <h1 id="brand">MODUS <span>Golf</span></h1>
   <div id="status"><span id="dot"></span><span id="stext">Starting</span></div>
   <button id="pv" class="hide" onclick="show('preview')">Shot Preview</button>
   <span id="camwarn"></span>
@@ -132,7 +139,7 @@ const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph
   ['smash','Smash Factor','',2],['carry','Carry','yd',0],
   ['launch_angle','Launch Angle','deg',1],['launch_dir','Launch Direction','deg',1],
   ['spin','Spin Rate','rpm',0],['club_path','Club Path','deg',1]];
-const STATUS={STARTING:['Starting','#9aa7b4'],SEARCHING:['Looking for Ball','#f0b429'],
+const STATUS={STARTING:['Starting','#8a97a5'],SEARCHING:['Looking for Ball','#f0b429'],
   BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
   CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],MEASURING:['Measuring','#4dabf7'],
   SWINGTEST:['Ready','#2ecc71']};
@@ -197,7 +204,7 @@ async function tick(){
   try{
     const s=await (await fetch('/state')).json();
     const st=STATUS[s.state]||[s.state,'#fff'];
-    $('stext').textContent=st[0];$('dot').style.background=st[1];
+    $('stext').textContent=st[0];$('dot').style.background=st[1];$('status').style.borderColor=st[1];
     if(s.rev!=rev){
       rev=s.rev;
       const waiting=s.metrics.radar_pending?['ball_speed','launch_angle','carry','launch_dir']:[];
