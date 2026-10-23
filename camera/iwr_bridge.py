@@ -15,6 +15,12 @@ the ball. Everything else (camera, screen, shot handling) stays ours.
 
 Needs a copy of OpenFlight at ~/openflight (or wherever --openflight points)
 with the custom firmware already flashed onto the radar.
+
+The TI board must sit the way OpenFlight's enclosure holds it: turned so the
+TX antennas are ABOVE the RX antennas (the 8-element elevation array upright).
+Its mounting geometry (tee and net distance, tilt, antenna and ball height,
+azimuth) comes from start_kiosk.sh and must be measured, not guessed: a wrong
+value biases every launch angle without raising an error.
 """
 
 import dataclasses
@@ -25,8 +31,17 @@ import sys
 import threading
 import time
 
-ANGLE_FIELDS = ("vertical_deg", "launch_angle_deg", "vertical_launch_deg",
-                "launch_deg", "elevation_deg")
+# Our club names (start menu, ballflight.py) -> OpenFlight's ClubType values.
+# OpenFlight needs the real club: the TI ball tracker ignores anything slower
+# than that club class's slowest real ball (radial: wedge 26.5 m/s, 9-6 iron
+# 34, 5 iron and longer 40, driver and woods 50), and the OPS processing
+# handles wedges and their spin differently. Left alone, both radars assume a
+# driver, so wedge and short-iron balls were thrown out by the TI tracker.
+OPENFLIGHT_CLUBS = {
+    "driver": "driver", "3w": "3-wood", "5w": "5-wood", "hybrid": "3-hybrid",
+    "4i": "4-iron", "5i": "5-iron", "6i": "6-iron", "7i": "7-iron", "8i": "8-iron",
+    "9i": "9-iron", "pw": "pw", "gw": "gw", "sw": "sw", "lw": "lw",
+}
 
 
 def _openflight_root(args):
@@ -60,7 +75,95 @@ def _summary(m):
 
 
 def _empty(error):
-    return {"launch_angle": None, "ball_speed": None, "quality": None, "error": error}
+    return {"launch_angle": None, "launch_dir": None, "ball_speed": None,
+            "quality": None, "error": error}
+
+
+def openflight_club_name(name):
+    """OpenFlight's club name for one of ours ('52' -> 'gw', '7i' -> '7-iron')."""
+    from ballflight import club_defaults
+    return OPENFLIGHT_CLUBS.get(club_defaults(name)[2], "unknown")
+
+
+def openflight_club(name):
+    """OpenFlight's ClubType for one of our club names, or None if this copy of
+    OpenFlight doesn't have one that matches (then nothing is set)."""
+    try:
+        from openflight.clubs import ClubType
+    except ImportError:
+        try:                                  # older OpenFlight layouts
+            from openflight.launch_monitor import ClubType
+        except ImportError:
+            return None
+    try:
+        return ClubType(openflight_club_name(name))
+    except ValueError:
+        return None
+
+
+def _number(v):
+    """v as a finite float, or None."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def read_measurement(m):
+    """Launch angle, launch direction and status from OpenFlight's TI result.
+
+    Current OpenFlight returns an LCMFResult: the launch angle is in
+    ``angle_deg``, and ``accepted`` says whether it passed OpenFlight's quality
+    gates (status "accepted" or "accepted_low_confidence_recovery"). This is
+    exactly what OpenFlight's own server reads. Older builds returned a
+    ShotMeasurement, with a ``launch_angle_deg`` property and a ``quality`` of
+    ok / low / reject; that shape is handled too. A result that was not
+    accepted gives no angle, and its status becomes the error.
+
+    Launch direction is ``horizontal_deg``: TrackMan convention, positive =
+    starting right of the target line, already including the azimuth offset.
+    """
+    status = str(getattr(m, "status", None) or getattr(m, "quality", None) or "")
+    angle = _number(getattr(m, "angle_deg", None))
+    if angle is None:
+        angle = _number(getattr(m, "launch_angle_deg", None))
+    accepted = getattr(m, "accepted", None)
+    if accepted is None:
+        accepted = angle is not None and "reject" not in status
+    out = {"launch_angle": None, "launch_dir": None, "quality": status or None, "error": None}
+    if accepted and angle is not None:
+        out["launch_angle"] = angle
+        out["launch_dir"] = _number(getattr(m, "horizontal_deg", None))
+    else:
+        out["error"] = status or "no ball in the radar data"
+    return out
+
+
+def ops_speed_corrector(args):
+    """OpenFlight's ball-speed cosine correction for our geometry, or None.
+
+    The OPS243 reads the ball's speed along its line of sight. The ball leaves
+    upward at the launch angle while the radar sits low behind it, so the
+    reading is short of the true speed (OpenFlight measured about 2 mph on
+    average against TrackMan). OpenFlight's server corrects it whenever an angle
+    radar is in use, using the TI geometry for both radars; on this faceplate
+    the two antennas sit side by side, so that holds here too.
+
+    Returns f(measured_mph, launch_deg) -> corrected mph.
+    """
+    try:
+        _openflight_root(args)
+        from openflight.speed_correction import correct_ball_speed
+    except Exception as e:
+        print(f"Ball-speed correction not available ({type(e).__name__}: {e})")
+        return None
+    distance_ft = args.iwr_tee_m * 3.28084
+    above_ft = (args.iwr_ball_height_m - args.iwr_radar_height_m) * 3.28084
+
+    def correct(measured_mph, launch_deg):
+        return correct_ball_speed(measured_mph, launch_deg, distance_ft, above_ft)
+    return correct
 
 
 class IWRBridge:
@@ -77,7 +180,9 @@ class IWRBridge:
         tx_order = tx_order_from_config(config)
 
         # Same as OpenFlight's server: start from the reference calibration,
-        # then apply our mounting geometry.
+        # then apply our mounting geometry. Tilt is the antenna face leaning
+        # back from vertical (boresight pointing up), positive = up. Heights are
+        # both from the same floor/ground surface.
         cal = Calibration.load(path(args.iwr_cal))
         cal.tee_range_m = args.iwr_tee_m
         cal.tee_ball_height_m = args.iwr_ball_height_m
@@ -87,19 +192,30 @@ class IWRBridge:
         self.on_trigger = on_trigger
         self.lock = threading.Lock()
         self.events = []   # one per speed-radar shot
+        self.club = openflight_club_name(getattr(args, "club", None))
 
         out = os.path.join(args.out, "iwr")
         os.makedirs(out, exist_ok=True)
-        # OpenFlight's monitor owns the sound trigger pin (--gate-gpio, GPIO17 by default). We hear about
-        # each trigger through the observer below.
+        # OpenFlight's monitor owns the sound-trigger GPIO. We hear about each
+        # trigger through the observer below.
+        gpio = getattr(args, "gate_gpio", 17)
         self.monitor = IWR6843CaptureMonitor(
-            config_path=config, output_dir=out, port=args.iwr_port, gpio_pin=getattr(args, "gate_gpio", 17),
+            config_path=config, output_dir=out, port=args.iwr_port, gpio_pin=gpio,
             save_dumps=args.iwr_save_dumps, trigger_observers=[self._observer])
+        extra = {}
+        azimuth = getattr(args, "iwr_azimuth_offset_deg", 0.0) or 0.0
+        if azimuth:
+            # Positive = the radar points right of the target line.
+            extra["azimuth_offset_deg"] = azimuth
         self.runtime = IWR6843Runtime(
             capture_monitor=self.monitor, calibration=cal, net_range_m=args.iwr_net_m,
-            tx_order=tx_order, capture_timeout_s=25.0, tdm_sign_policy="positive")
+            tx_order=tx_order, capture_timeout_s=25.0, tdm_sign_policy="positive", **extra)
         self.monitor.start(armed=True)
 
+        print(f"TI geometry: tee {args.iwr_tee_m} m, net {args.iwr_net_m} m, "
+              f"tilt {args.iwr_tilt_deg} deg up, antenna height {args.iwr_radar_height_m} m, "
+              f"ball height {args.iwr_ball_height_m} m, azimuth {azimuth} deg, "
+              f"club {self.club}, {tx_order} TX order")
         self.has_ops = ops is not None
         if self.has_ops:
             ops.listeners.append(self._on_ops_shot)
@@ -108,7 +224,7 @@ class IWRBridge:
                 print(f"TI radar ready on {args.iwr_port} (triggered by the speed radar, "
                       f"guided by its shot data)")
             else:
-                print(f"TI radar ready on {args.iwr_port} (sound trigger on GPIO{getattr(args, 'gate_gpio', 17)}, "
+                print(f"TI radar ready on {args.iwr_port} (sound trigger on GPIO{gpio}, "
                       f"guided by the speed radar)")
         else:
             print(f"TI radar ready on {args.iwr_port}, but it needs the speed radar (--ops) "
@@ -145,8 +261,12 @@ class IWRBridge:
         """Run OpenFlight's TI estimator for one speed-radar shot."""
         result = _empty(None)
         try:
+            # The speed radar's shot carries the club we set on it; fall back
+            # to the start-menu club if it doesn't.
             club = getattr(shot, "club", None)
-            club = getattr(club, "value", club)
+            club = getattr(club, "value", club) or self.club
+            # Raw (uncorrected) OPS speed, exactly as OpenFlight's server
+            # passes it: the TI tracker works in radial speed.
             r = self.runtime.process_shot(
                 impact_timestamp=getattr(shot, "impact_timestamp", None),
                 ball_speed_mph=shot.ball_speed_mph,
@@ -160,16 +280,13 @@ class IWRBridge:
             elif m is None:
                 result["error"] = "TI estimator returned nothing"
             else:
-                info = _summary(m)
-                print(f"[{time.strftime('%H:%M:%S')}] TI radar details: {info}")
-                status = str(info.get("status", "") or "")
-                result["quality"] = info.get("quality") or status or None
-                angle = next((info[f] for f in ANGLE_FIELDS
-                              if isinstance(info.get(f), (int, float))), None)
-                if angle is not None and "reject" not in status:
-                    result["launch_angle"] = angle
-                else:
-                    result["error"] = status or "no ball in the radar data"
+                print(f"[{time.strftime('%H:%M:%S')}] TI radar details: {_summary(m)}")
+                result.update(read_measurement(m))
+                if result["launch_angle"] is not None:
+                    dir_text = ("" if result["launch_dir"] is None
+                                else f", direction {result['launch_dir']:+.1f} deg")
+                    print(f"[{time.strftime('%H:%M:%S')}] TI launch angle "
+                          f"{result['launch_angle']:.1f} deg{dir_text} ({result['quality']})")
         except Exception as e:
             result["error"] = f"{type(e).__name__}: {e}"
         event["result"] = result
@@ -201,30 +318,6 @@ class IWRBridge:
                 print(f"TI radar stop: {e}")
 
 
-def _force_ops_power(level):
-    """Make OpenFlight use our OPS243-A transmit power instead of its fixed
-    level 3. Level 0 is the strongest; higher numbers are weaker. OpenFlight
-    turns the power down to stop overload when the ball is close; with the ball
-    about 5 ft away more power gives a stronger echo."""
-    import inspect
-    from openflight import ops243
-    patched = 0
-    for _, cls in inspect.getmembers(ops243, inspect.isclass):
-        original = cls.__dict__.get("set_transmit_power")
-        if original is None or getattr(original, "_modus", False):
-            continue
-
-        def forced(self, _level, _orig=original):
-            return _orig(self, level)
-        forced._modus = True
-        cls.set_transmit_power = forced
-        patched += 1
-    if patched:
-        print(f"Speed radar transmit power: level {level} (0 = strongest, OpenFlight uses 3)")
-    else:
-        print("Speed radar transmit power could not be changed; using OpenFlight's")
-
-
 class _SpeedTriggerTap(logging.Handler):
     """OpenFlight's speed trigger has no callback; it logs "[TRIGGER] Speed
     trigger: ..." the moment it fires. This turns that log line into a call."""
@@ -254,10 +347,6 @@ class OPSBridge:
         _openflight_root(args)
         from openflight.rolling_buffer import RollingBufferMonitor
 
-        power = getattr(args, "ops_power", None)
-        if power is not None:
-            _force_ops_power(int(power))
-
         self.lock = threading.Lock()
         self.shots = []      # (arrival time, Shot)
         self.listeners = []  # called with (shot, arrival time) for every shot
@@ -267,14 +356,22 @@ class OPSBridge:
             root = logging.getLogger()
             if root.level > logging.INFO:
                 root.setLevel(logging.INFO)
-            self._tap = _SpeedTriggerTap(self._on_trigger)
-            root.addHandler(self._tap)
+            root.addHandler(_SpeedTriggerTap(self._on_trigger))
         self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type=self.trigger_type,
                                             sample_rate_ksps=args.ops_ksps)
         if not self.monitor.connect():
             raise RuntimeError(f"could not connect on {args.radar_port}")
+        # Without this OpenFlight assumes a driver for every shot. Its shots
+        # also carry this club to the TI radar (see OPENFLIGHT_CLUBS).
+        self.club = openflight_club(getattr(args, "club", None))
+        if self.club is not None and hasattr(self.monitor, "set_club"):
+            self.monitor.set_club(self.club)
+            club_text = f"club {self.club.value}"
+        else:
+            club_text = "club NOT set: this OpenFlight copy has no matching club setting"
         self.monitor.start(shot_callback=self._on_shot)
-        print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, {self.trigger_type} trigger)")
+        print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
+              f"{self.trigger_type} trigger, {club_text})")
 
     def _on_trigger(self):
         for listener in list(self.trigger_listeners):
