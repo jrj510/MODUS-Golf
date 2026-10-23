@@ -1062,14 +1062,14 @@ def main():
                 ensure_lgpio_pin_factory()
             except Exception:
                 pass
-            from gpiozero import OutputDevice
-            trig_out = OutputDevice(args.trigger_out_gpio, active_high=True, initial_value=False)
+            from gpiozero import DigitalOutputDevice    # (plain OutputDevice has no blink())
+            trig_out = DigitalOutputDevice(args.trigger_out_gpio, active_high=True, initial_value=False)
 
             def fire(source):
-                if source != "sound":        # "sound" = our own pulse coming back on GPIO17
-                    trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
+                if source != "sound":        # "sound" = our own pulse coming back on --gate-gpio
                     print(f"[{time.strftime('%H:%M:%S')}] Camera trigger ({source}): "
                           f"pulse on GPIO{args.trigger_out_gpio} to both radars")
+                    trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
             sh.on_fire = fire
             print(f"Camera is the shot trigger: pulses GPIO{args.trigger_out_gpio} "
                   f"(wired to OPS J3-3 and GPIO{args.gate_gpio})")
