@@ -883,6 +883,9 @@ def main():
     p.add_argument("--ops", action="store_true",
                    help="use the OPS243-A in rolling-buffer mode through OpenFlight's code "
                         "(ball speed, club speed, spin)")
+    p.add_argument("--trigger-out-gpio", type=int, default=0,
+                   help="camera as the shot trigger: pulse this GPIO the moment the camera triggers. "
+                        "Wire it to OPS J3-3 and to --gate-gpio (in place of the sound detector's GATE). 0 = off")
     p.add_argument("--ops-trigger", choices=("sound", "speed"), default="sound",
                    help="what starts a shot capture: sound = SEN-14262 GATE on OPS J3-3 and GPIO17; "
                         "speed = the OPS243-A's own speed trigger (no sound detector; ball must be 35+ mph)")
@@ -1047,6 +1050,31 @@ def main():
         K.correct_speed = ops_speed_corrector(args)
         if K.correct_speed is not None:
             print("Ball speed: corrected for launch angle (raw OPS reading kept in the log)")
+    if args.trigger_out_gpio:
+        # The camera replaces the sound detector: when it sees the ball leave
+        # (motion trigger) it sends the same 3.3 V pulse the detector's GATE did,
+        # into OPS J3-3 (HOST_INT) and GPIO17, so both radars capture exactly as
+        # with the sound trigger. Made after the radars, which pick the Pi 5 pin
+        # factory first.
+        try:
+            try:
+                from openflight.gpio_factory import ensure_lgpio_pin_factory
+                ensure_lgpio_pin_factory()
+            except Exception:
+                pass
+            from gpiozero import OutputDevice
+            trig_out = OutputDevice(args.trigger_out_gpio, active_high=True, initial_value=False)
+
+            def fire(source):
+                if source != "sound":        # "sound" = our own pulse coming back on GPIO17
+                    trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] Camera trigger ({source}): "
+                          f"pulse on GPIO{args.trigger_out_gpio} to both radars")
+            sh.on_fire = fire
+            print(f"Camera is the shot trigger: pulses GPIO{args.trigger_out_gpio} "
+                  f"(wired to OPS J3-3 and GPIO{args.gate_gpio})")
+        except Exception as e:
+            print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
     if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice

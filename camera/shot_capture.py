@@ -15,7 +15,8 @@ always held in memory, so the moment of impact is already recorded when the
 trigger arrives.
 
 Triggers (any of them fires a capture)
-    sound   the SparkFun sound detector GATE pin on GPIO17 (only when READY)
+    sound   a pulse on GPIO17: the SparkFun sound detector's GATE, or the Pi's
+            own trigger output (kiosk --trigger-out-gpio) when the camera fires
     motion  the picture changes where the ball was sitting (only when READY)
     key     press Enter in this terminal (any time, for testing)
 
@@ -111,6 +112,7 @@ class Shared:
         self.pending = None       # frames handed over for saving
         self.camera_fps = 0.0
         self.exposure = (None, None)  # (microseconds, gain) the sensor last used
+        self.on_fire = None           # called with the source when a trigger is accepted
 
     def trigger(self, source, need_armed=True):
         with self.lock:
@@ -120,6 +122,11 @@ class Shared:
                 return
             self.trigger_time = time.monotonic()
             self.trigger_source = source
+        if self.on_fire is not None:
+            try:
+                self.on_fire(source)
+            except Exception as e:
+                print(f"Trigger output error: {e}")
 
 
 # --- Exposure ---------------------------------------------------------------
