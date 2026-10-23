@@ -361,6 +361,16 @@ class OPSBridge:
                                             sample_rate_ksps=args.ops_ksps)
         if not self.monitor.connect():
             raise RuntimeError(f"could not connect on {args.radar_port}")
+        if self.trigger_type == "speed":
+            # OpenFlight's 20 mph default fires on anything moving away from the
+            # radar (people, the net, a fan), so a shot started the moment a
+            # ball was set down. Only something this fast counts as a shot.
+            mph = getattr(args, "ops_trigger_mph", None)
+            trig = getattr(self.monitor, "trigger", None)
+            if mph and hasattr(trig, "min_trigger_speed_mph"):
+                trig.min_trigger_speed_mph = float(mph)
+            if trig is not None and hasattr(trig, "min_trigger_speed_mph"):
+                print(f"Speed trigger fires at {trig.min_trigger_speed_mph:.0f} mph outbound or faster")
         # Without this OpenFlight assumes a driver for every shot. Its shots
         # also carry this club to the TI radar (see OPENFLIGHT_CLUBS).
         self.club = openflight_club(getattr(args, "club", None))

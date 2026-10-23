@@ -886,6 +886,8 @@ def main():
     p.add_argument("--ops-trigger", choices=("sound", "speed"), default="sound",
                    help="what starts a shot capture: sound = SEN-14262 GATE on OPS J3-3 and GPIO17; "
                         "speed = the OPS243-A's own speed trigger (no sound detector; ball must be 35+ mph)")
+    p.add_argument("--ops-trigger-mph", type=float, default=60.0,
+                   help="speed trigger: outbound speed that counts as a shot, mph (OpenFlight's default is 20)")
     p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
     p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
                    help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
