@@ -1397,9 +1397,16 @@ def update_ready(sh, args, gray, ball, trk, now):
             trk["lost_since"] = now
         if now - trk["lost_since"] < args.hold_seconds:
             return "READY"  # briefly covered; give it a moment
+        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: ball not seen and its patch "
+              f"changed by {diff if diff is not None else -1:.1f} (limit {args.motion_threshold:.0f}) "
+              f"for {now - trk['lost_since']:.1f} s")
         sh.armed = False
         sh.roi = sh.roi_ref = None
         trk.update(new_track())
+        # Show "Looking for Ball" for a moment instead of re-arming at once on a
+        # fresh picture (which looked as if it had never left Ready).
+        sh.rearm_after = now + getattr(args, "rearm_pause", 2.0)
+        return "SEARCHING"
 
     if center is None:
         if trk["center"] is not None and trk.get("misses", 0) <= getattr(args, "miss_checks", 3):
@@ -1416,7 +1423,8 @@ def update_ready(sh, args, gray, ball, trk, now):
     else:
         trk["center"], trk["still_since"] = center, None
     trk["box"] = ball
-    if trk["still_since"] is not None and now - trk["still_since"] >= args.still_seconds:
+    if trk["still_since"] is not None and now - trk["still_since"] >= args.still_seconds \
+            and now >= getattr(sh, "rearm_after", 0.0):
         _set_patch(sh, gray, ball)
         sh.armed = True
         trk["lost_since"] = None
@@ -1448,6 +1456,7 @@ class PatchWatch:
         self.n = 0
         self.cand = None
         self.steady_since = None
+        self.last_note = -1e9
 
     def step(self, diff, now, thr):
         h = self.hist
@@ -1459,6 +1468,14 @@ class PatchWatch:
         if self.cand is None and len(h) >= 7 and diff - h[-4] > 0.8 * thr \
                 and abs(h[-4] - h[-7]) < 0.25 * thr:
             self.cand = (self.n, h[-4])
+        elif self.cand is None and len(h) >= 7 and diff - h[-4] > 0.4 * thr \
+                and now - self.last_note > 1.0:
+            # A sudden change too small to count: often a shot whose ball is too
+            # faint against the mat for --motion-threshold. Logged for tuning.
+            self.last_note = now
+            print(f"[{time.strftime('%H:%M:%S')}] Motion: small jump {h[-4]:.1f} -> {diff:.1f} "
+                  f"(a shot needs +{0.8 * thr:.1f}; still before: "
+                  f"{'yes' if abs(h[-4] - h[-7]) < 0.25 * thr else 'no'})")
         if self.cand is not None:
             k, base = self.cand
             if self.n - k == 4:
@@ -1469,6 +1486,11 @@ class PatchWatch:
                 # is still changing four frames later.
                 if rise_end > 0.8 * thr and rise_early >= 0.75 * rise_end:
                     return "trigger"
+                # Logged so a missed shot can be told apart from a club being set down.
+                why = ("change too small" if rise_end <= 0.8 * thr else "still changing 4 frames later")
+                print(f"[{time.strftime('%H:%M:%S')}] Motion: patch jumped but no trigger ({why}): "
+                      f"before {base:.1f}, +1 frame {h[-4]:.1f}, +4 frames {diff:.1f}, "
+                      f"need +{0.8 * thr:.1f} that holds")
         if self.cand is None and len(h) >= 4 and diff > 0.5 * thr \
                 and abs(diff - h[-4]) < 0.15 * thr:
             if self.steady_since is None:
@@ -1619,7 +1641,7 @@ def main():
     p.add_argument("--checks-per-second", type=float, default=8.0, help="how often the model runs")
     p.add_argument("--still-pixels", type=float, default=12.0, help="movement that still counts as still")
     p.add_argument("--still-seconds", type=float, default=1.0, help="time the ball must sit still before READY")
-    p.add_argument("--hold-seconds", type=float, default=3.0,
+    p.add_argument("--hold-seconds", type=float, default=10.0,
                    help="how long to stay READY when the ball is covered and the model cannot see it")
     p.add_argument("--pre", type=float, default=0.25, help="seconds to keep from before the trigger")
     p.add_argument("--post", type=float, default=0.5, help="seconds to record after the trigger")

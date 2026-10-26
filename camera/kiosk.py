@@ -849,8 +849,10 @@ def main():
                    help="ball checks a second while READY; the motion trigger watches every frame anyway")
     p.add_argument("--still-pixels", type=float, default=12.0)
     p.add_argument("--still-seconds", type=float, default=1.0)
-    p.add_argument("--hold-seconds", type=float, default=3.0,
-                   help="how long to stay Ready when the ball is covered")
+    p.add_argument("--hold-seconds", type=float, default=10.0,
+                   help="how long to stay Ready when the ball is covered (club, feet, body over it)")
+    p.add_argument("--rearm-pause", type=float, default=2.0,
+                   help="after Ready is lost, stay Looking for Ball at least this long before arming again")
     p.add_argument("--recording", default="flight", choices=("flight", "full", "off"),
                    help="flight: keep just the ball leaving (0.03 s before to 0.15 s after impact), "
                         "saved quietly, no preview video (default, least power); full: 0.25 s + 0.5 s "
