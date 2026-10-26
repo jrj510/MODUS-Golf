@@ -850,7 +850,7 @@ def main():
                    help="ball checks a second while READY; the motion trigger watches every frame anyway")
     p.add_argument("--still-pixels", type=float, default=12.0)
     p.add_argument("--still-seconds", type=float, default=1.0)
-    p.add_argument("--hold-seconds", type=float, default=10.0,
+    p.add_argument("--hold-seconds", type=float, default=5.0,
                    help="how long to stay Ready when the ball is covered (club, feet, body over it)")
     p.add_argument("--rearm-pause", type=float, default=2.0,
                    help="after Ready is lost, stay Looking for Ball at least this long before arming again")
