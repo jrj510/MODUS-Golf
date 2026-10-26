@@ -1,0 +1,23 @@
+{
+  "fixture_only": true,
+  "basis": "user-confirmed configuration, not live telemetry",
+  "trigger_source": "camera",
+  "sound_sensor": {
+    "status": "temporarily_removed",
+    "reason": "broken",
+    "replacement_planned": true
+  },
+  "capture_presets": {
+    "outside": {
+      "sensor": "full",
+      "requested_fps": 60,
+      "recording": "off"
+    },
+    "inside": {
+      "sensor": "binned",
+      "requested_fps": 300,
+      "recording": "off"
+    }
+  },
+  "battery_percentage": null
+}

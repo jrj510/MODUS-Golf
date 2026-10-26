@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "shot_id": "shot_deviceA_sessionA_000001",
+  "session_id": "session_deviceA_opaqueUUID",
+  "device_id": "device_opaqueUUID",
+  "profile_id": "existingProfileDocumentID",
+  "sequence_number": 1,
+  "revision": 1,
+  "timestamp": "2026-10-23T15:00:00.000Z",
+  "club": "52",
+  "record_kind": "real",
+  "processing_state": "final",
+  "ball_speed_mph": 84.3,
+  "club_speed_mph": 66.1,
+  "smash_factor": 1.28,
+  "vertical_launch_angle_deg": 24.6,
+  "horizontal_launch_angle_deg": -1.8,
+  "carry_yards": 112,
+  "carry_kind": "model",
+  "spin_rpm": null,
+  "club_path_deg": null,
+  "trajectory": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      56,
+      19,
+      0
+    ],
+    [
+      112,
+      0,
+      0
+    ]
+  ],
+  "model_inputs": {
+    "vertical_launch_angle_deg": 24.6,
+    "spin_rpm": 7690,
+    "horizontal_launch_angle_deg": 0
+  },
+  "quality_flags": [
+    "spin_assumed",
+    "flight_direction_assumed",
+    "sensor_values_unverified"
+  ],
+  "source": {
+    "kind": "pi_live",
+    "filename": "session_20261023_100000.csv",
+    "local_log_time": "10:00:00",
+    "timezone": null,
+    "ti_radar": "Example status only",
+    "ball_speed_raw_mph": null,
+    "apex_yards": 19
+  }
+}

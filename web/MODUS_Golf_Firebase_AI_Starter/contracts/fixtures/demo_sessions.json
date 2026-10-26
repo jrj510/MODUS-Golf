@@ -1,0 +1,14 @@
+[
+  {
+    "session_id": "session_189b7842e4c355b5b5beafe7453d60d50bdadb7e87091e07f1c2a1ff47771a7b",
+    "device_id": "demo_pi",
+    "profile_id": "demo_golfer_a",
+    "source_filename": "session_20261022_192000.csv",
+    "timestamp": null,
+    "local_start": "2026-10-22T19:20:00",
+    "timezone": null,
+    "record_kind": "synthetic",
+    "demo_only": true,
+    "shot_count": 12
+  }
+]

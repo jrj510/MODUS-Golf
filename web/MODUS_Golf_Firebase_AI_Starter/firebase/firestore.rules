@@ -1,0 +1,39 @@
+rules_version = '2';
+// Conservative STARTER DRAFT. Run emulator tests before deployment.
+// Admin SDK bypasses these rules; backend validation/ownership is mandatory.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function owner(uid) { return request.auth != null && request.auth.uid == uid; }
+    function validProfile(data) {
+      return data.keys().hasAll(['display_name', 'created_at', 'updated_at'])
+        && data.keys().hasOnly(['display_name', 'created_at', 'updated_at'])
+        && data.display_name is string
+        && data.display_name.size() > 0 && data.display_name.size() <= 80
+        && data.created_at is timestamp && data.updated_at is timestamp;
+    }
+    match /users/{uid} {
+      allow read, write: if false;
+      match /profiles/{profileId} {
+        allow read: if owner(uid);
+        allow create: if owner(uid) && validProfile(request.resource.data)
+          && request.resource.data.created_at == request.time
+          && request.resource.data.updated_at == request.time;
+        allow update: if owner(uid) && validProfile(request.resource.data)
+          && request.resource.data.created_at == resource.data.created_at
+          && request.resource.data.updated_at == request.time;
+        // Profile deletion/reassignment requires a server-side reference check.
+        allow delete: if false;
+      }
+      match /shots/{shotId} { allow read: if owner(uid); allow write: if false; }
+      match /sessions/{sessionId} { allow read: if owner(uid); allow write: if false; }
+      match /summaries/{summaryId} { allow read: if owner(uid); allow write: if false; }
+      match /imports/{importId} { allow read: if owner(uid); allow write: if false; }
+    }
+    match /devices/{deviceId} {
+      allow get: if request.auth != null && resource.data.owner_uid == request.auth.uid;
+      allow list, write: if false;
+    }
+    match /device_credentials/{credentialId} { allow read, write: if false; }
+    match /{document=**} { allow read, write: if false; }
+  }
+}

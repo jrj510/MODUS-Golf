@@ -1,0 +1,27 @@
+{
+  "name": "modus-golf",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/shot.test.mjs tests/view-model.test.mjs",
+    "test:rules": "node --test tests/firestore.test.mjs"
+  },
+  "dependencies": {
+    "firebase": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.13.6"
+  }
+}

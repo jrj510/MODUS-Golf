@@ -1,0 +1,9 @@
+{
+  "name": "modus-firebase-ai-handoff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Build context and tested app-domain starter modules; a frontend is generated in the AI builder.",
+  "engines": {"node": ">=20"},
+  "scripts": {"test": "node --test app-core/shot.test.mjs"}
+}

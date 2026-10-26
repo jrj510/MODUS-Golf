@@ -1,0 +1,13 @@
+shot,time,club,ball_speed_mph,club_speed_mph,smash,launch_deg,launch_measured,spin_rpm_used,carry_yd,apex_yd,ti_radar,ball_speed_raw_mph,launch_dir_deg
+1,19:20:01,driver,139.1,99.4,1.4,13.0,yes,2700,225.3,29.3,synthetic_fixture,137.7,-1.2
+2,19:20:02,driver,140.9,100.6,1.4,13.8,yes,2700,229.8,32.0,synthetic_fixture,139.5,0.0
+3,19:20:03,driver,142.7,101.9,1.4,12.2,yes,2700,230.8,28.9,synthetic_fixture,141.3,1.2
+4,19:20:04,driver,137.3,98.1,1.4,13.0,yes,2700,221.8,28.5,synthetic_fixture,135.9,0
+5,19:20:05,7i,107.1,76.5,1.4,18.8,yes,7000,150.8,26.8,synthetic_fixture,106.0,-2.4
+6,19:20:06,7i,108.9,77.8,1.4,17.2,yes,7000,153.6,25.6,synthetic_fixture,107.8,-1.2
+7,19:20:07,7i,110.7,79.1,1.4,18.0,yes,7000,157.3,28.0,synthetic_fixture,109.6,0.0
+8,19:20:08,7i,105.3,75.2,1.4,18.8,yes,7000,147.4,25.6,synthetic_fixture,104.2,0
+9,19:20:09,pw,84.1,60.1,1.4,25.2,yes,9300,102.4,19.4,synthetic_fixture,83.3,2.4
+10,19:20:10,pw,85.9,,,26.0,yes,9300,105.8,21.2,synthetic_fixture,85.0,-2.4
+11,19:20:11,pw,87.7,62.6,1.4,26.8,yes,9300,109.1,23.1,synthetic_fixture,86.8,-1.2
+12,19:20:12,pw,82.3,58.8,1.4,24.0,no,9300,98.8,17.3,synthetic_fixture,81.5,0
