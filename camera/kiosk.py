@@ -56,7 +56,7 @@ from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, Zone
                           sharpness, zoom_on,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
-                          smooth_box, start_camera, update_ready)
+                          smooth_box, start_camera, update_ready, _ball_diff)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 REPLAY_FPS = 30
@@ -142,6 +142,7 @@ const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph
 const STATUS={STARTING:['Starting','#8a97a5'],SEARCHING:['Looking for Ball','#f0b429'],
   BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
   CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],MEASURING:['Measuring','#4dabf7'],
+  CHECKING:['Checking','#4dabf7'],
   SWINGTEST:['Ready','#2ecc71']};
 const $=id=>document.getElementById(id);
 const main=$('main');
@@ -865,6 +866,9 @@ def main():
                    help="keep only the newest this many shot folders (Saved ones are never deleted; 0 = all)")
     p.add_argument("--idle-fps", type=float, default=60.0,
                    help="camera frame rate while no ball is READY (full --fps once READY); 0 = always full")
+    p.add_argument("--verify-seconds", type=float, default=1.5,
+                   help="after a camera trigger, watch the ball's spot this long: if the ball shows up "
+                        "again (a club tapped down behind it) it was no shot. 0 = off")
     p.add_argument("--settle-seconds", type=float, default=8.0,
                    help="after a shot, pause ball finding while the radars work out the numbers, "
                         "up to this long (spreads out the power draw)")
@@ -1104,7 +1108,8 @@ def main():
                                  and (ae is not None or args.exposure > 0)) else 0
     fps_now = args.fps
     rates = {"SEARCHING": args.search_checks_per_second, "BALL": args.checks_per_second,
-             "READY": args.ready_checks_per_second, "MEASURING": 4.0}
+             "READY": args.ready_checks_per_second, "MEASURING": 4.0, "CHECKING": 20.0}
+    verify = None               # a camera trigger being checked: is the ball really gone?
     K.state = "SEARCHING"
     view_settle_until = 0.0     # frames from before a zoom change are still arriving
     focus_best, focus_where = None, None
@@ -1143,6 +1148,37 @@ def main():
                 sh.roi = sh.roi_ref = None
                 if ae is not None:
                     ae.next_check = max(view_settle_until, time.monotonic())  # re-meter on the (new) zone
+
+            # A trigger fired. The radars were pulsed at once (their recordings
+            # are short), but whether it was a shot is decided here: a club
+            # tapped down behind the ball covers its spot exactly like a shot
+            # does. If the ball's spot looks like the ball again within
+            # --verify-seconds, it was no shot: back to Ready with nothing
+            # counted. The radar numbers take longer than this to arrive anyway,
+            # so a real shot loses nothing by the wait.
+            if sh.pending is not None and verify is None and args.verify_seconds > 0 \
+                    and not args.swing_test and sh.roi is not None and sh.ball_ref is not None:
+                verify = {"until": time.monotonic() + args.verify_seconds, "back": 0, "peak": 0.0}
+            if verify is not None:
+                d = _ball_diff(sh, sh.latest)      # against the ball as it looked when armed
+                if d is not None:
+                    verify["peak"] = max(verify["peak"], d)
+                verify["back"] = verify["back"] + 1 if (d is not None and d <= args.motion_threshold * 0.5) else 0
+                if verify["back"] >= 3:               # ball seen in its spot on 3 checks in a row
+                    print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
+                          f"(its spot changed by up to {verify['peak']:.1f}, now {d:.1f}); back to Ready")
+                    with sh.lock:
+                        sh.pending = None
+                        sh.roi_ref = sh.ball_ref.copy()   # motion trigger back on the ball's own picture
+                        sh.armed = True               # same ball
+                    verify = None
+                    K.state = "READY"
+                    continue
+                if time.monotonic() < verify["until"]:
+                    K.state = "CHECKING"
+                    time.sleep(1.0 / rates["CHECKING"])
+                    continue
+                verify = None                         # the ball didn't come back: a shot
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:

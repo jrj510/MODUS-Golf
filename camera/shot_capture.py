@@ -106,7 +106,10 @@ class Shared:
         self.running = True
         self.armed = False
         self.roi = None           # (x0, y0, x1, y1) where the ball is sitting
-        self.roi_ref = None       # what that patch looked like when armed
+        self.roi_ref = None       # what that patch looked like when armed (the motion trigger's
+                                  # picture: also re-taken when a club settles beside the ball)
+        self.ball_ref = None      # the patch as the BALL looked when armed (never re-taken onto
+                                  # a club or hand): used to tell "covered" from "still there"
         self.trigger_time = None  # when a trigger fired
         self.trigger_source = None
         self.pending = None       # frames handed over for saving
@@ -596,6 +599,18 @@ def _patch_diff(sh, gray):
     return float(cv2.absdiff(patch, ref).mean())
 
 
+def _ball_diff(sh, gray):
+    """How much the ball's patch differs from the ball as it looked when armed, or None."""
+    roi, ref = sh.roi, sh.ball_ref
+    if roi is None or ref is None or gray is None:
+        return None
+    x0, y0, x1, y1 = roi
+    patch = gray[y0:y1, x0:x1]
+    if patch.shape != ref.shape:
+        return None
+    return float(cv2.absdiff(patch, ref).mean())
+
+
 def _set_patch(sh, gray, ball):
     """Remember the middle of the ball's box for the motion trigger."""
     w, h = ball[2] - ball[0], ball[3] - ball[1]
@@ -606,6 +621,7 @@ def _set_patch(sh, gray, ball):
     if x1 > x0 and y1 > y0:
         sh.roi = None
         sh.roi_ref = gray[y0:y1, x0:x1].copy()
+        sh.ball_ref = sh.roi_ref.copy()
         sh.roi = (x0, y0, x1, y1)
 
 
@@ -1378,30 +1394,31 @@ def update_ready(sh, args, gray, ball, trk, now):
         trk.update(keep)
 
     if sh.armed and trk["center"] is not None:
-        diff = _patch_diff(sh, gray)
+        # Compared with the ball as it looked when armed: a hand or club held
+        # over it changes this, even when the model still half-sees a ball
+        # through it or the motion trigger has re-taken its picture.
+        diff = _ball_diff(sh, gray)
         same = center is not None and np.hypot(
             center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels
         if same:
-            trk["lost_since"] = None
             trk["confirmed_at"] = now
             trk["box"] = ball
-            if diff is not None and diff <= args.motion_threshold * 0.5:
-                _set_patch(sh, gray, ball)  # follow slow lighting changes
-            return "READY"
+        visible = diff is None or diff <= args.motion_threshold
         blind = now - (trk["confirmed_at"] or now)
-        if diff is not None and diff <= args.motion_threshold \
-                and blind <= getattr(args, "blind_seconds", 30.0):
+        if visible and (same or blind <= getattr(args, "blind_seconds", 30.0)):
             trk["lost_since"] = None
-            return "READY"  # the ball's patch is unchanged, so it is still there
+            if same and diff is not None and diff <= args.motion_threshold * 0.5:
+                _set_patch(sh, gray, ball)  # follow slow lighting changes
+            return "READY"  # the ball's spot looks as it did when armed
         if trk["lost_since"] is None:
             trk["lost_since"] = now
         if now - trk["lost_since"] < args.hold_seconds:
             return "READY"  # briefly covered; give it a moment
-        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: ball not seen and its patch "
-              f"changed by {diff if diff is not None else -1:.1f} (limit {args.motion_threshold:.0f}) "
+        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: the ball's spot has looked "
+              f"different (change {diff if diff is not None else -1:.1f}, limit {args.motion_threshold:.0f}) "
               f"for {now - trk['lost_since']:.1f} s")
         sh.armed = False
-        sh.roi = sh.roi_ref = None
+        sh.roi = sh.roi_ref = sh.ball_ref = None
         trk.update(new_track())
         # Show "Looking for Ball" for a moment instead of re-arming at once on a
         # fresh picture (which looked as if it had never left Ready).
