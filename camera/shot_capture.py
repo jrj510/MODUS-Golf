@@ -357,15 +357,6 @@ def add_exposure_args(p):
                         "in 2x on the hitting zone at full detail (see --zoom)")
     p.add_argument("--full-fps", type=float, default=144.0,
                    help="highest frame rate of the full 1280x800 sensor mode (OV9281: 144 at 8 bit)")
-    p.add_argument("--outdoor", action="store_true",
-                   help="outside: handle sun glare (haze removal, frame averaging, flare-ghost guard, "
-                        "flash-proof motion trigger, glare warning). Off = inside, unchanged")
-    p.add_argument("--glare-frames", type=int, default=6,
-                   help="outside: frames averaged for finding the ball (less noise to dig it out of glare)")
-    p.add_argument("--glare-model-conf", type=float, default=0.6,
-                   help="outside: model rating needed to take a ball on the model's word alone; it must "
-                        "also be new since the empty-zone picture (lens-flare ghosts look like balls to "
-                        "the model but were already there). A ball seen being set down or tapped needs less")
     p.add_argument("--zoom", default="auto", choices=("auto", "on", "off"),
                    help="with --sensor full: auto zooms in on the hitting zone once one is drawn "
                         "(if it fits), on/off force it. Zoomed, the ball is twice as wide")
@@ -596,35 +587,6 @@ def new_track():
             "found_by": None}     # which finder first took this ball on, for the log
 
 
-_GAMMA_LUT = ((np.arange(256) / 255.0) ** 2.2).astype(np.float32)
-
-
-def _glare_corrected(sh, gray, patch, ring_ref):
-    """Outside: the patch with any light added all around it since ring_ref
-    was taken removed. Sun glare flashing on (or off) adds (or takes away)
-    the same light everywhere near the ball, mat and ball alike, so it is
-    measured on the mat in a ring round the ball (median: a club passing
-    through part of the ring doesn't count) and taken off the patch, in
-    linear light. A ball leaving changes the patch, not the ring. Returns None
-    when the glare has turned the mat round the ball white: nothing can be
-    told from such a frame (the ball leaving wouldn't show either)."""
-    ring = getattr(sh, "ring", None)
-    if ring is None or ring_ref is None:
-        return patch
-    rx0, ry0, rx1, ry1 = ring
-    now = gray[ry0:ry1, rx0:rx1]
-    if now.shape != ring_ref.shape:
-        return patch
-    mask = sh.ring_mask
-    if np.median(now[mask]) >= 250:
-        return None
-    added = float(np.median(_GAMMA_LUT[now[mask]] - _GAMMA_LUT[ring_ref[mask]]))
-    if abs(added) < 1e-3:
-        return patch
-    lin = np.clip(_GAMMA_LUT[patch] - added, 0.0, 1.0)
-    return np.round(lin ** (1 / 2.2) * 255.0).astype(np.uint8)
-
-
 def _patch_diff(sh, gray):
     """How much the patch where the ball sat has changed (0-255), or None."""
     roi, ref = sh.roi, sh.roi_ref
@@ -634,10 +596,6 @@ def _patch_diff(sh, gray):
     patch = gray[y0:y1, x0:x1]
     if patch.shape != ref.shape:
         return None
-    if getattr(sh, "ring", None) is not None:
-        patch = _glare_corrected(sh, gray, patch, sh.ring_ref)
-        if patch is None:
-            return None
     return float(cv2.absdiff(patch, ref).mean())
 
 
@@ -650,10 +608,6 @@ def _ball_diff(sh, gray):
     patch = gray[y0:y1, x0:x1]
     if patch.shape != ref.shape:
         return None
-    if getattr(sh, "ring", None) is not None:
-        patch = _glare_corrected(sh, gray, patch, getattr(sh, "ball_ring_ref", None))
-        if patch is None:
-            return None
     return float(cv2.absdiff(patch, ref).mean())
 
 
@@ -666,20 +620,6 @@ def _set_patch(sh, gray, ball):
     y1 = min(int(ball[3] - 0.2 * h), HEIGHT)
     if x1 > x0 and y1 > y0:
         sh.roi = None
-        if getattr(sh, "glare_comp", False):
-            # Outside: also remember the mat in a ring round the ball (one ball
-            # width wide), to tell a glare flash from the ball leaving.
-            d = int(max(w, h))
-            rx0, ry0 = max(int(ball[0]) - d, 0), max(int(ball[1]) - d, 0)
-            rx1, ry1 = min(int(ball[2]) + d, WIDTH), min(int(ball[3]) + d, HEIGHT)
-            mask = np.ones((ry1 - ry0, rx1 - rx0), bool)
-            mask[max(int(ball[1]) - 2 - ry0, 0):max(int(ball[3]) + 2 - ry0, 0),
-                 max(int(ball[0]) - 2 - rx0, 0):max(int(ball[2]) + 2 - rx0, 0)] = False
-            sh.ring = None
-            sh.ring_mask = mask
-            sh.ring_ref = gray[ry0:ry1, rx0:rx1].copy()
-            sh.ball_ring_ref = sh.ring_ref.copy()
-            sh.ring = (rx0, ry0, rx1, ry1) if mask.any() else None
         sh.roi_ref = gray[y0:y1, x0:x1].copy()
         sh.ball_ref = sh.roi_ref.copy()
         sh.roi = (x0, y0, x1, y1)
@@ -729,17 +669,13 @@ def _inside_area(args, box):
     """True if a box from the model could be the ball: not much taller than
     wide, at most twice as wide as tall (a ball sitting down in turf shows
     only its top, so its box comes out wide and short), not huge, and (with
-    --search-area) at least a third of it inside the search area. A ball set
-    down on the zone's edge counts (its box may stick out of the zone, and
-    its centre may wobble either side of the line from frame to frame); one
-    clearly outside doesn't."""
+    --search-area) entirely inside the search area."""
     w, h = box[2] - box[0], box[3] - box[1]
     if w <= 0 or h <= 0 or not (0.6 <= w / h <= 2.0) or max(w, h) > 120:
         return False
     x0, y0, x1, y1 = _search_area(args)
-    iw = min(box[2], x1) - max(box[0], x0)
-    ih = min(box[3], y1) - max(box[1], y0)
-    return iw > 0 and ih > 0 and iw * ih >= 0.35 * w * h
+    m = 4   # small allowance at the edges
+    return box[0] >= x0 - m and box[1] >= y0 - m and box[2] <= x1 + m and box[3] <= y1 + m
 
 
 def find_ball_spot(gray, args, near=None):
@@ -893,7 +829,7 @@ def _seen(trk, box, blob=False, keep_rivals=False, conf=None, source=None, sure=
     return box
 
 
-def detect_ball(model, gray, args, trk, zone=None, alt=None):
+def detect_ball(model, gray, args, trk, zone=None):
     """The ball's box [x0, y0, x1, y1], or None.
 
     The box stays on one ball:
@@ -919,39 +855,14 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
         anything it finds there is part of the mat).
     A tap on the Camera view (trk["hint"]) takes the ball found right there
     at once. With --search-area, anything outside the area is ignored.
-
-    Outside (--outdoor), alt is the same picture with the sun glare taken out
-    of the hitting zone (see deglare): the model takes a second look at it
-    when the plain picture gives nothing sure, and the small-ball finder uses
-    it. Lens-flare ghosts (round bright blobs from the sun) look like balls
-    to the model (even 0.85), but they were already there in the empty-zone
-    picture, so a ball the model alone vouches for must be new since then,
-    seen while the zone is calm, and rated --glare-model-conf. One seen
-    being set down, or tapped, needs no more than inside. The small-ball
-    finder never starts on a ball of its own there.
     """
     following = trk.get("box") is not None and trk["center"] is not None
     use_blob = getattr(args, "blob", False)
-    outdoor = getattr(args, "outdoor", False)
-    spot_pic = alt if alt is not None else gray        # where the small-ball finder looks
     in_zone = (zone is not None and zone.active and getattr(args, "search_area", None)
                and 0 < getattr(args, "tile", 0) < WIDTH)
-    fresh = None
-    if outdoor and in_zone:
-        def fresh(box):
-            """Outside: a model-alone find must be new since the empty-zone
-            picture (ghosts were already in it), seen while the zone is calm
-            (not while the sun comes out and the whole zone changes)."""
-            ch = zone.changed(box)
-            return (not zone.busy) and ch is not None and ch >= getattr(args, "place_contrast", 0.2)
 
     if trk.get("hint") is not None:
-        box = _ball_at_hint(model, gray, args, trk, alt)
-        if box is not None:
-            return box
-
-    if not following and trk.get("last_ball") is not None:
-        box = _ball_at_last(model, gray, args, trk, alt, zone if in_zone else None)
+        box = _ball_at_hint(model, gray, args, trk)
         if box is not None:
             return box
 
@@ -959,7 +870,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
     if model is None:
         cands = []
     elif in_zone:
-        cands = _zone_model_candidates(model, gray, args, trk, following, placed, alt)
+        cands = _zone_model_candidates(model, gray, args, trk, following, placed)
     else:
         cands = list(_model_candidates(model, gray, args, trk, following))
     strong = [c for c in cands if c[1] >= args.conf]
@@ -969,7 +880,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
         # start-up it may be a look-alike on the mat). A ball seen being set
         # down elsewhere in the zone takes over.
         elsewhere = [p for p in zone.placed if not _matches_track(p[0], trk)]
-        found = _new_ball_evidence(spot_pic, args, [], elsewhere, use_blob)
+        found = _new_ball_evidence(gray, args, [], elsewhere, use_blob)
         box = _confirmed(trk, [(b, s) for b, s, _ in found], args, key="takeover", hold=2,
                          better_than=args.conf, slow=(getattr(args, "confirm_checks", 2) + 3, 0.4))
         if box is not None:
@@ -994,12 +905,10 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
             # higher (0.1) than the followed ball: e.g. the box had settled on
             # a tee before the ball was put down. Two equally ball-like things
             # never trade places.
-            others = [c for c in cands if not _matches_track(c[0], trk)
-                      and (fresh is None or fresh(c[0]))]
+            others = [c for c in cands if not _matches_track(c[0], trk)]
             rival = _confirmed(trk, [(b, c) for b, c, _ in others], args, key="rivals",
                                need=getattr(args, "switch_checks", 4), hold=8,
-                               better_than=max(args.conf, (total + conf) / (n + 1) + 0.1,
-                                               _model_alone(args)))
+                               better_than=max(args.conf, (total + conf) / (n + 1) + 0.1))
             if rival is not None:
                 trk["far"] = next(f for b, _, f in others if b is rival)
                 trk["switched"] = True          # update_ready starts over on it
@@ -1010,7 +919,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
     if following and use_blob:
         # The model missed the ball it was following: try the small-ball
         # finder right where it was, and only accept a spot right there.
-        box = find_ball_spot(spot_pic, args, near=_center(trk["box"]))
+        box = find_ball_spot(gray, args, near=_center(trk["box"]))
         if box and _matches_track(box, trk, strict=True):
             return _seen(trk, box, blob=True)
 
@@ -1027,7 +936,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
         return None
 
     # A new ball: a confident model find, or a spot where one was set down.
-    found = _new_ball_evidence(spot_pic, args, cands, placed, use_blob, fresh)
+    found = _new_ball_evidence(gray, args, cands, placed, use_blob)
     need = getattr(args, "confirm_checks", 2)
     # The zone's tiles are looked at in turn, so a find may only come back
     # every few checks: keep it in mind that long.
@@ -1043,7 +952,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
         trk["misses"] += 1
         return None
 
-    if use_blob and not (in_zone and zone.trusted) and not outdoor:
+    if use_blob and not (in_zone and zone.trusted):
         spots = find_ball_spots(gray, args)
         if in_zone and len(spots) > 1:
             # Several ball-like spots in the zone and none seen being set
@@ -1059,14 +968,7 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
     return None
 
 
-def _model_alone(args):
-    """Model rating needed to take a new ball on the model's word alone."""
-    if getattr(args, "outdoor", False):
-        return max(args.conf, getattr(args, "glare_model_conf", 0.75))
-    return args.conf
-
-
-def _new_ball_evidence(gray, args, cands, placed, use_blob, fresh=None):
+def _new_ball_evidence(gray, args, cands, placed, use_blob):
     """Possible new balls this check, as (box, rating, source). Ratings are on
     the model's 0-1 scale; --conf (0.5) or more counts after --confirm-checks
     sightings, 0.4 or more after three more.
@@ -1080,7 +982,7 @@ def _new_ball_evidence(gray, args, cands, placed, use_blob, fresh=None):
         pc, pd = _center(pbox), max(_diameter(pbox), 6.0)
         reach = max(0.8 * pd, 8.0)
         near = [c for c in cands if np.hypot(*np.subtract(_center(c[0]), pc)) <= reach
-                and 0.4 <= _diameter(c[0]) / pd <= (1.8 if getattr(args, "outdoor", False) else 2.5)]
+                and 0.4 <= _diameter(c[0]) / pd <= 2.5]
         if near:
             b, c, _ = max(near, key=lambda f: f[1])
             used += [n[0] for n in near]
@@ -1092,45 +994,13 @@ def _new_ball_evidence(gray, args, cands, placed, use_blob, fresh=None):
                 found.append((spot, 0.6, "set down + spot finder"))
                 continue
         found.append((pbox, 0.45, "set down"))
-    alone = _model_alone(args)
     for b, c, _ in cands:
-        if c >= alone and not any(b is u for u in used) and (fresh is None or fresh(b)):
+        if c >= args.conf and not any(b is u for u in used):
             found.append((b, c, f"model {c:.2f}"))
     return found
 
 
-def _ball_at_last(model, gray, args, trk, alt=None, zone=None):
-    """READY was lost without a shot (the ball wasn't seen for a while): look
-    for it right where it was, every check, until it's found again, a shot is
-    taken or the zone changes. Taken when the model sees a ball of the same
-    size right there (at --keep-conf, as for the ball being followed), or the
-    small-ball finder does and the spot still differs from the empty mat.
-    This also finds a ball that was already lying there when the empty-zone
-    picture was taken (the set-down watch can't see that one)."""
-    last = trk["last_ball"]
-    ref = {"box": last}
-    if model is not None and 0 < getattr(args, "tile", 0) < WIDTH:
-        T = min(args.tile, HEIGHT)
-        ox, oy = _tile_at(_center(last), T)
-        low = min(getattr(args, "keep_conf", 0.3), args.conf)
-        near = [(b, c) for pic in ([gray] if alt is None else [gray, alt])
-                for b, c, _ in _run_model(model, pic, args, ox, oy, T, low)
-                if _matches_track(b, ref, strict=True)]
-        if near:
-            b, c = max(near, key=lambda f: f[1])
-            trk["far"] = True
-            return _seen(trk, b, conf=c, source=f"refound + model {c:.2f}", sure=True)
-    if getattr(args, "blob", False):
-        spot = find_ball_spot(alt if alt is not None else gray, args, near=_center(last))
-        if spot is not None and _matches_track(spot, ref, strict=True):
-            ch = zone.changed(spot) if zone is not None else None
-            if ch is None or ch >= getattr(args, "place_contrast", 0.2):
-                trk["far"] = True
-                return _seen(trk, spot, blob=True, source="refound + spot finder", sure=True)
-    return None
-
-
-def _ball_at_hint(model, gray, args, trk, alt=None):
+def _ball_at_hint(model, gray, args, trk):
     """A tap on the Camera view said "the ball is here": take the ball found
     within 40 px of the tap straight away (the model at any confidence, else
     the small-ball finder). Tried for a few checks, then given up."""
@@ -1145,14 +1015,14 @@ def _ball_at_hint(model, gray, args, trk, alt=None):
         T = min(args.tile, HEIGHT)
         ox, oy = _tile_at((hx, hy), T)
         low = min(getattr(args, "assist_conf", 0.15), args.conf)
-        near = [(b, c) for pic in ([gray] if alt is None else [gray, alt])
-                for b, c, _ in _run_model(model, pic, args, ox, oy, T, low) if dist(b) <= reach]
+        near = [(b, c) for b, c, _ in _run_model(model, gray, args, ox, oy, T, low)
+                if dist(b) <= reach]
         if near:
             b, c = max(near, key=lambda f: f[1] / (1.0 + dist(f[0]) / reach))
             trk["hint"], trk["far"] = None, True
             print(f"Ball found where you tapped: {b} (model {c:.2f})")
             return _seen(trk, b, conf=c, source=f"tapped + model {c:.2f}", sure=True)
-    spot = find_ball_spot(alt if alt is not None else gray, args, near=(hx, hy))
+    spot = find_ball_spot(gray, args, near=(hx, hy))
     if spot is not None and dist(spot) <= reach:
         trk["hint"], trk["far"] = None, True
         print(f"Ball found where you tapped: {spot} (spot finder)")
@@ -1222,166 +1092,6 @@ def _model_candidates(model, gray, args, trk, following):
             return
 
 
-# --- Outside: sun glare --------------------------------------------------------
-#
-# Sun shining into (or near) the lens scatters inside it and lays an even haze
-# of extra light over the whole picture, plus starbursts and "ghosts" (round
-# bright blobs on a line through the middle of the picture). The haze is light
-# ADDED on top of the scene, so turning the exposure down can't remove it: the
-# ball's contrast against the mat shrinks to a few grey levels and the model
-# stops seeing it. Outside (--outdoor) the ball is looked for in a picture
-# with the haze taken out of the hitting zone as well (deglare), averaged over
-# a few frames to keep the noise down, and ghosts are kept from passing for a
-# ball (see detect_ball).
-
-_TO_LINEAR = ((np.arange(256) / 255.0) ** 2.2).astype(np.float32)   # undo the picture's gamma
-
-
-def _block_percentile(a, block, q):
-    """q-th percentile of each block x block square of a (at least one block)."""
-    h, w = a.shape
-    by, bx = max(h // block, 1), max(w // block, 1)
-    if h < block or w < block:
-        return np.full((1, 1), np.percentile(a, q), np.float32)
-    cut = a[:by * block, :bx * block].reshape(by, block, bx, block).transpose(0, 2, 1, 3)
-    return np.percentile(cut.reshape(by, bx, -1), q, axis=2).astype(np.float32)
-
-
-def deglare(gray, area, block=16, texture=0.35, target=80, margin=48):
-    """The picture with sun glare taken out of the hitting zone (plus a margin).
-
-    Glare is smooth and adds the same light to dark and bright parts of the
-    mat (in linear light). Without it, the darkest bits of a mat are only a
-    fraction (`texture`) of its middle brightness; glare lifts them towards
-    the rest. So the glare is estimated from how far the dark floor (a smooth
-    surface just under the darkest pixels) sits above that fraction of the
-    middle brightness, subtracted, and the mat is brought back to its usual
-    brightness (`target`). gray may be a float average of several frames.
-    Pixels that were clipped white stay white: what's under them is gone.
-    Returns a uint8 picture."""
-    x0, y0, x1, y1 = (int(v) for v in area)
-    X0, Y0 = max(x0 - margin, 0), max(y0 - margin, 0)
-    X1, Y1 = min(x1 + margin, gray.shape[1]), min(y1 + margin, gray.shape[0])
-    out = np.clip(np.round(gray), 0, 255).astype(np.uint8) if gray.dtype != np.uint8 else gray.copy()
-    reg = gray[Y0:Y1, X0:X1]
-    if reg.shape[0] < 8 or reg.shape[1] < 8:
-        return out
-    lin = _TO_LINEAR[reg] if reg.dtype == np.uint8 else \
-        (np.clip(reg, 0, 255).astype(np.float32) / 255.0) ** 2.2
-    h, w = lin.shape
-    floor = cv2.erode(_block_percentile(lin, block, 3), np.ones((3, 3), np.uint8))
-    floor = cv2.resize(cv2.GaussianBlur(floor, (0, 0), 1.0), (w, h), interpolation=cv2.INTER_LINEAR)
-    # The mat's middle brightness over blocks much bigger than a ball, so a
-    # ball set down doesn't shift the glare estimate round it.
-    middle = cv2.GaussianBlur(_block_percentile(lin, 3 * block, 50), (0, 0), 1.0)
-    middle = cv2.resize(middle, (w, h), interpolation=cv2.INTER_LINEAR)
-    glare = np.clip((floor - texture * middle) / (1.0 - texture), 0.0, 0.97 * floor)
-    scene = np.maximum(lin - glare, 0.0)
-    level = cv2.GaussianBlur(_block_percentile(scene, 2 * block, 50), (0, 0), 1.0)
-    level = np.maximum(cv2.resize(level, (w, h), interpolation=cv2.INTER_LINEAR), 1e-5)
-    res = np.clip(scene * (((target / 255.0) ** 2.2) / level), 0, 1) ** (1 / 2.2) * 255.0
-    res = np.where(reg >= 252, 255.0, res)
-    out[Y0:Y1, X0:X1] = np.clip(np.round(res), 0, 255).astype(np.uint8)
-    return out
-
-
-def average_frames(sh, n):
-    """The mean of the last n frames (float32), or the latest frame if there
-    aren't n yet. A ball lying still is the same in all of them while the
-    noise averages out."""
-    frames = []
-    for i in range(1, max(n, 1) + 1):
-        try:
-            frames.append(sh.frames[-i][2])
-        except IndexError:
-            break
-    if len(frames) <= 1 or any(f.shape != frames[0].shape for f in frames):
-        return sh.latest
-    acc = frames[0].astype(np.float32)
-    for f in frames[1:]:
-        acc += f
-    return acc / len(frames)
-
-
-MAT_FILE = "mat_texture.json"   # how textured the mat is without sun, learned inside
-
-
-class GlareMeter:
-    """How much of the light on the hitting zone is sun glare, for the screen,
-    and how textured the mat itself is, for deglare.
-
-    Without glare the darkest bits of the mat are a fixed share of its middle
-    brightness (its texture: a smooth mat's dark bits are nearly as bright as
-    the rest, turf's much darker). Haze lifts the darkest bits towards the
-    rest. The meter compares with the clearest moment it has seen (the
-    lowest share), so it reads 0 in clear light and towards 1 when the mat is
-    all haze, whatever the mat.
-
-    Inside (learn=True) there is no sun, so the share measured there, with
-    nothing in the zone, is the mat's own texture: it is saved in the shots
-    folder (MAT_FILE) and used outside to tell glare from texture."""
-
-    WARN = 0.6
-
-    def __init__(self, out_dir=None, learn=False):
-        self.path = os.path.join(out_dir, MAT_FILE) if out_dir else None
-        self.learn = learn
-        self.saved = self._load()
-        self.r0 = self.saved          # lowest (clearest) share seen
-        self.r = None                 # the share now (smoothed)
-        self.n = 0
-        self.value = 0.0
-        self.sun = 0.0
-
-    def _load(self):
-        try:
-            with open(self.path) as f:
-                v = float(json.load(f)["dark_share"])
-            return v if 0.0 < v < 1.0 else None
-        except (OSError, ValueError, KeyError, TypeError):
-            return None
-
-    def texture(self):
-        """The mat's own dark share for deglare (0.35, typical turf, until learned inside)."""
-        return min(max(self.saved, 0.2), 0.85) if self.saved is not None else 0.35
-
-    def update(self, gray, area, quiet=True):
-        """quiet: nothing in the zone right now (no ball, no hand): only then is
-        anything learned."""
-        x0, y0, x1, y1 = (int(v) for v in area)
-        reg = gray[y0:y1:2, x0:x1:2]
-        if reg.size < 16:
-            return self.value
-        lin = _TO_LINEAR[reg] if reg.dtype == np.uint8 else \
-            (np.clip(reg, 0, 255).astype(np.float32) / 255.0) ** 2.2
-        p5, p50 = np.percentile(lin, (5, 50))
-        r = float(p5 / max(p50, 1e-6))
-        self.r = r if self.r is None else 0.8 * self.r + 0.2 * r
-        self.n += 1
-        if quiet and self.n >= 8:
-            if self.r0 is None or self.r < self.r0:
-                self.r0 = self.r
-            if self.learn and self.path and (self.saved is None or self.r < self.saved - 0.02):
-                try:
-                    with open(self.path, "w") as f:
-                        json.dump({"dark_share": round(self.r, 3)}, f)
-                    self.saved = self.r
-                except OSError:
-                    pass
-        if self.r0 is None:
-            return self.value
-        h = (self.r - self.r0) / max(1.0 - self.r0, 1e-3)
-        self.value = float(np.clip(h, 0, 1))
-        self.sun = float(np.mean(gray[::4, ::4] >= 250))
-        return self.value
-
-    def message(self):
-        if self.value >= self.WARN:
-            return ("Sun glare on the lens" + (" (sun in the picture)" if self.sun >= 0.02 else "") +
-                    ": shade the camera or turn the unit away from the sun")
-        return ""
-
-
 # --- The hitting zone ---------------------------------------------------------
 
 _ROTATION = [0]     # which of the zone's tiles the model looks at next
@@ -1416,7 +1126,7 @@ def _run_model(model, gray, args, ox, oy, T, low):
     return found
 
 
-def _zone_model_candidates(model, gray, args, trk, following, placed, alt=None):
+def _zone_model_candidates(model, gray, args, trk, following, placed):
     """The model's finds inside the hitting zone, best first, as (box, confidence, True).
 
     Each check the model looks at one tile centred on the followed ball; or,
@@ -1425,12 +1135,7 @@ def _zone_model_candidates(model, gray, args, trk, following, placed, alt=None):
     turn (so a ball already lying there is found too). That keeps it to one
     to three looks a check however big the zone is. Low confidences are kept
     (down to --assist-conf): on their own they don't count, but they back up
-    a set-down spot.
-
-    alt (outside): the picture with the glare taken out. The same tiles are
-    looked at again in it when the plain picture gave nothing sure (no
-    rating of --conf, or no sight of the followed ball); the better rating of
-    each find is kept."""
+    a set-down spot."""
     T = min(args.tile, HEIGHT)
     zone = _zone_tiles(args)
     if following:
@@ -1451,18 +1156,13 @@ def _zone_model_candidates(model, gray, args, trk, following, placed, alt=None):
         if any(abs(ox - a) < 32 and abs(oy - b) < 32 for a, b in done):
             continue                           # practically the same tile
         done.append((ox, oy))
-    for pic in ([gray] if alt is None else [gray, alt]):
-        if pic is alt and (any(_matches_track(b, trk, strict=True) for b, _, _ in found) if following
-                           else any(c >= args.conf for _, c, _ in found)):
-            break                              # the plain picture was enough
-        for ox, oy in done:
-            for box, conf, tile in _run_model(model, pic, args, ox, oy, T, low):
-                same = next((i for i, f in enumerate(found) if np.hypot(*np.subtract(
-                    _center(f[0]), _center(box))) < 0.5 * max(_diameter(f[0]), 1.0)), None)
-                if same is None:
-                    found.append((box, conf, tile))
-                elif conf > found[same][1]:
-                    found[same] = (box, conf, tile)
+        for box, conf, tile in _run_model(model, gray, args, ox, oy, T, low):
+            same = next((i for i, f in enumerate(found) if np.hypot(*np.subtract(
+                _center(f[0]), _center(box))) < 0.5 * max(_diameter(f[0]), 1.0)), None)
+            if same is None:
+                found.append((box, conf, tile))
+            elif conf > found[same][1]:
+                found[same] = (box, conf, tile)
     found.sort(key=lambda f: -f[1])
     return found
 
@@ -1513,7 +1213,6 @@ class ZoneWatch:
         self.leftover = None      # box of a ball still lying where it was after a "shot"
         self.busy_since = None
         self.noise = None         # picture noise, in the same relative units
-        self.busy = False         # much of the zone differs from the empty picture right now
 
     @property
     def active(self):
@@ -1530,21 +1229,6 @@ class ZoneWatch:
         z = cv2.GaussianBlur(gray[Y0:Y1, X0:X1].astype(np.float32), (5, 5), 0)
         rel = z / (cv2.blur(z, (k, k)) + 8.0)
         return rel[y0 - Y0:y1 - Y0, x0 - X0:x1 - X0]
-
-    def changed(self, box):
-        """How much brighter than in the empty picture the zone now is inside
-        box (relative units, as --place-contrast), or None with no usable
-        empty picture. Used outside: a lens-flare ghost was already there when
-        the empty picture was taken, a ball just put down wasn't."""
-        if self.bg is None or self.prev is None or self.after_shot is not None \
-                or self.prev.shape != self.bg.shape:
-            return None
-        x0, y0 = self.area[:2]
-        bx0, by0, bx1, by1 = (int(v) for v in box)
-        d = (self.prev - self.bg)[max(by0 - y0, 0):max(by1 - y0, 0), max(bx0 - x0, 0):max(bx1 - x0, 0)]
-        if d.size == 0:
-            return None
-        return float(np.percentile(d, 75))     # a ball fills most of its box
 
     def shot_taken(self, ball_box, now):
         """A shot was just recorded: take a new empty picture once the zone is quiet."""
@@ -1579,14 +1263,12 @@ class ZoneWatch:
 
         if self.bg is None or self.after_shot is not None:
             self.placed = []
-            self.busy = True
             if allow_new and self.quiet >= 2 and (self.after_shot is None or now >= self.after_shot[0]):
                 self._take(gray, rel)
             return
 
         diff = rel - self.bg
         busy = float(np.mean(np.abs(diff) > thr))
-        self.busy = busy > self.BUSY
         if protect is not None:
             self.leftover = None              # a ball is being followed again
         if busy <= self.BUSY:
@@ -1622,7 +1304,6 @@ class ZoneWatch:
 
     def _take(self, gray, rel):
         """Remember the zone as it is now as "empty"."""
-        before = self.bg                                  # the empty zone before this ball
         self.bg = rel.copy()
         self.placed = []
         self.busy_since = None
@@ -1631,8 +1312,7 @@ class ZoneWatch:
             old = self.after_shot[1]
             still = None if old is None else next(
                 (b for b, _ in lying
-                 if np.hypot(*np.subtract(_center(b), _center(old))) <= max(0.6 * _diameter(old), 5.0)
-                 and not (getattr(self.args, "outdoor", False) and self._was_there(before, b))),
+                 if np.hypot(*np.subtract(_center(b), _center(old))) <= max(0.6 * _diameter(old), 5.0)),
                 None)
             # The rest of the zone is known to be empty either way. A ball
             # still lying where it was (the trigger fired but it wasn't hit)
@@ -1644,20 +1324,6 @@ class ZoneWatch:
             self.trusted, self.leftover = not lying, None
         self.after_shot = None
         print(f"Hitting zone: empty picture taken ({'no ball in it' if self.trusted else 'a ball may be in it'})")
-
-    def _was_there(self, before, box):
-        """True if box was already a bright spot in the empty picture taken
-        before the last ball was set down: a mark on the mat or a lens-flare
-        ghost next to where the ball sat, not the ball left behind (outside)."""
-        if before is None or before.shape != self.bg.shape:
-            return False
-        x0, y0 = self.area[:2]
-        bx0, by0, bx1, by1 = (int(v) for v in box)
-        sl = (slice(max(by0 - y0, 0), max(by1 - y0, 0)), slice(max(bx0 - x0, 0), max(bx1 - x0, 0)))
-        if before[sl].size == 0:
-            return False
-        lift = float(np.percentile(before[sl], 75)) - float(np.median(before))
-        return lift >= getattr(self.args, "place_contrast", 0.2)
 
     def _spots(self, diff, thr):
         """Ball-sized spots that have become brighter than the empty zone, with
@@ -1708,15 +1374,11 @@ def smooth_box(shown, box, weight=0.4):
 
 
 def update_ready(sh, args, gray, ball, trk, now):
-    """Decide SEARCHING / BALL / READY from the latest find.
+    """Decide SEARCHING / BALL / READY from the model's latest answer.
 
-    While READY the ball keeps being looked for. It counts as seen when a
-    finder places it where it was AND its spot still looks like the ball did
-    when armed (a hand or club over it doesn't count, even if the model half
-    sees the ball through it). If it hasn't been seen for --hold-seconds (5 s
-    in start_kiosk.sh), it's back to Looking for Ball; where it was is
-    remembered (trk["last_ball"]) so detect_ball finds it there again, and
-    once it has sat still for --still-seconds it is READY again.
+    Once READY, the script stays READY even if the model loses the ball (for
+    example when the club is set down next to it), as long as the patch of
+    picture where the ball sits still looks the same.
     """
     center = None
     if ball is not None:
@@ -1738,28 +1400,26 @@ def update_ready(sh, args, gray, ball, trk, now):
         diff = _ball_diff(sh, gray)
         same = center is not None and np.hypot(
             center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels
-        visible = diff is None or diff <= args.motion_threshold
-        if same and visible:
+        if same:
             trk["confirmed_at"] = now
             trk["box"] = ball
+        visible = diff is None or diff <= args.motion_threshold
+        blind = now - (trk["confirmed_at"] or now)
+        if visible and (same or blind <= getattr(args, "blind_seconds", 30.0)):
             trk["lost_since"] = None
-            if diff is not None and diff <= args.motion_threshold * 0.5:
+            if same and diff is not None and diff <= args.motion_threshold * 0.5:
                 _set_patch(sh, gray, ball)  # follow slow lighting changes
-            return "READY"
+            return "READY"  # the ball's spot looks as it did when armed
         if trk["lost_since"] is None:
             trk["lost_since"] = now
-        unseen = now - (trk["confirmed_at"] or now)
-        if unseen < args.hold_seconds:
-            return "READY"  # not seen just now (covered, or a missed check): give it a moment
-        why = (f"its spot looks different (change {diff:.1f}, limit {args.motion_threshold:.0f})"
-               if not visible and diff is not None else "not found where it was")
-        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: ball not seen for "
-              f"{unseen:.1f} s ({why}); Looking for Ball")
-        last = list(trk["box"]) if trk.get("box") is not None else None
+        if now - trk["lost_since"] < args.hold_seconds:
+            return "READY"  # briefly covered; give it a moment
+        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: the ball's spot has looked "
+              f"different (change {diff if diff is not None else -1:.1f}, limit {args.motion_threshold:.0f}) "
+              f"for {now - trk['lost_since']:.1f} s")
         sh.armed = False
         sh.roi = sh.roi_ref = sh.ball_ref = None
         trk.update(new_track())
-        trk["last_ball"] = last         # look for it right there first
         # Show "Looking for Ball" for a moment instead of re-arming at once on a
         # fresh picture (which looked as if it had never left Ready).
         sh.rearm_after = now + getattr(args, "rearm_pause", 2.0)
@@ -1786,7 +1446,6 @@ def update_ready(sh, args, gray, ball, trk, now):
         sh.armed = True
         trk["lost_since"] = None
         trk["confirmed_at"] = now
-        trk["last_ball"] = None
         return "READY"
     return "BALL"
 
@@ -1893,9 +1552,6 @@ def camera_thread(cam, sh, args):
                     # Something (usually the club) has settled beside the ball.
                     x0, y0, x1, y1 = sh.roi
                     sh.roi_ref = img[y0:y1, x0:x1].copy()
-                    if getattr(sh, "ring", None) is not None:
-                        rx0, ry0, rx1, ry1 = sh.ring
-                        sh.ring_ref = img[ry0:ry1, rx0:rx1].copy()
         else:
             watch.reset()
 

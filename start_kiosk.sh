@@ -19,8 +19,7 @@ BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the g
 AZIMUTH_DEG=0      # radars point this far right of the target line (left = negative), degrees
 GATE_GPIO=20       # trigger input the TI radar listens on: GPIO20 = pin 38 (was 17 = pin 11)
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-HOLD_SECONDS=5      # Ready: ball not seen this long (covered, moved, gone) -> back to Looking for Ball;
-                    # it is then looked for where it was and is Ready again once found
+HOLD_SECONDS=5      # ball covered (hand, club, foot) this long -> back to Looking for Ball
 MOTION_THRESHOLD=12 # camera trigger: how much the ball's spot must change (0-255) when the ball leaves.
                    # Was 25; lab shots only changed it by 13-16, so half were missed
 OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera or the sound detector);
@@ -43,8 +42,6 @@ OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time 
 OUTSIDE_SENSOR=full
 OUTSIDE_FPS=60       # 144 cut out the battery pack; 60 keeps the load down
 OUTSIDE_RECORDING=off   # no shot replay or saved frames: lightest load for the battery
-OUTSIDE_GLARE=1      # 1 = sun-glare handling (haze removal, flare-ghost guard, flash-proof
-                     # trigger, glare warning on screen); 0 = find the ball as inside
 #   Inside Golf: wall outlet only. Full sensor so it can zoom 2x on the hitting
 #   zone like Outside Golf (the ball is twice as wide, much easier to find), at
 #   the full sensor's top speed, 144 fps. INSIDE_SENSOR=binned + INSIDE_FPS=300
@@ -99,12 +96,9 @@ while true; do
     MODE=${CHOICE%%,*}
     CLUB=${CHOICE##*,}
     case "$MODE" in
-        inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING
-                OUTDOOR="" ;;
+        inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING ;;
         *)      MODE=outside
-                CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING
-                OUTDOOR=""
-                [ "$OUTSIDE_GLARE" = "1" ] && OUTDOOR="'--outdoor'," ;;
+                CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING ;;
     esac
     DETECT="'--trigger','motion,sound','--blob'"
     MODELARG=""
@@ -118,7 +112,7 @@ while true; do
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     reset_ops
     echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OUTDOOR'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"
