@@ -3,9 +3,10 @@
 MODUS-Golf start menu.
 
 Shown on the Pi's screen (and on any phone on the MODUS WiFi) before the kiosk
-starts. Pick how shots are detected and which club is being hit, press Start,
-and this prints the choice for start_kiosk.sh, which then starts the kiosk. The
-kiosk's Menu button brings you back here.
+starts. Pick Outside or Inside Golf, press Start, and this prints the choice for
+start_kiosk.sh, which then starts the kiosk. The kiosk's Menu button brings you
+back here. The club is picked inside the kiosk (its Club button); the last one
+used is remembered here and passed on.
 
     python3 camera/launcher.py [--open-browser]
 
@@ -43,24 +44,24 @@ h1{margin:0;font-size:5.5vh;letter-spacing:.5px}
 h1 span{color:#2ecc71}
 .lbl{color:#8a97a5;font-size:2.8vh;margin-bottom:1vh;font-weight:600}
 .row{display:grid;gap:1.5vw}
-.modes{grid-template-columns:1fr 1fr}
+.modes{grid-template-columns:1fr 1fr;flex:1}
+.modes .mode{display:flex;flex-direction:column;justify-content:center}
+.mode b{font-size:5vh!important}.mode small{font-size:2.8vh!important}
+.grow{flex:1;display:flex;flex-direction:column}
 .mode{background:#141b24;border:3px solid #141b24;border-radius:16px;padding:2vh 2vw;color:#eef3f7;
   text-align:left;font:inherit}
 .mode b{display:block;font-size:3.6vh;margin-bottom:.6vh}
 .mode small{color:#8a97a5;font-size:2.3vh;line-height:1.3}
 .mode.on{border-color:#2ecc71;background:#132519}
-.clubs{grid-template-columns:repeat(6,1fr)}
-.club{background:#141b24;border:3px solid #141b24;border-radius:12px;color:#eef3f7;font:inherit;
-  font-size:3vh;font-weight:700;padding:1.6vh 0}
-.club.on{border-color:#2ecc71;background:#132519}
 #start{margin-top:auto;background:#2ecc71;color:#06210f;border:0;border-radius:16px;font:inherit;
   font-size:4.6vh;font-weight:800;padding:2.4vh}
 #start:disabled{background:#2a3a30;color:#7c8a80}
 #hint{color:#6f7c89;font-size:2.1vh;text-align:center}
+#clubnow{color:#8a97a5;font-size:2.6vh;text-align:center}#clubnow b{color:#2ecc71}
 #msg{color:#f0b429;font-size:2.4vh;text-align:center;min-height:2.6vh}
 </style></head><body>
 <h1>MODUS <span>Golf</span></h1>
-<div>
+<div class="grow">
   <div class="lbl">Where are you playing?</div>
   <div class="row modes">
     <button class="mode" data-mode="outside"><b>Outside Golf</b>
@@ -69,10 +70,7 @@ h1 span{color:#2ecc71}
       <small>Fastest camera. Plug into a wall outlet (won't work on the battery).</small></button>
   </div>
 </div>
-<div>
-  <div class="lbl">Club (sets typical launch and spin until launch angle is measured)</div>
-  <div class="row clubs" id="clubs"></div>
-</div>
+<div id="clubnow">Club: <b id="clubname"></b> &middot; change it with the Club button once started</div>
 <div id="msg"></div>
 <button id="start">Start</button>
 <div id="hint">Phone: join WiFi <b>MODUS</b>, open <b>10.42.0.1:8000</b></div>
@@ -80,14 +78,11 @@ h1 span{color:#2ecc71}
 const CLUBS=__CLUBS__, LABEL=__LABELS__;
 let mode=__MODE__, club=__CLUB__;
 const $=id=>document.getElementById(id);
-for(const c of CLUBS){const b=document.createElement('button');b.className='club';b.dataset.club=c;
-  b.textContent=LABEL[c]||c.toUpperCase();$('clubs').appendChild(b);}
+$('clubname').textContent=LABEL[club]||club;
 function draw(){
   document.querySelectorAll('.mode').forEach(b=>b.classList.toggle('on',b.dataset.mode===mode));
-  document.querySelectorAll('.club').forEach(b=>b.classList.toggle('on',b.dataset.club===club));
 }
 document.querySelectorAll('.mode').forEach(b=>b.onclick=()=>{mode=b.dataset.mode;draw();});
-document.querySelectorAll('.club').forEach(b=>b.onclick=()=>{club=b.dataset.club;draw();});
 $('start').onclick=async()=>{
   $('start').disabled=true;$('start').textContent='Starting...';
   $('msg').textContent='Getting the camera and radars ready (about 20 seconds)';
@@ -204,7 +199,7 @@ def main():
             q = dict(x.split("=", 1) for x in query.split("&") if "=" in x)
             if path == "/start":
                 m = q.get("mode") if q.get("mode") in MODES else "outside"
-                c = q.get("club") if q.get("club") in CLUBS else "52"
+                c = q.get("club") if q.get("club") in CLUBS else load_settings()[1]   # set in the kiosk
                 choice.update(mode=m, club=c)
                 done.set()
             self.send_response(204)

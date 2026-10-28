@@ -59,6 +59,12 @@ from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, Zone
                           smooth_box, start_camera, update_ready, _ball_diff)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
+# Clubs for the Club button (same list and names as the start menu, launcher.py).
+CLUBS = ["driver", "3w", "hybrid", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
+CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "5i": "5 Iron",
+              "6i": "6 Iron", "7i": "7 Iron", "8i": "8 Iron", "9i": "9 Iron", "pw": "PW",
+              "52": "52\u00b0", "56": "56\u00b0", "60": "60\u00b0"}
+MENU_SETTINGS = os.path.expanduser("~/MODUS-Golf/shots/launcher.json")   # shared with launcher.py
 REPLAY_FPS = 30
 NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
 
@@ -105,6 +111,13 @@ button:active{border-color:#2ecc71;background:#132519}
 .cmsg{font-size:2.4vh;color:#8a97a5;text-align:center}
 #expo{font-size:2.2vh;color:#6f7c89}
 #camwarn{color:#f0b429;font-size:2.4vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#clubbtn b{color:#2ecc71}
+#clubs{display:flex;flex-direction:column;gap:2vh}
+#clubs .grid{flex:1;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(3,1fr);gap:1.5vw}
+#clubs .club{height:auto;font-size:4.4vh;font-weight:800;border-radius:16px}
+#clubs .club.on{border-color:#2ecc71;background:#132519;color:#2ecc71}
+#clubs .head{display:flex;align-items:center;gap:1.5vw;height:9vh}
+#clubs .head .lbl{flex:1}
 </style></head><body>
 <div id="top">
   <h1 id="brand">MODUS <span>Golf</span></h1>
@@ -112,6 +125,7 @@ button:active{border-color:#2ecc71;background:#132519}
   <button id="pv" class="hide" onclick="show('preview')">Shot Preview</button>
   <span id="camwarn"></span>
   <span id="shotno"></span>
+  <button id="clubbtn" onclick="show('clubs')">Club <b id="clubname"></b></button>
   <button id="cam" onclick="show('camera')">Camera</button>
   <button id="rng" onclick="location.href='/range'">Range</button>
   <button id="quit" onclick="post('quit')">Menu</button>
@@ -125,6 +139,11 @@ button:active{border-color:#2ecc71;background:#132519}
     <button id="keep" onclick="post('keep')">Save</button>
     <button id="del" onclick="post('delete')">Delete</button>
   </div>
+</div>
+<div id="clubs" class="view hide">
+  <div class="head"><button onclick="show('main')">Back</button>
+    <span class="lbl">Club: sets the typical launch and spin until launch angle is measured</span></div>
+  <div class="grid" id="clubgrid"></div>
 </div>
 <div id="camera" class="view hide">
   <img id="live" draggable="false"><div id="sel"></div>
@@ -152,7 +171,16 @@ for(const [k,label,unit] of TILES){
               '<div class="unit" id="u_'+k+'">'+unit+'</div>';
   main.appendChild(t);
 }
-let view='main',shot=-1,rev=-1,video='none';
+let view='main',shot=-1,rev=-1,video='none',club=null;
+const CLUBS=__CLUBS__,CLUB_LABEL=__CLUB_LABEL__;
+for(const c of CLUBS){const b=document.createElement('button');b.className='club';b.dataset.club=c;
+  b.textContent=CLUB_LABEL[c]||c.toUpperCase();
+  b.onclick=()=>{club=c;drawClub();fetch('/club?c='+encodeURIComponent(c),{method:'POST'});show('main');};
+  $('clubgrid').appendChild(b);}
+function drawClub(){
+  $('clubname').textContent=club?(CLUB_LABEL[club]||club):'';
+  document.querySelectorAll('#clubgrid .club').forEach(b=>b.classList.toggle('on',b.dataset.club===club));
+}
 function post(a){fetch('/'+a,{method:'POST'});}
 // Live view: drag a box over the hitting area (the hitting zone) and the camera
 // keeps looking for a ball set down anywhere inside it (remembered across
@@ -197,7 +225,7 @@ function zoomToggle(){fetch('/view?zoom='+(zoomed?0:1),{method:'POST'});}
 function saveTraining(){fetch('/train_frame',{method:'POST'});}
 function show(v){
   view=v;
-  for(const n of ['main','preview','camera'])$(n).classList.toggle('hide',n!=v);
+  for(const n of ['main','preview','camera','clubs'])$(n).classList.toggle('hide',n!=v);
   $('rep').src=(v=='preview')?'/replay.mjpg?'+shot+'_'+Date.now():'';
   $('live').src=(v=='camera')?'/stream.mjpg':'';
 }
@@ -223,6 +251,7 @@ async function tick(){
       $('shotno').textContent=shot>0?'Shot '+shot:'';
       if(view=='preview')show(s.video=='none'||s.video=='deleted'?'main':'preview');
     }
+    if(s.club&&s.club!==club){club=s.club;drawClub();}
     video=s.video;
     const has=(video=='pending'||video=='kept');
     $('pv').classList.toggle('hide',!has);
@@ -258,6 +287,9 @@ async function waitForMenu(){
 }
 tick();
 </script></body></html>"""
+
+PAGE = (PAGE.replace(b"__CLUBS__", json.dumps(CLUBS).encode())
+            .replace(b"__CLUB_LABEL__", json.dumps(CLUB_LABEL).encode()))
 
 
 def empty_metrics():
@@ -300,6 +332,8 @@ class Kiosk:
         self.folder = None      # where the latest shot is saved
         self.video = "none"     # none / pending / kept / deleted
         self.quit = False
+        self.ops = None         # the radar bridges, so the Club button can update them
+        self.bridge = None
         self.args = None
         self.reset_track = False
         self.history = []       # flights of the last shots, for the range view
@@ -372,6 +406,38 @@ class Kiosk:
         else:
             print("Hitting zone is too big to zoom in on (it must be under about half the "
                   "picture's width and height); staying wide")
+
+    def set_club(self, club):
+        """The Club button: change the club without leaving the kiosk. Used for
+        the next shot's typical launch and spin, and passed to both radars."""
+        if self.args is None or club not in CLUBS or club == self.args.club:
+            return
+        with self.lock:
+            self.args.club = club
+            self.rev += 1
+        told = []
+        for name, part in (("speed radar", self.ops), ("TI radar", self.bridge)):
+            if part is not None and hasattr(part, "set_club"):
+                try:
+                    part.set_club(club)
+                    told.append(name)
+                except Exception as e:
+                    print(f"Could not give the {name} the new club ({e})")
+        print(f"[{time.strftime('%H:%M:%S')}] Club: {CLUB_LABEL.get(club, club)}"
+              + (f" (also set on the {' and '.join(told)})" if told else ""))
+        # Remembered for next time, so the start menu doesn't need to ask.
+        try:
+            with open(MENU_SETTINGS) as f:
+                saved = json.load(f)
+        except (OSError, ValueError):
+            saved = {}
+        saved["club"] = club
+        try:
+            os.makedirs(os.path.dirname(MENU_SETTINGS), exist_ok=True)
+            with open(MENU_SETTINGS, "w") as f:
+                json.dump(saved, f)
+        except OSError:
+            pass
 
     def set_zoom(self, on):
         """The Zoom in / Wide view button."""
@@ -450,7 +516,8 @@ class Handler(BaseHTTPRequestHandler):
                                    "camera": getattr(K, "camera", None),
                                    "zone": bool(K.args is not None and K.args.search_area),
                                    "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
-                                   "focus": K.focus, "training": K.training}).encode()
+                                   "focus": K.focus, "training": K.training,
+                                   "club": K.args.club if K.args is not None else None}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
@@ -548,6 +615,9 @@ class Handler(BaseHTTPRequestHandler):
         if action == "view":
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             K.set_zoom(q.get("zoom") == "1")
+        if action == "club":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            K.set_club(q.get("c", ""))
         if action == "train_frame":
             K.train_request = True
         if action == "quit":
@@ -1055,6 +1125,7 @@ def main():
             bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
         except Exception as e:
             print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
+    K.ops, K.bridge = ops, bridge       # so the Club button can update both radars
     # Ball-speed cosine correction: on whenever the TI radar is running, as in
     # OpenFlight. The raw reading is kept in the session log.
     K.correct_speed = None

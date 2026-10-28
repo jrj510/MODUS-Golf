@@ -292,6 +292,10 @@ class IWRBridge:
         event["result"] = result
         event["done"].set()
 
+    def set_club(self, name):
+        """Club changed from the kiosk's Club button (used for the next shots)."""
+        self.club = openflight_club_name(name)
+
     def result_for(self, shot_time, wait_s=45.0):
         """The TI result for the speed-radar shot that goes with a camera shot."""
         if not self.has_ops:
@@ -400,6 +404,16 @@ class OPSBridge:
                 listener(shot, now)
             except Exception as e:
                 print(f"Speed radar listener error: {e}")
+
+    def set_club(self, name):
+        """Club changed from the kiosk's Club button: OpenFlight's processing
+        handles wedges and their spin differently, so it is told straight away."""
+        club = openflight_club(name)
+        if club is not None and hasattr(self.monitor, "set_club"):
+            self.monitor.set_club(club)
+            self.club = club
+            return club.value
+        return None
 
     def result_for(self, shot_time, wait_s=35.0):
         """The speed radar's shot that goes with a camera shot, or None.
