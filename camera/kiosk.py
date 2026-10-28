@@ -56,7 +56,8 @@ from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, Zone
                           sharpness, zoom_on,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
-                          smooth_box, start_camera, update_ready, _ball_diff)
+                          smooth_box, start_camera, update_ready, _ball_diff,
+                          GlareMeter, average_frames, deglare, _search_area)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 # Clubs for the Club button (same list and names as the start menu, launcher.py).
@@ -260,9 +261,10 @@ async function tick(){
     $('vmsg').textContent=video=='kept'?'Saved':(video=='pending'?'Save this video?':'');
     if(view=='preview'&&!has)show('main');
     const c=s.camera;
-    $('expo').textContent=c?('Exposure '+c.exposure_us+' us x'+c.gain+
+    $('expo').textContent=(c&&c.exposure_us!=null?('Exposure '+c.exposure_us+' us x'+c.gain+
       (c.median!=null?', ball area brightness '+c.median+(c.clipped_pct?' ('+c.clipped_pct+'% white)':''):'')+
-      (c.message?'. '+c.message:'')):'';
+      (c.message?'. '+c.message:'')):'')+(c&&c.glare!=null?' Sun glare '+Math.round(c.glare*100)+'%'+
+      (c.glare_msg?' - '+c.glare_msg.split(': ')[1]:''):'');
     const vw=s.view||{};zoomed=!!vw.zoomed;
     $('zoombtn').classList.toggle('hide',!vw.can_zoom);
     $('zoombtn').textContent=zoomed?'Wide view':'Zoom in';
@@ -270,7 +272,7 @@ async function tick(){
     $('focus').textContent=f?('Focus '+f.value+' (best '+f.best+', '+f.where+'). '):'';
     const tr=s.training;
     $('trainbtn').textContent='Save frame'+(tr?' ('+tr[0]+' ball / '+tr[1]+' empty)':'');
-    $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):
+    $('camwarn').textContent=(c&&c.glare_msg)?c.glare_msg.split(':')[0]:(c&&c.state=='limit')?(c.message.split(':')[0]):
       (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
     fails=0;
   }catch(e){
@@ -1171,6 +1173,15 @@ def main():
     ball, trk, drawn = None, new_track(), None
     # Notices a ball being set down in the hitting zone (see ZoneWatch).
     zone = None if args.swing_test else ZoneWatch(args)
+    # Outside: sun glare handling (see "Outside: sun glare" in shot_capture.py).
+    # Inside it only learns how textured the mat is with no sun on it (saved in
+    # the shots folder), so outside can tell sun glare from the mat's texture.
+    glare = None if args.swing_test else GlareMeter(args.out, learn=not args.outdoor)
+    sh.glare_comp = bool(args.outdoor)     # flash-proof motion trigger
+    glare_warned = False
+    if args.outdoor:
+        print(f"Outside mode: glare handling on (averaging {args.glare_frames} frames, "
+              f"model alone needs {max(args.conf, args.glare_model_conf):.2f})")
     rearm_at = time.monotonic() + 2.0
     settle_until = 0.0          # after a shot: let the radars work before looking again
     # Lower frame rate while no ball is READY (only with a fixed/ladder exposure:
@@ -1323,10 +1334,35 @@ def main():
                     rearm_at = time.monotonic() + 0.5
                 K.camera = ae.summary(sh.exposure)
 
+            # Outside: look for the ball in an average of the last few frames
+            # (less noise), and again in a copy with the sun glare taken out of
+            # the hitting zone (alt). The READY logic and the motion trigger
+            # keep using the live frame.
+            det, alt = gray, None
+            if glare is not None and args.search_area and not args.outdoor:
+                if K.state == "SEARCHING" and not (zone is not None and zone.busy):
+                    glare.update(gray, _search_area(args), quiet=True)     # inside: learn the mat
+            elif glare is not None and args.search_area:
+                avg = average_frames(sh, args.glare_frames)
+                area = _search_area(args)
+                alt = deglare(avg, area, texture=glare.texture())
+                det = np.clip(np.round(avg), 0, 255).astype(np.uint8) if avg.dtype != np.uint8 else avg
+                glare.update(gray, area, quiet=K.state == "SEARCHING" and not (zone is not None and zone.busy))
+                msg = glare.message()
+                if K.camera is not None:
+                    K.camera = dict(K.camera, glare=round(glare.value, 2), glare_msg=msg)
+                else:
+                    K.camera = {"glare": round(glare.value, 2), "glare_msg": msg}
+                if bool(msg) != glare_warned:
+                    glare_warned = bool(msg)
+                    print(f"[{time.strftime('%H:%M:%S')}] " + (msg if msg else "Sun glare has eased")
+                          + f" (glare {glare.value:.2f})")
+
             now = time.monotonic()
             if zone is not None and sh.trigger_time is None and now >= view_settle_until:
                 following = trk.get("box") is not None and trk["center"] is not None
-                zone.update(gray, now, protect=trk["box"] if following else None,
+                zone.update(alt if alt is not None else gray, now,
+                            protect=trk["box"] if following else None,
                             allow_new=ae is None or ae.state in ("ok", "limit"))
             measuring = (now < settle_until and not args.swing_test
                          and any(j.is_alive() for j in K.radar_jobs))
@@ -1345,14 +1381,17 @@ def main():
                     sh.armed = True
                 K.state = "SWINGTEST" if sh.armed else "WAIT"
             else:
-                ball = detect_ball(model, gray, args, trk, zone)
+                ball = detect_ball(model, det, args, trk, zone, alt)
                 was = K.state
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"] if K.state in ("BALL", "READY") else None
                 if K.state == "READY" and was != "READY":
                     b = trk["box"]
                     if zone is not None:          # set-down spots must be about this size
-                        zone.ball_d = ((b[2] - b[0]) + (b[3] - b[1])) / 2.0
+                        d = ((b[2] - b[0]) + (b[3] - b[1])) / 2.0
+                        # (eased, so one odd box can't make every later ball "the wrong size")
+                        zone.ball_d = d if (zone.ball_d is None or not args.outdoor) \
+                            else 0.7 * zone.ball_d + 0.3 * d
                     # Logged so a box on the wrong spot can be traced to its finder.
                     print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
                           f"(found by {trk.get('found_by') or trk.get('source')}; now {trk.get('source')}), "
