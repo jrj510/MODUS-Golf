@@ -273,7 +273,7 @@ async function tick(){
     const tr=s.training;
     $('trainbtn').textContent='Save frame'+(tr?' ('+tr[0]+' ball / '+tr[1]+' empty)':'');
     $('camwarn').textContent=(c&&c.glare_msg)?c.glare_msg.split(':')[0]:(c&&c.state=='limit')?(c.message.split(':')[0]):
-      (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
+      (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':(s.hint||''));
     fails=0;
   }catch(e){
     // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
@@ -348,6 +348,7 @@ class Kiosk:
         self.train_request = False
         self.training = None    # (ball, empty) training examples saved
         self.focus = None       # {"value", "best", "where"} while the Camera view is open
+        self.hint_msg = ""      # a tip for the status line (outside: set the ball down again)
 
     def test_shot(self, speed=None, launch=None):
         """A pretend shot, for trying the screens without hitting a ball."""
@@ -517,6 +518,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "metrics": K.metrics, "video": K.video,
                                    "camera": getattr(K, "camera", None),
                                    "zone": bool(K.args is not None and K.args.search_area),
+                                   "hint": K.hint_msg,
                                    "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
                                    "focus": K.focus, "training": K.training,
                                    "club": K.args.club if K.args is not None else None}).encode()
@@ -923,7 +925,8 @@ def main():
     p.add_argument("--still-pixels", type=float, default=12.0)
     p.add_argument("--still-seconds", type=float, default=1.0)
     p.add_argument("--hold-seconds", type=float, default=5.0,
-                   help="how long to stay Ready when the ball is covered (club, feet, body over it)")
+                   help="Ready: if the ball isn't seen for this long (covered, moved, gone), back to "
+                        "Looking for Ball; it is then looked for where it was, and Ready again once found")
     p.add_argument("--rearm-pause", type=float, default=2.0,
                    help="after Ready is lost, stay Looking for Ball at least this long before arming again")
     p.add_argument("--recording", default="flight", choices=("flight", "full", "off"),
@@ -1224,6 +1227,7 @@ def main():
             if K.reset_track:             # the zone was drawn, or a ball tapped
                 K.reset_track = False
                 trk.update(new_track())
+                trk["last_ball"] = None        # the zone or view changed: forget where it was
                 hint, K.hint = K.hint, None
                 trk["hint"] = (hint[0], hint[1], 6) if hint else None
                 sh.armed = False
@@ -1361,8 +1365,9 @@ def main():
             now = time.monotonic()
             if zone is not None and sh.trigger_time is None and now >= view_settle_until:
                 following = trk.get("box") is not None and trk["center"] is not None
+                # (the ball being followed, or where a lost one was: never part of the empty mat)
                 zone.update(alt if alt is not None else gray, now,
-                            protect=trk["box"] if following else None,
+                            protect=trk["box"] if following else trk.get("last_ball"),
                             allow_new=ae is None or ae.state in ("ok", "limit"))
             measuring = (now < settle_until and not args.swing_test
                          and any(j.is_alive() for j in K.radar_jobs))
@@ -1385,6 +1390,11 @@ def main():
                 was = K.state
                 K.state = update_ready(sh, args, gray, ball, trk, time.monotonic())
                 ball = trk["box"] if K.state in ("BALL", "READY") else None
+                # Outside, a ball already lying in the zone when its empty picture
+                # was taken can't be told from a lens-flare ghost: say so.
+                K.hint_msg = ("Ball already in the zone? Set it down again, or tap it"
+                              if args.outdoor and K.state == "SEARCHING" and zone is not None
+                              and zone.bg is not None and not zone.trusted else "")
                 if K.state == "READY" and was != "READY":
                     b = trk["box"]
                     if zone is not None:          # set-down spots must be about this size

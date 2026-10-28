@@ -19,7 +19,8 @@ BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the g
 AZIMUTH_DEG=0      # radars point this far right of the target line (left = negative), degrees
 GATE_GPIO=20       # trigger input the TI radar listens on: GPIO20 = pin 38 (was 17 = pin 11)
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-HOLD_SECONDS=5      # ball covered (hand, club, foot) this long -> back to Looking for Ball
+HOLD_SECONDS=5      # Ready: ball not seen this long (covered, moved, gone) -> back to Looking for Ball;
+                    # it is then looked for where it was and is Ready again once found
 MOTION_THRESHOLD=12 # camera trigger: how much the ball's spot must change (0-255) when the ball leaves.
                    # Was 25; lab shots only changed it by 13-16, so half were missed
 OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera or the sound detector);

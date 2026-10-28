@@ -729,13 +729,17 @@ def _inside_area(args, box):
     """True if a box from the model could be the ball: not much taller than
     wide, at most twice as wide as tall (a ball sitting down in turf shows
     only its top, so its box comes out wide and short), not huge, and (with
-    --search-area) entirely inside the search area."""
+    --search-area) at least a third of it inside the search area. A ball set
+    down on the zone's edge counts (its box may stick out of the zone, and
+    its centre may wobble either side of the line from frame to frame); one
+    clearly outside doesn't."""
     w, h = box[2] - box[0], box[3] - box[1]
     if w <= 0 or h <= 0 or not (0.6 <= w / h <= 2.0) or max(w, h) > 120:
         return False
     x0, y0, x1, y1 = _search_area(args)
-    m = 4   # small allowance at the edges
-    return box[0] >= x0 - m and box[1] >= y0 - m and box[2] <= x1 + m and box[3] <= y1 + m
+    iw = min(box[2], x1) - max(box[0], x0)
+    ih = min(box[3], y1) - max(box[1], y0)
+    return iw > 0 and ih > 0 and iw * ih >= 0.35 * w * h
 
 
 def find_ball_spot(gray, args, near=None):
@@ -946,6 +950,11 @@ def detect_ball(model, gray, args, trk, zone=None, alt=None):
         if box is not None:
             return box
 
+    if not following and trk.get("last_ball") is not None:
+        box = _ball_at_last(model, gray, args, trk, alt, zone if in_zone else None)
+        if box is not None:
+            return box
+
     placed = zone.placed if (in_zone and not following) else []
     if model is None:
         cands = []
@@ -1088,6 +1097,37 @@ def _new_ball_evidence(gray, args, cands, placed, use_blob, fresh=None):
         if c >= alone and not any(b is u for u in used) and (fresh is None or fresh(b)):
             found.append((b, c, f"model {c:.2f}"))
     return found
+
+
+def _ball_at_last(model, gray, args, trk, alt=None, zone=None):
+    """READY was lost without a shot (the ball wasn't seen for a while): look
+    for it right where it was, every check, until it's found again, a shot is
+    taken or the zone changes. Taken when the model sees a ball of the same
+    size right there (at --keep-conf, as for the ball being followed), or the
+    small-ball finder does and the spot still differs from the empty mat.
+    This also finds a ball that was already lying there when the empty-zone
+    picture was taken (the set-down watch can't see that one)."""
+    last = trk["last_ball"]
+    ref = {"box": last}
+    if model is not None and 0 < getattr(args, "tile", 0) < WIDTH:
+        T = min(args.tile, HEIGHT)
+        ox, oy = _tile_at(_center(last), T)
+        low = min(getattr(args, "keep_conf", 0.3), args.conf)
+        near = [(b, c) for pic in ([gray] if alt is None else [gray, alt])
+                for b, c, _ in _run_model(model, pic, args, ox, oy, T, low)
+                if _matches_track(b, ref, strict=True)]
+        if near:
+            b, c = max(near, key=lambda f: f[1])
+            trk["far"] = True
+            return _seen(trk, b, conf=c, source=f"refound + model {c:.2f}", sure=True)
+    if getattr(args, "blob", False):
+        spot = find_ball_spot(alt if alt is not None else gray, args, near=_center(last))
+        if spot is not None and _matches_track(spot, ref, strict=True):
+            ch = zone.changed(spot) if zone is not None else None
+            if ch is None or ch >= getattr(args, "place_contrast", 0.2):
+                trk["far"] = True
+                return _seen(trk, spot, blob=True, source="refound + spot finder", sure=True)
+    return None
 
 
 def _ball_at_hint(model, gray, args, trk, alt=None):
@@ -1668,11 +1708,15 @@ def smooth_box(shown, box, weight=0.4):
 
 
 def update_ready(sh, args, gray, ball, trk, now):
-    """Decide SEARCHING / BALL / READY from the model's latest answer.
+    """Decide SEARCHING / BALL / READY from the latest find.
 
-    Once READY, the script stays READY even if the model loses the ball (for
-    example when the club is set down next to it), as long as the patch of
-    picture where the ball sits still looks the same.
+    While READY the ball keeps being looked for. It counts as seen when a
+    finder places it where it was AND its spot still looks like the ball did
+    when armed (a hand or club over it doesn't count, even if the model half
+    sees the ball through it). If it hasn't been seen for --hold-seconds (5 s
+    in start_kiosk.sh), it's back to Looking for Ball; where it was is
+    remembered (trk["last_ball"]) so detect_ball finds it there again, and
+    once it has sat still for --still-seconds it is READY again.
     """
     center = None
     if ball is not None:
@@ -1694,26 +1738,28 @@ def update_ready(sh, args, gray, ball, trk, now):
         diff = _ball_diff(sh, gray)
         same = center is not None and np.hypot(
             center[0] - trk["center"][0], center[1] - trk["center"][1]) <= args.still_pixels
-        if same:
+        visible = diff is None or diff <= args.motion_threshold
+        if same and visible:
             trk["confirmed_at"] = now
             trk["box"] = ball
-        visible = diff is None or diff <= args.motion_threshold
-        blind = now - (trk["confirmed_at"] or now)
-        if visible and (same or blind <= getattr(args, "blind_seconds", 30.0)):
             trk["lost_since"] = None
-            if same and diff is not None and diff <= args.motion_threshold * 0.5:
+            if diff is not None and diff <= args.motion_threshold * 0.5:
                 _set_patch(sh, gray, ball)  # follow slow lighting changes
-            return "READY"  # the ball's spot looks as it did when armed
+            return "READY"
         if trk["lost_since"] is None:
             trk["lost_since"] = now
-        if now - trk["lost_since"] < args.hold_seconds:
-            return "READY"  # briefly covered; give it a moment
-        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: the ball's spot has looked "
-              f"different (change {diff if diff is not None else -1:.1f}, limit {args.motion_threshold:.0f}) "
-              f"for {now - trk['lost_since']:.1f} s")
+        unseen = now - (trk["confirmed_at"] or now)
+        if unseen < args.hold_seconds:
+            return "READY"  # not seen just now (covered, or a missed check): give it a moment
+        why = (f"its spot looks different (change {diff:.1f}, limit {args.motion_threshold:.0f})"
+               if not visible and diff is not None else "not found where it was")
+        print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: ball not seen for "
+              f"{unseen:.1f} s ({why}); Looking for Ball")
+        last = list(trk["box"]) if trk.get("box") is not None else None
         sh.armed = False
         sh.roi = sh.roi_ref = sh.ball_ref = None
         trk.update(new_track())
+        trk["last_ball"] = last         # look for it right there first
         # Show "Looking for Ball" for a moment instead of re-arming at once on a
         # fresh picture (which looked as if it had never left Ready).
         sh.rearm_after = now + getattr(args, "rearm_pause", 2.0)
@@ -1740,6 +1786,7 @@ def update_ready(sh, args, gray, ball, trk, now):
         sh.armed = True
         trk["lost_since"] = None
         trk["confirmed_at"] = now
+        trk["last_ball"] = None
         return "READY"
     return "BALL"
 
