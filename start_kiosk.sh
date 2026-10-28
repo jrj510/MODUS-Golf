@@ -42,11 +42,13 @@ OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time 
 OUTSIDE_SENSOR=full
 OUTSIDE_FPS=60       # 144 cut out the battery pack; 60 keeps the load down
 OUTSIDE_RECORDING=off   # no shot replay or saved frames: lightest load for the battery
-#   Inside Golf: wall outlet only. Asks for 300 fps; the sensor gives its
-#   fastest (about 250). Set INSIDE_SENSOR=full to keep the zoom at 144 fps.
-INSIDE_SENSOR=binned
-INSIDE_FPS=300
-INSIDE_RECORDING=off    # no replay: 300 fps for the trigger, nothing saved
+#   Inside Golf: wall outlet only. Full sensor so it can zoom 2x on the hitting
+#   zone like Outside Golf (the ball is twice as wide, much easier to find), at
+#   the full sensor's top speed, 144 fps. INSIDE_SENSOR=binned + INSIDE_FPS=300
+#   gives about 250 fps instead, but no zoom.
+INSIDE_SENSOR=full
+INSIDE_FPS=144
+INSIDE_RECORDING=off    # no shot replay (full = slow-motion Shot Preview with Save/Delete)
 MODEL=             # ball model; empty = OpenFlight's. After retraining (camera/train_ball_model.py):
                    # MODEL=~/openflight/models/modus_ball_256.onnx
 TI_DUMPS=0         # 1 = also save the TI radar's raw captures (for debugging angles only)
