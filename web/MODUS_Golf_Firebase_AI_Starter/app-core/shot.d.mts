@@ -16,9 +16,9 @@ export interface Shot {
     ti_radar?: string; ball_speed_raw_mph?: number | null; apex_yards?: number | null};
 }
 export interface MetricSummary {n: number; mean: number | null; min: number | null; max: number | null; sample_sd: number | null}
-export interface ImportContext {deviceId: string; profileId: string; filename: string; timezone?: string | null; confirmedReal?: boolean}
+export interface ImportContext {deviceId: string; profileId: string; filename: string; timezone?: string | null; confirmedReal?: boolean; hashBytes?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>}
 export const CSV_COLUMNS: readonly string[];
-export function stableId(prefix: string, parts: string[]): Promise<string>;
+export function stableId(prefix: string, parts: string[], hashBytes?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>): Promise<string>;
 export function parseSessionCsv(text: string): Record<string, string>[];
 export function normalizeSessionCsv(text: string, context: ImportContext): Promise<Shot[]>;
 export function mergeRevision(previous: Shot | undefined | null, incoming: Shot): Shot;

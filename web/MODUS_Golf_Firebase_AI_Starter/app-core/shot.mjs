@@ -23,10 +23,10 @@ function canonical(value) {
     return '{' + Object.keys(value).sort().map(k => JSON.stringify(k)+':'+canonical(value[k])).join(',') + '}';
   return JSON.stringify(value);
 }
-export async function stableId(prefix, parts) {
-  if (!globalThis.crypto?.subtle) throw new Error('Web Crypto requires HTTPS/localhost or Node 20+');
+export async function stableId(prefix, parts, hashBytes) {
+  if (!hashBytes && !globalThis.crypto?.subtle) throw new Error('Web Crypto requires HTTPS/localhost or Node 20+');
   const bytes = new TextEncoder().encode(JSON.stringify([prefix, ...parts]));
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  const digest = hashBytes ? await hashBytes(bytes) : await globalThis.crypto.subtle.digest('SHA-256', bytes);
   return prefix + '_' + Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2,'0')).join('');
 }
 
@@ -97,10 +97,11 @@ export async function normalizeSessionCsv(text, context) {
       apex:number(row.apex_yd,'modeled apex',0,300),
       raw:number(row.ball_speed_raw_mph,'raw radar speed',0,250)};
   });
-  const sessionId=await stableId('session',[deviceId,filename]);
+  const id=(prefix,parts)=>stableId(prefix,parts,context.hashBytes);
+  const sessionId=await id('session',[deviceId,filename]);
   return Promise.all(parsed.map(async x=>({
     schema_version:1,
-    shot_id:await stableId('shot',[deviceId,filename,x.row.shot]),
+    shot_id:await id('shot',[deviceId,filename,x.row.shot]),
     session_id:sessionId,device_id:deviceId,profile_id:profileId,
     sequence_number:Number(x.row.shot),revision:1,timestamp:null,
     club:x.row.club.toLowerCase(),record_kind:confirmedReal?'real':'unknown',processing_state:'final',
@@ -112,7 +113,7 @@ export async function normalizeSessionCsv(text, context) {
     quality_flags:['legacy_csv','sensor_values_unverified','spin_assumed','flight_direction_assumed',
       'no_impact_timestamp',...(x.row.launch_measured==='no'?['launch_assumed']:[])],
     source:{kind:'legacy_csv',filename,local_log_time:x.row.time,timezone,
-      row_sha256:await stableId('row',CSV_COLUMNS.map(k=>x.row[k])),
+      row_sha256:await id('row',CSV_COLUMNS.map(k=>x.row[k])),
       ti_radar:x.row.ti_radar,ball_speed_raw_mph:x.raw,apex_yards:x.apex}
   })));
 }

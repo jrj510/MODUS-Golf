@@ -1,5 +1,23 @@
 # MODUS Golf web app
 
+## iPhone app — Mac build added 2026-11-02
+
+The installed iPhone source is in **`mobile/`**. It shares this website's components and contracts while storing local captures independently of Firebase sign-in/internet. New Pi readings use the existing local `/session.csv`; no new app is hosted on the Pi.
+
+On the MacBook with a compatible Xcode 26+ and Node 24 LTS, run from this `web/` directory:
+
+```bash
+cd mobile
+npm ci
+npm run ios:prepare
+npm run ios:open
+```
+
+Finish the two resource memberships, `-ObjC` linker setting and Apple signing in **`mobile/MAC_BUILD_CHECKLIST.md`**. Native build/install and phone tests have not been performed yet. This app's automatic local-to-cloud upload remains unfinished.
+
+Read **`MODUS_Golf_GitHub_Update_ZIP4_2026-11-02.md`** for this exact repository update and **`MODUS_Golf_Mac_Deployment_2026-11-02.md`** for the first install. These are the current mobile instructions. The older integration handoff's Pi upload worker proposal is superseded by a phone-side queue and trusted backend ingestion.
+
+
 Published at **https://modus-golf-ea469.web.app**.
 
 The app now has Practice, Sessions, My Bag and Settings screens, real Firebase accounts/profiles, automatic cloud-record subscriptions, an explicitly synthetic demo, and local Pi CSV preview. See `WEB_APP_REFINEMENT_2026-10-23.md` for the latest iPhone-focused release and `MODUS_Golf_GitHub_Integration_Handoff.md` for the full Pi/backend integration plan. The previous release notes retain earlier design-document traceability.

@@ -1,0 +1,14 @@
+{
+  "CFBundleURLTypes": [
+    {
+      "CFBundleURLSchemes": [
+        "com.googleusercontent.apps.759125763752-jleq4gprpelp2s2qs4ssabqu1l5kcc0b"
+      ]
+    }
+  ],
+  "GIDClientID": "759125763752-jleq4gprpelp2s2qs4ssabqu1l5kcc0b.apps.googleusercontent.com",
+  "NSLocalNetworkUsageDescription": "Connect to your MODUS Golf launch monitor on its local Wi-Fi to copy shot measurements. Internet access is not required.",
+  "NSAppTransportSecurity": {
+    "NSAllowsLocalNetworking": true
+  }
+}
