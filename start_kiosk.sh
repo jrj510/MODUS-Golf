@@ -14,7 +14,7 @@
 TEE_M=1.575        # antenna centre to ball centre, slant, metres (5 ft 2 in)
 NET_M=4.6          # antenna centre to the net / box, metres
 TILT_DEG=10        # antenna face leans back this far from vertical (points up), degrees
-RADAR_H=0.076      # antenna centre above the ground, metres (3 in, measured with the box tipped back 10 deg)
+RADAR_H=0.06985    # antenna centre above the ground, metres (2.75 in, measured with the box tipped back 10 deg)
 BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the ground; on a mat add its thickness)
 AZIMUTH_DEG=0      # radars point this far right of the target line (left = negative), degrees
 GATE_GPIO=20       # trigger input the TI radar listens on: GPIO20 = pin 38 (was 17 = pin 11)
