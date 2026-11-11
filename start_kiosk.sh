@@ -49,6 +49,16 @@ OUTSIDE_RECORDING=off   # no shot replay or saved frames: lightest load for the 
 INSIDE_SENSOR=full
 INSIDE_FPS=144
 INSIDE_RECORDING=off    # no shot replay (full = slow-motion Shot Preview with Save/Delete)
+# Sleep. The moon button (top right) puts the box to sleep: camera and TI
+# radar off, screen dark; tap the screen to wake (about 3-5 s, the TI radar is
+# set up again). It also sleeps by itself after this many minutes of Looking
+# for Ball with no ball, no shot and no taps on the screen; 0 = button only.
+# Never in the middle of a shot. The speed radar stays on (its mode can't be
+# switched safely at runtime).
+OUTSIDE_SLEEP_MINUTES=3   # on the course: sleeps on the walk to the ball
+INSIDE_SLEEP_MINUTES=10
+SLEEP_SCREEN=off   # off = backlight off while asleep (saves the most);
+                   # black = backlight on, screen black (only if a tap doesn't wake it with the backlight off)
 MODEL=             # ball model; empty = OpenFlight's. After retraining (camera/train_ball_model.py):
                    # MODEL=~/openflight/models/modus_ball_256.onnx
 TI_DUMPS=0         # 1 = also save the TI radar's raw captures (for debugging angles only)
@@ -81,11 +91,22 @@ reset_ops() {
     sleep 2.5        # the OPS takes about 2 s to start up again
 }
 
+# The kiosk turns the screen's backlight off while asleep. If it ever stops
+# while asleep, put the backlight back before the menu comes up.
+screen_on() {
+    [ -f /tmp/modus-backlight ] || return 0
+    while read -r path value; do
+        echo "$value" > "$path" 2>/dev/null || echo "$value" | sudo -n tee "$path" >/dev/null 2>&1
+    done < <(tac /tmp/modus-backlight)
+    rm -f /tmp/modus-backlight
+}
+
 source ~/vision-env/bin/activate
 
 OPEN="--open-browser"   # open the full-screen browser the first time only
 NOTE=""
 while true; do
+    screen_on
     CHOICE=$(python3 camera/launcher.py $OPEN --note "$NOTE" 2>>logs/launcher.log)
     if [ -z "$CHOICE" ]; then
         sleep 2
@@ -96,9 +117,11 @@ while true; do
     MODE=${CHOICE%%,*}
     CLUB=${CHOICE##*,}
     case "$MODE" in
-        inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING ;;
+        inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING
+                SLEEP_MIN=$INSIDE_SLEEP_MINUTES ;;
         *)      MODE=outside
-                CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING ;;
+                CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING
+                SLEEP_MIN=$OUTSIDE_SLEEP_MINUTES ;;
     esac
     DETECT="'--trigger','motion,sound','--blob'"
     MODELARG=""
@@ -111,8 +134,8 @@ while true; do
     fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     reset_ops
-    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min (log: $LOG)"
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"

@@ -21,6 +21,14 @@ deleted is deleted when the next shot arrives, or when the kiosk exits.
 
 Numbers that no connected sensor can measure yet are shown as "--".
 
+Sleep (the moon button, top right): the camera and the TI radar stop and the
+screen goes dark until it is tapped; waking takes a few seconds (the TI radar
+is set up again, exactly as at start-up). With --sleep-minutes the kiosk also
+goes to sleep by itself after that long Looking for Ball with no ball, no shot
+and no taps on the screen. It never sleeps in the middle of a shot. The speed
+radar stays on: switching its mode while running can break its trigger.
+Ball finding, Ready and the shot triggers are not changed by any of this.
+
 This file must sit in the same folder as shot_capture.py, which it reuses.
 
 Run from a terminal, inside vision-env:
@@ -31,6 +39,7 @@ Run from a terminal, inside vision-env:
 
 import argparse
 import collections
+import glob
 import json
 import math
 import os
@@ -76,7 +85,7 @@ PAGE = b"""<!doctype html><html><head><meta charset="utf-8">
 html,body{margin:0;height:100%;background:#0b0f14;color:#eef3f7;
   font-family:system-ui,-apple-system,sans-serif;overflow:hidden;user-select:none;-webkit-user-select:none}
 body{display:flex;flex-direction:column;padding:2vh 2.2vw;gap:1.8vh}
-#top{display:flex;align-items:center;gap:1vw;height:11vh;min-height:48px}
+#top{display:flex;align-items:center;gap:.75vw;height:11vh;min-height:48px}
 #brand{margin:0;font-size:4.4vh;font-weight:800;letter-spacing:.5px;white-space:nowrap}
 #brand span{color:#2ecc71}
 #status{display:flex;align-items:center;gap:1vw;background:#141b24;border:3px solid #141b24;
@@ -88,6 +97,9 @@ button{background:#141b24;border:3px solid #141b24;border-radius:12px;color:#eef
 button:active{border-color:#2ecc71;background:#132519}
 #pv{border-color:#2ecc71;background:#132519}
 #quit{color:#8a97a5}
+#top>button{padding:0 1.15vw}   /* a little tighter, so Sleep fits too on an 800x480 screen */
+#sleepbtn{display:flex;align-items:center}
+#sleepbtn svg{width:4.4vh;height:4.4vh;fill:#8a97a5}
 .hide{display:none!important}
 .view{flex:1;min-height:0}
 #main{display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:1fr 1fr;gap:1.5vw}
@@ -128,6 +140,8 @@ button:active{border-color:#2ecc71;background:#132519}
   <button id="clubbtn" onclick="show('clubs')">Club <b id="clubname"></b></button>
   <button id="cam" onclick="show('camera')">Camera</button>
   <button id="rng" onclick="location.href='/range'">Range</button>
+  <button id="sleepbtn" onclick="sleepUI.sleep()" title="Sleep"><svg viewBox="0 0 24 24"><path
+    d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5 8.6 8.6 0 1 0 20.5 14.6z"/></svg></button>
   <button id="quit" onclick="post('quit')">Menu</button>
 </div>
 <div id="main" class="view"></div>
@@ -153,6 +167,7 @@ button:active{border-color:#2ecc71;background:#132519}
     <span class="cmsg">Drag a box over where the ball is set down (once). Each ball put down inside it
       is found by itself.<br>Tap a ball to point it out. <span id="focus"></span> <span id="expo"></span></span></div>
 </div>
+__SLEEP__
 <script>
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
   ['smash','Smash Factor','',2],['carry','Carry','yd',0],
@@ -161,7 +176,7 @@ const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph
 const STATUS={STARTING:['Starting','#8a97a5'],SEARCHING:['Looking for Ball','#f0b429'],
   BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
   CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],MEASURING:['Measuring','#4dabf7'],
-  CHECKING:['Checking','#4dabf7'],
+  CHECKING:['Checking','#4dabf7'],SLEEPING:['Asleep','#5c6b7a'],WAKING:['Waking up','#8a97a5'],
   SWINGTEST:['Ready','#2ecc71']};
 const $=id=>document.getElementById(id);
 const main=$('main');
@@ -230,8 +245,14 @@ function show(v){
   $('live').src=(v=='camera')?'/stream.mjpg':'';
 }
 async function tick(){
+  let next=250;
   try{
     const s=await (await fetch('/state')).json();
+    sleepUI.view(s.state);
+    if(s.state=='SLEEPING'){
+      next=1000;                       // nothing changes while asleep
+      if(view!='main')show('main');    // (closes the live camera stream)
+    }
     const st=STATUS[s.state]||[s.state,'#fff'];
     $('stext').textContent=st[0];$('dot').style.background=st[1];$('status').style.borderColor=st[1];
     if(s.rev!=rev){
@@ -277,7 +298,7 @@ async function tick(){
     // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
     if(++fails>=3){waitForMenu();return;}
   }
-  setTimeout(tick,250);
+  setTimeout(tick,next);
 }
 let fails=0;
 async function waitForMenu(){
@@ -288,8 +309,162 @@ async function waitForMenu(){
 tick();
 </script></body></html>"""
 
+# Sleep screen, shared by the dashboard and the Range page: black over
+# everything while asleep, and the tap that wakes it never reaches a button
+# underneath. Any tap on the screen also puts off the automatic sleep.
+SLEEP_SNIPPET = b"""<style>
+#sleepov{position:fixed;inset:0;z-index:1000;background:#000;display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:2vh;touch-action:none;user-select:none;-webkit-user-select:none}
+#sleepov.on{display:flex}
+#sleepov b{font:800 5vh system-ui,sans-serif;color:#2a343e}
+#sleepov span{font:600 2.8vh system-ui,sans-serif;color:#1f272f}
+#sleepov.lit b{color:#eef3f7}#sleepov.lit span{color:#8a97a5}
+</style>
+<div id="sleepov"><b id="sleept">Asleep</b><span id="sleeps">Tap anywhere to wake</span></div>
+<script>
+const sleepUI=(()=>{
+  const ov=document.getElementById('sleepov');
+  let going=false,state='';
+  function say(a,b,lit){document.getElementById('sleept').textContent=a;
+    document.getElementById('sleeps').textContent=b;ov.classList.toggle('lit',!!lit);}
+  function view(st){
+    state=st;
+    if(st=='SLEEPING'){going=false;ov.classList.add('on');say('Asleep','Tap anywhere to wake');}
+    else if(st=='WAKING'){ov.classList.add('on');say('Waking up','Starting the camera and radar',true);}
+    else if(going)ov.classList.add('on');          // finishing the last shot first
+    else ov.classList.remove('on');
+  }
+  ov.addEventListener('pointerdown',e=>{
+    e.preventDefault();e.stopPropagation();
+    if(state=='WAKING')return;
+    if(going&&state!='SLEEPING'){         // changed your mind before it went to sleep
+      going=false;fetch('/wake',{method:'POST'}).catch(()=>{});
+      setTimeout(()=>view(state),400);return;
+    }
+    fetch('/wake',{method:'POST'}).catch(()=>{});
+    say('Waking up','Starting the camera and radar',true);
+  });
+  ov.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();});
+  let touched=0;
+  document.addEventListener('pointerdown',()=>{
+    const n=Date.now();
+    if(n-touched>15000){touched=n;fetch('/touch',{method:'POST'}).catch(()=>{});}
+  },true);
+  function sleep(){
+    going=true;ov.classList.add('on');say('Going to sleep','Tap to stay awake',true);
+    fetch('/sleep',{method:'POST'}).catch(()=>{});
+  }
+  async function poll(){             // pages without their own /state loop (Range)
+    let next=1000;
+    try{const s=await (await fetch('/state',{cache:'no-store'})).json();
+        view(s.state);if(s.state!='SLEEPING')next=500;}catch(e){}
+    setTimeout(poll,next);
+  }
+  return {view,sleep,poll};
+})();
+</script>"""
+
 PAGE = (PAGE.replace(b"__CLUBS__", json.dumps(CLUBS).encode())
-            .replace(b"__CLUB_LABEL__", json.dumps(CLUB_LABEL).encode()))
+            .replace(b"__CLUB_LABEL__", json.dumps(CLUB_LABEL).encode())
+            .replace(b"__SLEEP__", SLEEP_SNIPPET))
+_end = RANGE_PAGE.rfind(b"</body>")
+RANGE_PAGE_SLEEP = (RANGE_PAGE[:_end] + SLEEP_SNIPPET + b"\n<script>sleepUI.poll()</script>"
+                    + RANGE_PAGE[_end:]) if _end >= 0 else RANGE_PAGE
+
+BACKLIGHT_SAVE = "/tmp/modus-backlight"   # read back by start_kiosk.sh if the kiosk stops while asleep
+
+
+class Backlight:
+    """The touchscreen's backlight, switched off while asleep (it is most of
+    the screen's power; the touch panel keeps working, so a tap still wakes).
+    Uses /sys/class/backlight. If that is missing or can't be written, the
+    screen is only blacked out."""
+
+    def __init__(self, root="/sys/class/backlight", save_file=BACKLIGHT_SAVE):
+        self.root, self.save_file = root, save_file
+        self.lock = threading.Lock()
+        self.saved = None          # [(path, value)] to put back on waking
+        self.warned = False
+
+    @staticmethod
+    def _write(path, value):
+        try:
+            with open(path, "w") as f:
+                f.write(str(value))
+            return True
+        except PermissionError:
+            # Not writable by this user: the Pi's own user can usually sudo.
+            try:
+                return subprocess.run(["sudo", "-n", "tee", path], input=str(value).encode(),
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      timeout=3).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                return False
+        except OSError:
+            return False
+
+    def off(self):
+        """Backlight off. True if it could be switched off."""
+        with self.lock:
+            if self.saved is not None:
+                return True
+            saved = []
+            for dev in sorted(glob.glob(os.path.join(self.root, "*"))):
+                level_path = os.path.join(dev, "brightness")
+                try:
+                    with open(level_path) as f:
+                        level = int(f.read().strip())
+                    with open(os.path.join(dev, "max_brightness")) as f:
+                        top = int(f.read().strip())
+                except (OSError, ValueError):
+                    continue
+                if self._write(level_path, 0):
+                    saved.append((level_path, level if level > 0 else top))
+                power = os.path.join(dev, "bl_power")
+                if os.path.exists(power) and self._write(power, 4):   # 4 = powered down
+                    saved.append((power, 0))
+            if not saved:
+                if not self.warned:
+                    self.warned = True
+                    print("Screen backlight can't be switched off here (nothing writable in "
+                          f"{self.root}); the screen just goes black while asleep")
+                return False
+            self.saved = saved
+            try:
+                with open(self.save_file, "w") as f:
+                    f.write("".join(f"{p} {v}\n" for p, v in saved))
+            except OSError:
+                pass
+            return True
+
+    def on(self):
+        """Backlight back as it was."""
+        with self.lock:
+            if self.saved is None:
+                return
+            for path, value in reversed(self.saved):
+                self._write(path, value)
+            self.saved = None
+            try:
+                os.remove(self.save_file)
+            except OSError:
+                pass
+
+    def restore_leftover(self):
+        """A run that stopped while asleep left the backlight off: put it back."""
+        try:
+            with open(self.save_file) as f:
+                rows = [line.split() for line in f if line.strip()]
+        except OSError:
+            return
+        for row in reversed(rows):
+            if len(row) == 2:
+                self._write(row[0], row[1])
+        try:
+            os.remove(self.save_file)
+        except OSError:
+            pass
+        print("Screen backlight turned back on (left off by the last run)")
 
 
 def empty_metrics():
@@ -346,6 +521,29 @@ class Kiosk:
         self.train_request = False
         self.training = None    # (ball, empty) training examples saved
         self.focus = None       # {"value", "best", "where"} while the Camera view is open
+        self.sleep_request = False    # Sleep pressed: sleep at the next moment no shot is in hand
+        self.wake_request = False     # the dark screen was tapped
+        self.last_active = time.monotonic()   # last ball, shot or tap (for the automatic sleep)
+        self.backlight = Backlight()
+
+    def touch(self):
+        """Something happened on the screen: put off the automatic sleep."""
+        self.last_active = time.monotonic()
+
+    def ask_sleep(self):
+        """The Sleep button. The main loop sleeps once no shot is being handled."""
+        if self.state in ("SLEEPING", "WAKING"):
+            return
+        self.wake_request = False
+        self.sleep_request = True
+
+    def ask_wake(self):
+        """A tap on the dark screen (or on "Going to sleep", to stay awake)."""
+        self.sleep_request = False
+        self.touch()
+        if self.state == "SLEEPING":
+            self.wake_request = True
+            self.backlight.on()      # light up at once; the sensors take a few seconds
 
     def test_shot(self, speed=None, launch=None):
         """A pretend shot, for trying the screens without hitting a ball."""
@@ -538,7 +736,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
-                self.wfile.write(RANGE_PAGE)
+                self.wfile.write(RANGE_PAGE_SLEEP)
             elif path == "/ping":
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
@@ -597,6 +795,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         action = self.path.split("?")[0].strip("/")
+        if action == "sleep":
+            K.ask_sleep()
+        elif action == "wake":
+            K.ask_wake()
+        elif action != "quit":
+            K.touch()            # the screen is being used: not idle
         if action == "testshot":
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             K.test_shot(q.get("speed"), q.get("launch"))
@@ -1018,6 +1222,13 @@ def main():
     p.add_argument("--assume-launch", type=float, default=0.0,
                    help="launch angle in degrees to assume for the carry estimate until it is measured")
     p.add_argument("--no-browser", action="store_true", help="do not open the full-screen browser")
+    p.add_argument("--sleep-minutes", type=float, default=0.0,
+                   help="go to sleep by itself after this many minutes of Looking for Ball with no ball, "
+                        "no shot and no taps on the screen (camera and TI radar off, screen dark; tap "
+                        "to wake). 0 = only with the Sleep button")
+    p.add_argument("--sleep-screen", choices=("off", "black"), default="off",
+                   help="while asleep: off = backlight off (saves the most); black = backlight left on "
+                        "with the screen black (if the touchscreen doesn't respond with its backlight off)")
     args = p.parse_args()
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
     if args.pre is None:
@@ -1049,6 +1260,7 @@ def main():
     except (OSError, ValueError, IndexError):
         pass
     K.args = args
+    K.backlight.restore_leftover()
 
     url = f"http://localhost:{args.port}"
     server = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
@@ -1094,7 +1306,8 @@ def main():
     K.training = count_training(args.out)
 
     sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
-    threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True).start()
+    cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
+    cam_thread.start()
 
     ops = None
     if args.ops:
@@ -1116,15 +1329,29 @@ def main():
                 K.sim = SimBridge(args)
             except Exception as e:
                 print(f"Simulator not available ({type(e).__name__}: {e}); continuing without it")
-    bridge = None
-    if args.iwr:
+    def start_ti():
+        """The TI radar (launch angle), through OpenFlight. Also used on waking up."""
         try:
             from iwr_bridge import IWRBridge
             # OpenFlight's monitor owns the sound trigger pin; each sound trigger is passed on to
             # the camera so it can capture the shot too.
-            bridge = IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
+            return IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
         except Exception as e:
             print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
+            return None
+
+    def stop_ti(b):
+        """Stop the TI radar (going to sleep): unhook it from the speed radar, then
+        stop its firmware and free its port and trigger pin."""
+        if ops is not None:
+            for hooks, fn in ((getattr(ops, "listeners", None), getattr(b, "_on_ops_shot", None)),
+                              (getattr(ops, "trigger_listeners", None), getattr(b, "_software_trigger", None))):
+                if hooks is not None and fn is not None:
+                    while fn in hooks:
+                        hooks.remove(fn)
+        b.stop()
+
+    bridge = start_ti() if args.iwr else None
     K.ops, K.bridge = ops, bridge       # so the Club button can update both radars
     # Ball-speed cosine correction: on whenever the TI radar is running, as in
     # OpenFlight. The raw reading is kept in the session log.
@@ -1185,9 +1412,117 @@ def main():
     view_settle_until = 0.0     # frames from before a zoom change are still arriving
     focus_best, focus_where = None, None
 
+    # Sleep: camera and TI radar off, screen dark, until the screen is tapped.
+    # The speed radar is left running in its rolling-buffer mode (OpenFlight:
+    # changing its mode at runtime can break its trigger until it is power-cycled).
+    sleep_after = args.sleep_minutes * 60.0
+    asleep_since = 0.0
+
+    def camera_controls_now():
+        """Everything the camera was running with, to start it again with on waking."""
+        us = int(1_000_000 / fps_now)
+        c = {"FrameDurationLimits": (us, us)}
+        if ae is not None:
+            c.update(ae.controls())
+        elif args.exposure > 0:
+            c["ExposureTime"] = min(args.exposure, int(1_000_000 / args.fps) - 100)
+            if args.gain > 0:
+                c["AnalogueGain"] = args.gain
+        elif args.gain > 0:
+            c["AnalogueGain"] = args.gain
+        if getattr(args, "full_sensor", False):
+            c["ScalerCrop"] = K.view.crop()
+        return c
+
+    def fall_asleep(reason):
+        nonlocal bridge, asleep_since, ball, drawn
+        K.sleep_request = False
+        K.wake_request = False
+        K.state = "SLEEPING"
+        asleep_since = time.monotonic()
+        dark = K.backlight.off() if args.sleep_screen == "off" else False
+        with sh.lock:                             # forget the ball; nothing is armed
+            sh.armed = False
+            sh.roi = sh.roi_ref = None
+        trk.update(new_track())
+        ball, drawn = None, None
+        sh.running = False                        # the camera thread ends after this frame
+        cam_thread.join(timeout=3.0)
+        camera_off = not cam_thread.is_alive()
+        if camera_off:
+            try:
+                cam.stop()
+            except Exception as e:
+                print(f"Could not stop the camera ({type(e).__name__}: {e})")
+        ti = "off" if bridge is not None else "not running"
+        if bridge is not None:
+            try:
+                stop_ti(bridge)
+            except Exception as e:
+                print(f"TI radar stop: {type(e).__name__}: {e}")
+            bridge = K.bridge = None
+        print(f"[{time.strftime('%H:%M:%S')}] Asleep ({reason}): camera "
+              f"{'off' if camera_off else 'still running (did not stop)'}, TI radar {ti}, screen "
+              f"{'backlight off' if dark else 'black'}. Tap the screen to wake.")
+
+    def wake_up():
+        nonlocal bridge, cam_thread, zone, view_settle_until
+        K.wake_request = False
+        K.state = "WAKING"
+        K.backlight.on()
+        K.touch()
+        print(f"[{time.strftime('%H:%M:%S')}] Waking up after "
+              f"{(time.monotonic() - asleep_since) / 60:.1f} min asleep")
+        t0 = time.monotonic()
+        sh.frames.clear()
+        sh.latest = None                          # no old picture is looked at again
+        if cam_thread.is_alive():
+            sh.running = True                     # it never stopped
+        else:
+            try:
+                cam.set_controls(camera_controls_now())   # applied as it starts
+                cam.start()
+            except Exception as e:
+                print(f"Camera did not start again ({type(e).__name__}: {e})")
+            sh.running = True
+            cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
+            cam_thread.start()
+        if args.iwr and bridge is None:
+            bridge = K.bridge = start_ti()        # set up again exactly as at start-up
+        if zone is not None:
+            # As at start-up: a fresh picture of the empty zone (the box may
+            # have been carried somewhere else), taken once things are still.
+            zone = ZoneWatch(args)
+        view_settle_until = time.monotonic() + 0.5
+        K.reset_track = True
+        K.touch()
+        K.state = "SEARCHING"
+        print(f"[{time.strftime('%H:%M:%S')}] Awake in {time.monotonic() - t0:.1f} s: camera on, "
+              f"TI radar {'on' if bridge is not None else 'off'}")
+
+    if sleep_after > 0:
+        print(f"Sleep: by itself after {args.sleep_minutes:g} min with no ball, no shot and no taps "
+              f"(or with the Sleep button)")
+    K.touch()                   # the idle time counts from now, not from loading the model
     try:
         while not K.quit:
             loop_start = time.monotonic()
+            if K.state == "SLEEPING":
+                if K.wake_request:
+                    wake_up()
+                else:
+                    time.sleep(0.1)
+                continue
+            if K.state != "SEARCHING" or K.viewers > 0:
+                K.last_active = loop_start        # a ball, a shot, or the Camera view open
+            if K.sleep_request or (sleep_after > 0 and K.state == "SEARCHING"
+                                   and loop_start - K.last_active >= sleep_after):
+                # Never in the middle of a shot: wait until it is saved and measured.
+                if sh.trigger_time is None and sh.pending is None and verify is None \
+                        and not any(j.is_alive() for j in K.radar_jobs):
+                    fall_asleep("Sleep button" if K.sleep_request else
+                                f"nothing for {args.sleep_minutes:g} min")
+                    continue
             want, K.want_view = K.want_view, None
             if want is not None and want != K.view and K.can_zoom \
                     and sh.trigger_time is None and sh.pending is None:
@@ -1450,6 +1785,7 @@ def main():
         print("\nStopping.")
         K.drop_undecided()
         K.quit = True
+        K.backlight.on()
         sh.running = False
         if bridge is not None:
             bridge.stop()
