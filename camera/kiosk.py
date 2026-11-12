@@ -1179,6 +1179,11 @@ def main():
     p.add_argument("--ops-trigger-mph", type=float, default=60.0,
                    help="speed trigger: outbound speed that counts as a shot, mph (OpenFlight's default is 20)")
     p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
+    p.add_argument("--ops-pre-trigger", type=int, default=None,
+                   help="speed radar (sound trigger): how many of its 32 buffer blocks (~4.3 ms each) come "
+                        "from before the trigger. With the camera as the trigger it fires ~4 frames after "
+                        "the ball leaves, so the club coming in needs more history than OpenFlight's "
+                        "default (made for a sound trigger at impact). Empty = OpenFlight's default")
     p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
                    help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
     p.add_argument("--iwr", action="store_true",

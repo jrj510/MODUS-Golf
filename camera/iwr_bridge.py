@@ -361,8 +361,28 @@ class OPSBridge:
             if root.level > logging.INFO:
                 root.setLevel(logging.INFO)
             root.addHandler(_SpeedTriggerTap(self._on_trigger))
-        self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type=self.trigger_type,
-                                            sample_rate_ksps=args.ops_ksps)
+        # How much of the radar's 136 ms buffer (32 blocks of ~4.3 ms) comes from
+        # before the trigger. OpenFlight's default suits a sound trigger, which
+        # fires at impact. The camera triggers later (it waits 4 frames to be
+        # sure the ball has gone), so more of the buffer has to come from before
+        # the trigger, or the club coming in is already gone and there is no
+        # club speed. Set again by OpenFlight on every re-arm.
+        kw = {}
+        pre = getattr(args, "ops_pre_trigger", None)
+        if pre is not None and self.trigger_type == "sound":
+            kw["pre_trigger_segments"] = max(0, min(32, int(pre)))
+        try:
+            self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type=self.trigger_type,
+                                                sample_rate_ksps=args.ops_ksps, **kw)
+        except TypeError:
+            if not kw:
+                raise
+            print("This OpenFlight copy can't set the speed radar's pre-trigger window; "
+                  "using its default")
+            kw = {}
+            self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type=self.trigger_type,
+                                                sample_rate_ksps=args.ops_ksps)
+        segs = getattr(getattr(self.monitor, "trigger", None), "pre_trigger_segments", None)
         if not self.monitor.connect():
             raise RuntimeError(f"could not connect on {args.radar_port}")
         if self.trigger_type == "speed":
@@ -384,8 +404,10 @@ class OPSBridge:
         else:
             club_text = "club NOT set: this OpenFlight copy has no matching club setting"
         self.monitor.start(shot_callback=self._on_shot)
+        window = (f", keeps {segs} of 32 blocks ({segs * 4096 / 32 / (args.ops_ksps * 1000) * 1000:.0f} ms) "
+                  f"from before the trigger" if isinstance(segs, int) and self.trigger_type == "sound" else "")
         print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
-              f"{self.trigger_type} trigger, {club_text})")
+              f"{self.trigger_type} trigger, {club_text}{window})")
 
     def _on_trigger(self):
         for listener in list(self.trigger_listeners):

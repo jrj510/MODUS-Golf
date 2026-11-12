@@ -26,6 +26,15 @@ OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera 
                    # speed = the OPS triggers itself (picked up noise here, so not used)
 TRIGGER_OUT_GPIO=21 # camera trigger: GPIO21 (pin 40) pulses OPS J3-3 and GPIO20 (pin 38) when the
                    # camera sees the ball leave. 0 = off (only if the sound detector is wired again)
+# Speed radar history. With the camera as the trigger (TRIGGER_OUT_GPIO), the
+# pulse reaches the OPS ~4 camera frames after the ball leaves, because the
+# camera checks the ball is really gone first. That is ~90 ms after impact at
+# 60 fps, ~40 ms at 144 fps. OpenFlight's default buffer (made for a sound
+# trigger at impact) then no longer holds the club coming in: no club speed.
+# These say how many of the OPS buffer's 32 blocks (~4.3 ms each, 136 ms in all)
+# come from before the trigger. Only used with the camera trigger.
+OUTSIDE_OPS_PRE_TRIGGER=30   # 128 ms before the trigger: club + ~90 ms of ball at 60 fps
+INSIDE_OPS_PRE_TRIGGER=20    # 85 ms before + 51 ms after: club + ~90 ms of ball at 144 fps
 OPS_TRIGGER_MPH=60 # speed trigger only fires at this outbound speed or faster (OpenFlight default 20 mph);
                    # lower it for chips, raise it if things that aren't shots still start a measurement
 OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time the kiosk starts. Empty = off
@@ -118,10 +127,10 @@ while true; do
     CLUB=${CHOICE##*,}
     case "$MODE" in
         inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING
-                SLEEP_MIN=$INSIDE_SLEEP_MINUTES ;;
+                SLEEP_MIN=$INSIDE_SLEEP_MINUTES; OPS_PRE=$INSIDE_OPS_PRE_TRIGGER ;;
         *)      MODE=outside
                 CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING
-                SLEEP_MIN=$OUTSIDE_SLEEP_MINUTES ;;
+                SLEEP_MIN=$OUTSIDE_SLEEP_MINUTES; OPS_PRE=$OUTSIDE_OPS_PRE_TRIGGER ;;
     esac
     DETECT="'--trigger','motion,sound','--blob'"
     MODELARG=""
@@ -132,10 +141,14 @@ while true; do
     if [ "$TI_DUMPS" = "1" ]; then
         DUMPS="'--iwr-save-dumps',"
     fi
+    OPSPREARG=""
+    if [ "$TRIGGER_OUT_GPIO" != "0" ] && [ -n "$OPS_PRE" ]; then
+        OPSPREARG="'--ops-pre-trigger','$OPS_PRE',"
+    fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     reset_ops
     echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"
