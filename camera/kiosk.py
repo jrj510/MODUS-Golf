@@ -941,7 +941,26 @@ def save_metrics(folder, metrics, radar_log):
 
 SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
                    "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
-                   "ti_radar", "ball_speed_raw_mph", "launch_dir_deg"]
+                   "ti_radar", "ball_speed_raw_mph", "launch_dir_deg",
+                   "club_speed_hidden_mph", "spin_measured_rpm"]
+
+# The highest smash (ball speed / club speed) each kind of club can really
+# produce: a conforming driver tops out near 1.50 (the USGA's COR limit), and
+# every other club is lower. A higher ratio means the speed radar under-read
+# the club (it only sees the part of the club head's speed heading straight
+# away from it, and the head comes in on an arc), so the club speed and smash
+# are not shown. A little above the real limits, for measurement noise. Low
+# smash is kept: mishits are real.
+SMASH_MAX = {"driver": 1.52, "3w": 1.52, "5w": 1.52,
+             "hybrid": 1.50, "4i": 1.50, "5i": 1.50,
+             "6i": 1.45, "7i": 1.45, "8i": 1.45, "9i": 1.45,
+             "pw": 1.35, "gw": 1.35, "sw": 1.35, "lw": 1.35}
+SMASH_MIN = 0.8
+
+
+def smash_max(club):
+    """The highest believable smash for one of our club names ('52', '7i', ...)."""
+    return SMASH_MAX.get(club_defaults(club)[2], 1.52)
 
 
 def _session_path():
@@ -963,7 +982,8 @@ def _log_session(shot, m, f, r):
                "no" if "launch" in f.get("assumed", []) else "yes", f.get("spin"),
                f.get("carry"), f.get("apex"),
                (r or {}).get("error") or (r or {}).get("quality") or "",
-               m.get("ball_speed_raw"), m.get("launch_dir")]
+               m.get("ball_speed_raw"), m.get("launch_dir"),
+               m.get("club_speed_rejected"), m.get("spin_raw")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
@@ -988,6 +1008,8 @@ def _publish(shot, o, r, final):
                 m["club_speed"] = round(o["club_speed"], 1)
             if o["spin"] is not None:
                 m["spin"] = round(o["spin"])
+            if o.get("spin_raw") is not None:
+                m["spin_raw"] = round(o["spin_raw"])     # logged; shown only if trusted
         if r:
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:
@@ -1014,13 +1036,16 @@ def _publish(shot, o, r, final):
                 print(f"Shot {shot}: ball-speed correction failed ({type(e).__name__}: {e})")
         if m.get("ball_speed") and m.get("club_speed"):
             smash = m["ball_speed"] / m["club_speed"]
-            if 0.8 <= smash <= 1.6:
+            top = smash_max(club)
+            if SMASH_MIN <= round(smash, 2) <= top:     # judged as shown on screen
                 m["smash"] = round(smash, 2)
             else:
-                # No real strike gives this ratio: the club reading is wrong.
+                # No real strike with this club gives this ratio: the club
+                # reading is wrong (almost always under-read).
                 if final:
                     print(f"Shot {shot}: club speed {m['club_speed']} mph doesn't fit ball speed "
-                          f"{m['ball_speed']} mph (smash {smash:.2f}); not shown")
+                          f"{m['ball_speed']} mph for a {CLUB_LABEL.get(club, club)} "
+                          f"(smash {smash:.2f}, at most {top:.2f}); not shown")
                 m["club_speed_rejected"] = m.pop("club_speed")
                 m.pop("smash", None)
         if m.get("ball_speed"):
@@ -1358,14 +1383,18 @@ def main():
 
     bridge = start_ti() if args.iwr else None
     K.ops, K.bridge = ops, bridge       # so the Club button can update both radars
-    # Ball-speed cosine correction: on whenever the TI radar is running, as in
-    # OpenFlight. The raw reading is kept in the session log.
+    # Ball-speed cosine correction, as in OpenFlight: with the TI radar's
+    # launch angle, or the club's typical launch while there is none (also
+    # when the TI radar is not running at all). The raw reading is kept in
+    # the session log.
     K.correct_speed = None
-    if bridge is not None and ops is not None and not args.no_speed_correction:
+    if ops is not None and not args.no_speed_correction:
         from iwr_bridge import ops_speed_corrector
         K.correct_speed = ops_speed_corrector(args)
         if K.correct_speed is not None:
-            print("Ball speed: corrected for launch angle (raw OPS reading kept in the log)")
+            src = ("the TI radar's angle, or the club's typical launch until it arrives"
+                   if bridge is not None else "the club's typical launch (no TI radar)")
+            print(f"Ball speed: corrected for launch angle using {src}; raw OPS reading kept in the log")
     if args.trigger_out_gpio:
         # The camera replaces the sound detector: when it sees the ball leave
         # (motion trigger) it sends the same 3.3 V pulse the detector's GATE did,

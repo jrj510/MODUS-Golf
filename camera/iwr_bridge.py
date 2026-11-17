@@ -140,6 +140,37 @@ def read_measurement(m):
     return out
 
 
+def spin_trusted(shot):
+    """Whether OpenFlight trusts this shot's measured spin enough to show it.
+
+    OpenFlight reports every spin it computes, but marks how far to trust it:
+    a reading stuck at either end of its search range found nothing real, and
+    one with a confidence below SPIN_CONFIDENCE_RELIABLE (0.6) is diagnostic
+    only (OpenFlight's own carry then uses the club's typical spin instead).
+    Its "ungated multitaper" spin is always below that level. Older copies of
+    OpenFlight without these marks: only readings at the ends of the old search
+    range (about 1,500 and 11,000 rpm) are left out."""
+    spin = getattr(shot, "spin_rpm", None)
+    if spin is None:
+        return False
+    if getattr(shot, "spin_at_lower_rail", False) or getattr(shot, "spin_at_upper_rail", False):
+        return False
+    confidence = getattr(shot, "spin_confidence", None)
+    if confidence is not None:
+        try:
+            from openflight.launch_monitor import SPIN_CONFIDENCE_RELIABLE as reliable
+        except Exception:
+            reliable = 0.6
+        try:
+            return float(confidence) >= reliable
+        except (TypeError, ValueError):
+            return False
+    try:
+        return 1600.0 < float(spin) < 10900.0
+    except (TypeError, ValueError):
+        return False
+
+
 def ops_speed_corrector(args):
     """OpenFlight's ball-speed cosine correction for our geometry, or None.
 
@@ -420,7 +451,8 @@ class OPSBridge:
         print(f"[{time.strftime('%H:%M:%S')}] Speed radar shot: "
               f"ball {getattr(shot, 'ball_speed_mph', None)} mph, "
               f"club {getattr(shot, 'club_speed_mph', None)} mph, "
-              f"spin {getattr(shot, 'spin_rpm', None)} rpm")
+              f"spin {getattr(shot, 'spin_rpm', None)} rpm"
+              f"{'' if spin_trusted(shot) else ' (spin not trusted by OpenFlight: not shown)'}")
         for listener in list(self.listeners):
             try:
                 listener(shot, now)
@@ -449,7 +481,8 @@ class OPSBridge:
                 shot = min(near, key=lambda s: abs(s[0] - shot_time))[1]
                 return {"ball_speed": getattr(shot, "ball_speed_mph", None),
                         "club_speed": getattr(shot, "club_speed_mph", None),
-                        "spin": getattr(shot, "spin_rpm", None),
+                        "spin": getattr(shot, "spin_rpm", None) if spin_trusted(shot) else None,
+                        "spin_raw": getattr(shot, "spin_rpm", None),
                         "carry": getattr(shot, "estimated_carry_yards", None),
                         "shot": shot}
             if time.monotonic() > deadline:
