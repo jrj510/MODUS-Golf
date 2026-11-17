@@ -48,10 +48,20 @@ def club_defaults(club):
     return launch, spin, name if name in CLUBS else "7i"
 
 
+def rollout(landing_angle_deg):
+    """Roll after landing, in yards: OpenFlight's estimate (its ballistics
+    Trajectory.total_yards). Flatter landings roll farther: a ~20 deg driver
+    landing adds ~28 yd, a ~60 deg wedge landing ~15 yd. Flat ground and
+    average conditions; firmness, wetness and slope are ignored, so it is a
+    display estimate, not a course distance."""
+    return max(0.0, 30.0 * math.cos(math.radians(landing_angle_deg)))
+
+
 def fly(speed_mph, launch_deg, spin_rpm, direction_deg=0.0, spin_axis_deg=0.0,
         dt=0.01, points=60):
     """Simulate one shot. Returns a dict with carry, apex, side (yards), flight
-    time (s) and a path of about `points` [x, y, z] points in yards."""
+    time (s), landing angle (deg) and speed (mph), roll and total (carry + roll,
+    yards) and a path of about `points` [x, y, z] points in yards."""
     v = max(float(speed_mph), 0.1) * 0.44704
     th, ph = math.radians(launch_deg), math.radians(direction_deg)
     tilt = math.radians(spin_axis_deg)
@@ -87,12 +97,19 @@ def fly(speed_mph, launch_deg, spin_rpm, direction_deg=0.0, spin_axis_deg=0.0,
         apex = max(apex, y)
         path.append((x, y, z))
     path.append((x, 0.0, z))
+    horiz = math.hypot(vx, vz) or 1e-9
+    landing_angle = math.degrees(math.atan2(-vy, horiz))
+    landing_speed = math.sqrt(vx * vx + vy * vy + vz * vz) / 0.44704
+    carry = x / YD
+    roll = rollout(landing_angle)
     step = max(1, len(path) // points)
     pts = path[::step]
     if pts[-1] != path[-1]:
         pts.append(path[-1])
-    return {"carry": round(x / YD, 1), "apex": round(apex / YD, 1), "side": round(z / YD, 1),
-            "time": round(t, 2),
+    return {"carry": round(carry, 1), "apex": round(apex / YD, 1), "side": round(z / YD, 1),
+            "time": round(t, 2), "landing_angle": round(landing_angle, 1),
+            "landing_speed": round(landing_speed, 1), "roll": round(roll, 1),
+            "total": round(carry + roll, 1),
             "path": [[round(a / YD, 2), round(b / YD, 2), round(c / YD, 2)] for a, b, c in pts]}
 
 

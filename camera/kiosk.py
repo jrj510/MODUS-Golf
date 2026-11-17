@@ -172,7 +172,7 @@ __SLEEP__
 const TILES=[['ball_speed','Ball Speed','mph',1],['club_speed','Club Speed','mph',1],
   ['smash','Smash Factor','',2],['carry','Carry','yd',0],
   ['launch_angle','Launch Angle','deg',1],['launch_dir','Launch Direction','deg',1],
-  ['spin','Spin Rate','rpm',0],['club_path','Club Path','deg',1]];
+  ['spin','Spin Rate','rpm',0],['total','Total','yd',0]];
 const STATUS={STARTING:['Starting','#8a97a5'],SEARCHING:['Looking for Ball','#f0b429'],
   BALL:['Looking for Ball','#f0b429'],READY:['Ready','#2ecc71'],
   CAPTURING:['Recording','#c77dff'],WAIT:['Get Set','#f0b429'],MEASURING:['Measuring','#4dabf7'],
@@ -257,12 +257,12 @@ async function tick(){
     $('stext').textContent=st[0];$('dot').style.background=st[1];$('status').style.borderColor=st[1];
     if(s.rev!=rev){
       rev=s.rev;
-      const waiting=s.metrics.radar_pending?['ball_speed','launch_angle','carry','launch_dir']:[];
+      const waiting=s.metrics.radar_pending?['ball_speed','launch_angle','carry','launch_dir','total']:[];
       for(const [k,label,unit,dp] of TILES){
         const v=s.metrics[k],el=$('m_'+k),none=(v===null||v===undefined);
         el.textContent=none?(waiting.includes(k)?'...':'--'):Number(v).toFixed(dp);
         el.classList.toggle('none',none);
-        $('u_'+k).textContent=unit+((k=='carry'&&s.metrics.carry_estimated&&!none)?' est.':'');
+        $('u_'+k).textContent=unit+(((k=='carry'||k=='total')&&s.metrics.carry_estimated&&!none)?' est.':'');
         $('t_'+k).classList.add('fresh');
       }
       setTimeout(()=>{for(const [k] of TILES)$('t_'+k).classList.remove('fresh');},1500);
@@ -470,7 +470,7 @@ class Backlight:
 def empty_metrics():
     return {"ball_speed": None, "club_speed": None, "smash": None, "carry": None,
             "carry_estimated": True, "launch_angle": None, "launch_dir": None,
-            "spin": None, "club_path": None}
+            "spin": None, "total": None}
 
 
 AREA_FILE = "search_area.txt"   # where the hitting zone is remembered
@@ -556,7 +556,7 @@ class Kiosk:
         with self.lock:
             self.shot += 1
             m = empty_metrics()
-            m.update(ball_speed=round(speed, 1), carry=round(f["carry"]),
+            m.update(ball_speed=round(speed, 1), carry=round(f["carry"]), total=round(f["total"]),
                      carry_estimated=True, flight=f, test=True)
             self.metrics = m
             self.history = (self.history + [dict(f, shot=self.shot, at=time.strftime("%H:%M:%S"))])[-30:]
@@ -942,7 +942,7 @@ def save_metrics(folder, metrics, radar_log):
 SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
                    "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
                    "ti_radar", "ball_speed_raw_mph", "launch_dir_deg",
-                   "club_speed_hidden_mph", "spin_measured_rpm"]
+                   "club_speed_hidden_mph", "spin_measured_rpm", "total_yd", "landing_angle_deg"]
 
 # The highest smash (ball speed / club speed) each kind of club can really
 # produce: a conforming driver tops out near 1.50 (the USGA's COR limit), and
@@ -983,7 +983,8 @@ def _log_session(shot, m, f, r):
                f.get("carry"), f.get("apex"),
                (r or {}).get("error") or (r or {}).get("quality") or "",
                m.get("ball_speed_raw"), m.get("launch_dir"),
-               m.get("club_speed_rejected"), m.get("spin_raw")]
+               m.get("club_speed_rejected"), m.get("spin_raw"),
+               f.get("total"), f.get("landing_angle")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
@@ -1054,6 +1055,9 @@ def _publish(shot, o, r, final):
             # the club's typical value: the speed radar's spin is experimental.
             f = shot_flight(m["ball_speed"], club, launch_angle=m.get("launch_angle"))
             m["carry"] = round(f["carry"])
+            # Total: carry plus OpenFlight's roll estimate from the landing angle
+            # (flat ground, average conditions). Estimated whenever carry is.
+            m["total"] = round(f["total"])
             m["carry_estimated"] = "launch" in f["assumed"]
             m["flight"] = f
             if final and not any(h.get("shot") == shot for h in K.history):
