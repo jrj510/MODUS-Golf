@@ -163,6 +163,22 @@ EXPOSURE_STEPS = (
 DEFAULT_STEP = (500, 12.0)
 EXPOSURE_FILE = "exposure.json"   # last good setting, kept in the shots folder
 
+# Light modes. "day" is the normal ladder (it handles the sun and glare).
+# "night" (Low light, for dusk, deep shade and dark rooms) keeps the picture
+# brighter so the ball still stands out from a dark mat: it brightens sooner,
+# aims higher, skips the sun-only shortest shutters and adds longer ones for
+# real darkness (capped at the frame time: about 16.6 ms at 60 fps). It has its
+# own remembered setting, so switching to it never starts from a sunny one.
+LIGHT_MODES = {
+    "day": {"dark": 35.0, "dark_p90": 70.0, "good": (45.0, 180.0), "bright": 205.0,
+            "target": 110.0, "floor": None, "extra": (), "default": DEFAULT_STEP,
+            "file": EXPOSURE_FILE},
+    "night": {"dark": 75.0, "dark_p90": 110.0, "good": (90.0, 190.0), "bright": 215.0,
+              "target": 130.0, "floor": (350, 6.0),
+              "extra": ((9000, 12.0), (12000, 12.0), (16000, 12.0)),
+              "default": (650, 15.0), "file": "exposure_night.json"},
+}
+
 
 def _metering_area(args):
     """Where brightness is measured: the tapped search area plus a margin (the
@@ -173,9 +189,11 @@ def _metering_area(args):
     return (int(WIDTH * 0.2), int(HEIGHT * 0.45), int(WIDTH * 0.8), int(HEIGHT * 0.9))
 
 
-def measure_exposure(gray, area):
+def measure_exposure(gray, area, levels=None):
     """Rate the brightness inside area: (status, stats). Status is "good",
-    "marginal", "too_bright" or "too_dark"."""
+    "marginal", "too_bright" or "too_dark". levels: a LIGHT_MODES entry
+    (default: day)."""
+    lv = levels or LIGHT_MODES["day"]
     x0, y0, x1, y1 = area
     region = gray[y0:y1:2, x0:x1:2]
     if region.size == 0:
@@ -184,11 +202,11 @@ def measure_exposure(gray, area):
     clipped = float(np.mean(region >= 250)) * 100.0
     stats = {"median": round(median), "p10": round(p10), "p90": round(p90),
              "clipped_pct": round(clipped, 1)}
-    if clipped >= 8.0 or median >= 205.0:
+    if clipped >= 8.0 or median >= lv["bright"]:
         return "too_bright", stats
-    if median < 35.0 or p90 < 70.0:
+    if median < lv["dark"] or p90 < lv["dark_p90"]:
         return "too_dark", stats
-    if clipped <= 2.0 and 45.0 <= median <= 180.0:
+    if clipped <= 2.0 and lv["good"][0] <= median <= lv["good"][1]:
         return "good", stats
     return "marginal", stats
 
@@ -208,22 +226,55 @@ class ExposureControl:
 
     def __init__(self, camera_controls, args):
         self.args, self.cam = args, None
-        frame_us = int(1_000_000 / args.fps)
-        lo_us, hi_us = _limits(camera_controls, "ExposureTime", 1, frame_us - 100)
-        lo_g, hi_g = _limits(camera_controls, "AnalogueGain", 1.0, 16.0)
-        hi_us = min(hi_us, frame_us - 100)    # a shutter can't outlast its frame
-        steps = []
-        for us, gain in EXPOSURE_STEPS:
-            step = (int(min(max(us, lo_us), hi_us)), float(min(max(gain, lo_g), hi_g)))
-            if not steps or step[0] * step[1] > steps[-1][0] * steps[-1][1]:
-                steps.append(step)
-        self.steps = steps
-        self.index = self._nearest(self._saved() or DEFAULT_STEP)
+        self.camera_controls = camera_controls
+        mode = getattr(args, "light_mode", None) or "day"
+        self.mode = mode if mode in LIGHT_MODES else "day"
+        self.levels = LIGHT_MODES[self.mode]
+        self.steps = self._build_steps()
+        self.index = self._nearest(self._saved() or self.levels["default"])
         self.startup_left = self.STARTUP_ADJUSTMENTS
         self.bad_checks = 0
         self.next_check = 0.0
         self.state, self.message, self.stats = "starting", "Setting exposure", {}
         self._saved_index = None
+
+    def _build_steps(self):
+        """The ladder for the current light mode, limited to what the camera
+        and the frame time allow."""
+        frame_us = int(1_000_000 / self.args.fps)
+        lo_us, hi_us = _limits(self.camera_controls, "ExposureTime", 1, frame_us - 100)
+        lo_g, hi_g = _limits(self.camera_controls, "AnalogueGain", 1.0, 16.0)
+        hi_us = min(hi_us, frame_us - 100)    # a shutter can't outlast its frame
+        floor = self.levels["floor"]
+        steps = []
+        for us, gain in tuple(EXPOSURE_STEPS) + tuple(self.levels["extra"]):
+            if floor is not None and us * gain < floor[0] * floor[1]:
+                continue
+            step = (int(min(max(us, lo_us), hi_us)), float(min(max(gain, lo_g), hi_g)))
+            if not steps or step[0] * step[1] > steps[-1][0] * steps[-1][1]:
+                steps.append(step)
+        return steps
+
+    def set_mode(self, mode, now=0.0):
+        """Switch between "day" and "night" (Low light). Starts from that mode's
+        remembered setting and settles quickly, as at start-up. Returns True if
+        the camera's exposure was changed."""
+        if mode not in LIGHT_MODES or mode == self.mode:
+            return False
+        self.mode, self.levels = mode, LIGHT_MODES[mode]
+        self.steps = self._build_steps()
+        self.index = self._nearest(self._saved() or self.levels["default"])
+        self._saved_index = None
+        self.startup_left = self.STARTUP_ADJUSTMENTS
+        self.bad_checks = 0
+        self.next_check = now + self.SETTLE_S
+        self.state, self.message = "adjusting", "Adjusting exposure"
+        us, gain = self.steps[self.index]
+        print(f"Exposure: {'Low light' if mode == 'night' else 'Day'} mode, starting at {us} us x{gain:g} "
+              f"(ladder of {len(self.steps)} steps)")
+        if self.cam is not None:
+            self.cam.set_controls(self.controls())
+        return True
 
     # Settings ----------------------------------------------------------------
     def controls(self):
@@ -237,7 +288,7 @@ class ExposureControl:
                    key=lambda i: abs(np.log(self.steps[i][0] * self.steps[i][1] / signal)))
 
     def _path(self):
-        return os.path.join(getattr(self.args, "out", "shots"), EXPOSURE_FILE)
+        return os.path.join(getattr(self.args, "out", "shots"), self.levels["file"])
 
     def _saved(self):
         try:
@@ -268,7 +319,7 @@ class ExposureControl:
         exposure was just changed (frames for the next ~0.1 s are in between)."""
         if self.cam is None or gray is None or hold or now < self.next_check:
             return False
-        status, self.stats = measure_exposure(gray, _metering_area(self.args))
+        status, self.stats = measure_exposure(gray, _metering_area(self.args), self.levels)
         startup = self.startup_left > 0
         if status in ("good", "marginal"):
             self.state = "ok"
@@ -287,11 +338,16 @@ class ExposureControl:
         target = self._target(status, self.stats, big_jumps=startup)
         if target == self.index:               # already at the end of the ladder
             self.state = "limit"
-            self.message = ("Too bright for the camera even at its shortest exposure: "
-                            "shade the hitting area or fit an ND filter to the lens"
-                            if status == "too_bright" else
-                            "Too dark for the camera even at its longest exposure: "
-                            "add light on the ball")
+            if self.mode == "night":
+                self.message = ("Too bright for Low light: turn Low light off in the Camera view"
+                                if status == "too_bright" else
+                                "Too dark for the camera even in Low light: add light on the ball")
+            else:
+                self.message = ("Too bright for the camera even at its shortest exposure: "
+                                "shade the hitting area or fit an ND filter to the lens"
+                                if status == "too_bright" else
+                                "Too dark for the camera: turn on Low light in the Camera view, "
+                                "or add light on the ball")
             self.startup_left = 0
             self.next_check = now + self.CHECK_S
             print(f"Exposure: {self.message} ({self.stats})")
@@ -310,11 +366,13 @@ class ExposureControl:
         return True
 
     def _target(self, status, stats, big_jumps):
-        """The step to move to: aims the area's median at about 110. A clipped
-        picture hides how bright it really is, so it steps down hard."""
+        """The step to move to: aims the area's median at the mode's target
+        (110 by day, 130 in Low light). A clipped picture hides how bright it
+        really is, so it steps down hard."""
         us, gain = self.steps[self.index]
-        median = max(float(stats.get("median", 110)), 1.0)
-        factor = min(max(110.0 / median, 1 / 8), 8.0)
+        aim = self.levels["target"]
+        median = max(float(stats.get("median", aim)), 1.0)
+        factor = min(max(aim / median, 1 / 8), 8.0)
         if stats.get("clipped_pct", 0) > 40:
             factor = min(factor, 0.25)
             big_jumps = True
@@ -330,7 +388,7 @@ class ExposureControl:
     def summary(self, actual=(None, None)):
         """For the screen: what is set, what the sensor used, and any warning."""
         us, gain = self.steps[self.index]
-        return {"exposure_us": us, "gain": gain, "state": self.state,
+        return {"exposure_us": us, "gain": gain, "state": self.state, "mode": self.mode,
                 "message": self.message, "median": self.stats.get("median"),
                 "clipped_pct": self.stats.get("clipped_pct"),
                 "actual_us": actual[0], "actual_gain": actual[1]}

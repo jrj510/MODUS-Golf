@@ -123,6 +123,9 @@ button:active{border-color:#2ecc71;background:#132519}
 .cmsg{font-size:2.4vh;color:#8a97a5;text-align:center}
 #expo{font-size:2.2vh;color:#6f7c89}
 #camwarn{color:#f0b429;font-size:2.4vh;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#lightbtn{white-space:nowrap}
+#lightbtn.on{color:#4dabf7;border-color:#4dabf7}
+#cam .ll{display:block;color:#4dabf7;font-size:2.3vh;line-height:1.1}
 #clubbtn b{color:#2ecc71}
 #clubs{display:flex;flex-direction:column;gap:2vh}
 #clubs .grid{flex:1;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(3,1fr);gap:1.5vw}
@@ -163,6 +166,7 @@ button:active{border-color:#2ecc71;background:#132519}
   <img id="live" draggable="false"><div id="sel"></div>
   <div class="bar"><button onclick="show('main')">Back</button>
     <button id="zoombtn" class="hide" onclick="zoomToggle()">Zoom in</button>
+    <button id="lightbtn" onclick="lightToggle()">Low light: off</button>
     <button id="trainbtn" onclick="saveTraining()">Save frame</button>
     <span class="cmsg">Drag a box over where the ball is set down (once). Each ball put down inside it
       is found by itself.<br>Tap a ball to point it out. <span id="focus"></span> <span id="expo"></span></span></div>
@@ -237,6 +241,9 @@ $('live').addEventListener('pointerup',endDrag);
 $('live').addEventListener('pointercancel',()=>{drag=null;$('sel').style.display='none';});
 let zoomed=false;
 function zoomToggle(){fetch('/view?zoom='+(zoomed?0:1),{method:'POST'});}
+let lowlight=false;
+function lightToggle(){lowlight=!lowlight;$('lightbtn').textContent='Low light: '+(lowlight?'on':'off');
+  fetch('/light?mode='+(lowlight?'night':'day'),{method:'POST'});}
 function saveTraining(){fetch('/train_frame',{method:'POST'});}
 function show(v){
   view=v;
@@ -291,8 +298,12 @@ async function tick(){
     $('focus').textContent=f?('Focus '+f.value+' (best '+f.best+', '+f.where+'). '):'';
     const tr=s.training;
     $('trainbtn').textContent='Save frame'+(tr?' ('+tr[0]+' ball / '+tr[1]+' empty)':'');
+    lowlight=s.light=='night';
+    $('lightbtn').textContent='Low light: '+(lowlight?'on':'off');
+    $('lightbtn').classList.toggle('on',lowlight);
     $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):
       (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
+    $('cam').innerHTML=lowlight?'Camera<span class="ll">Low light</span>':'Camera';
     fails=0;
   }catch(e){
     // The kiosk stopped (Menu pressed): wait for the start menu, then go there.
@@ -474,6 +485,7 @@ def empty_metrics():
 
 
 AREA_FILE = "search_area.txt"   # where the hitting zone is remembered
+LIGHT_FILE = "light_mode.txt"   # the last Low light choice (day / night)
 # Size of the hitting zone made round a tapped ball, in wide-view pixels. With
 # the ball 5 ft 2 in from the camera it always sits in about the same spot, so
 # the zone is kept small (about 5 ball widths across, 4 tall): other balls on
@@ -518,6 +530,8 @@ class Kiosk:
         self.view = View()      # which part of the sensor the picture shows (wide / zoomed)
         self.can_zoom = False   # full sensor mode running: zooming is possible
         self.want_view = None   # a view change asked for, applied by the main loop
+        self.light_mode = "day"   # "day" or "night" (Low light), see shot_capture.LIGHT_MODES
+        self.want_light = None    # a light mode asked for, applied by the main loop
         self.train_request = False
         self.training = None    # (ball, empty) training examples saved
         self.focus = None       # {"value", "best", "where"} while the Camera view is open
@@ -637,6 +651,12 @@ class Kiosk:
         except OSError:
             pass
 
+    def set_light(self, mode):
+        """The Low light button (Camera view): "night" brightens the camera for
+        dusk, deep shade and dark rooms; "day" is the normal setting."""
+        if mode in ("day", "night"):
+            self.want_light = mode
+
     def set_zoom(self, on):
         """The Zoom in / Wide view button."""
         if self.args is None or not self.can_zoom:
@@ -714,6 +734,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "camera": getattr(K, "camera", None),
                                    "zone": bool(K.args is not None and K.args.search_area),
                                    "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
+                                   "light": K.want_light or K.light_mode,
                                    "focus": K.focus, "training": K.training,
                                    "club": K.args.club if K.args is not None else None}).encode()
                 self.send_response(200)
@@ -819,6 +840,9 @@ class Handler(BaseHTTPRequestHandler):
         if action == "view":
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             K.set_zoom(q.get("zoom") == "1")
+        if action == "light":
+            q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
+            K.set_light(q.get("mode", ""))
         if action == "club":
             q = dict(p.split("=", 1) for p in self.path.split("?", 1)[-1].split("&") if "=" in p)
             K.set_club(q.get("c", ""))
@@ -1187,6 +1211,10 @@ def main():
     add_blob_args(p)
     add_tracking_args(p)
     add_exposure_args(p)
+    p.add_argument("--light-mode", choices=("day", "night"), default=None,
+                   help="camera brightness: day (normal, handles sun and glare) or night (Low light: "
+                        "dusk, deep shade, dark rooms). Default: whatever was last picked with the "
+                        "Low light button in the Camera view (day the first time)")
     p.add_argument("--no-ball", action="store_true",
                    help="swing test: skip ball detection and record when a fast swing passes")
     p.add_argument("--swing-fraction", type=float, default=0.015,
@@ -1325,6 +1353,18 @@ def main():
                 view = zoom_on(saved_view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2))
         elif args.zoom == "on":
             view = zoom_on((640, 400))
+    light_file = os.path.join(args.out, LIGHT_FILE)
+    if args.light_mode is None:
+        try:
+            with open(light_file) as f:
+                args.light_mode = f.read().strip()
+        except OSError:
+            args.light_mode = "day"
+        if args.light_mode not in ("day", "night"):
+            args.light_mode = "day"
+    K.light_mode = args.light_mode
+    if K.light_mode == "night":
+        print("Camera: Low light mode (turn it off in the Camera view when it's sunny)")
     cam, ae = start_camera(args, view)
     K.camera = None
     K.can_zoom = bool(args.full_sensor)
@@ -1561,6 +1601,24 @@ def main():
                     fall_asleep("Sleep button" if K.sleep_request else
                                 f"nothing for {args.sleep_minutes:g} min")
                     continue
+            light = K.want_light
+            if light is not None and sh.trigger_time is None and sh.pending is None:
+                K.want_light = None
+                if ae is not None and ae.set_mode(light, time.monotonic()):
+                    K.light_mode = light
+                    try:
+                        with open(os.path.join(args.out, LIGHT_FILE), "w") as f:
+                            f.write(light + "\n")
+                    except OSError as e:
+                        print(f"Could not save the light mode: {e}")
+                    print(f"[{time.strftime('%H:%M:%S')}] Camera: "
+                          f"{'Low light on' if light == 'night' else 'Low light off (day)'}")
+                    # The picture's brightness jumps: look for the ball afresh
+                    # (as after a zoom change) so the jump can't count as a shot.
+                    K.reset_track = True
+                    view_settle_until = time.monotonic() + 0.4
+                elif ae is None:
+                    print("Low light needs the automatic exposure (not --exposure by hand)")
             want, K.want_view = K.want_view, None
             if want is not None and want != K.view and K.can_zoom \
                     and sh.trigger_time is None and sh.pending is None:
