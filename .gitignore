@@ -1,5 +1,6 @@
 # Virtual environment
 venv/
+configs/*.local.json
 
 # Python cache
 __pycache__/
@@ -13,3 +14,8 @@ __pycache__/
 Thumbs.db
 
 *.pt
+
+# Ball model training (copies of the training pictures and the results)
+dataset_modus/
+runs_modus/
+runs/

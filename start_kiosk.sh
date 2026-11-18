@@ -84,8 +84,9 @@ OUTSIDE_SLEEP_MINUTES=3   # on the course: sleeps on the walk to the ball
 INSIDE_SLEEP_MINUTES=10
 SLEEP_SCREEN=off   # off = backlight off while asleep (saves the most);
                    # black = backlight on, screen black (only if a tap doesn't wake it with the backlight off)
-MODEL=             # ball model; empty = OpenFlight's (until ours is trained). Ours, after
-                   # camera/train_ball_model.py:  MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
+MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
+                   # ball model: ours, retrained on our camera's pictures (camera/train_ball_model.py).
+                   # Empty, or the file not on the Pi yet = OpenFlight's model.
 BACKUP_MODEL=~/openflight/models/golf_ball_yolo11n_new_256.onnx
                    # used only once MODEL is ours: looks when ours finds nothing (at most once a
                    # second) and the log says when it found a ball ours missed. Empty = no backup.
@@ -155,8 +156,14 @@ while true; do
     esac
     DETECT="'--trigger','motion,sound','--blob'"
     MODELARG=""
-    if [ -n "$MODEL" ]; then
-        MODELARG="'--model','$MODEL',"
+    USE_MODEL=$MODEL
+    MODELNOTE=""
+    if [ -n "$USE_MODEL" ] && [ ! -f "$USE_MODEL" ]; then
+        MODELNOTE="Ball model $USE_MODEL not found on the Pi: using OpenFlight's model"
+        USE_MODEL=""
+    fi
+    if [ -n "$USE_MODEL" ]; then
+        MODELARG="'--model','$USE_MODEL',"
         if [ -n "$BACKUP_MODEL" ]; then
             MODELARG="$MODELARG'--backup-model','$BACKUP_MODEL',"
         fi
@@ -170,6 +177,7 @@ while true; do
         OPSPREARG="'--ops-pre-trigger','$OPS_PRE',"
     fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
+    [ -n "$MODELNOTE" ] && echo "$MODELNOTE" >> "$LOG"
     reset_ops
     echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off} (log: $LOG)"
     python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1

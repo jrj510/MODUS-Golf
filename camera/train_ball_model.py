@@ -35,10 +35,18 @@ log says when it found a ball ours missed.
    Add --compare golf_ball_yolo11n_new.pt to score the original model on the
    same held-back pictures, to show what the retraining gained.
    A laptop CPU takes roughly 10-30 minutes; a GPU a few minutes.
+   The copies of the pictures and the results go in a work folder next to
+   the training folder (e.g. Documents\modus_training_work, or --work): not
+   in this git folder, and not in OneDrive, which locks the folder while it
+   syncs and asks about every few hundred files deleted.
+   Already trained (say the run stopped after training)? Add
+     --trained <the best.pt it made>
+   to skip the training and just score, compare and export that model.
 5. Copy the new model to the Pi and use it:
      ssh modusgolf@modus.local mkdir -p MODUS-Golf/models
-     scp runs_modus/ball/weights/best_256.onnx modusgolf@modus.local:~/MODUS-Golf/models/modus_ball_256.onnx
-   then in start_kiosk.sh set  MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
+     scp <work folder>/runs/ball/weights/best_256.onnx modusgolf@modus.local:~/MODUS-Golf/models/modus_ball_256.onnx
+   (the script prints these with the model's real path at the end), then in
+   start_kiosk.sh set  MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
    (the original model becomes the backup automatically) and restart.
 """
 import argparse
@@ -46,6 +54,23 @@ import os
 import random
 import shutil
 import sys
+import time
+
+
+def _clear(folder):
+    """Delete the last run's copy of the pictures. A folder that OneDrive (or
+    an open Explorer window) is holding can refuse for a moment: try again."""
+    for attempt in range(5):
+        if not os.path.exists(folder):
+            return
+        try:
+            shutil.rmtree(folder)
+            return
+        except OSError as e:
+            err = e
+            time.sleep(1.0)
+    sys.exit(f"Couldn't clear {folder} ({err}). Something is holding it (OneDrive syncing, or a "
+             "window open on it): close that, or delete the folder yourself, and run again.")
 
 
 def build_dataset(srcs, dst, val_share, seed):
@@ -65,8 +90,7 @@ def build_dataset(srcs, dst, val_share, seed):
     random.Random(seed).shuffle(keys)
     n_val = max(1, int(len(keys) * val_share))
     split = {k: ("val" if i < n_val else "train") for i, k in enumerate(keys)}
-    if os.path.exists(dst):
-        shutil.rmtree(dst)
+    _clear(dst)
     counts = {"train": [0, 0], "val": [0, 0]}
     for k, files in groups.items():
         part = split[k]
@@ -100,6 +124,12 @@ def main():
                    help="refuse to train with fewer ball pictures than this (default 150, or 300 from "
                         "the generic yolo11n.pt; 0 = train anyway)")
     p.add_argument("--epochs", type=int, default=None, help="default 80 (150 from yolo11n.pt)")
+    p.add_argument("--trained", default=None,
+                   help="skip training: score, compare and export this already-trained model "
+                        "(the best.pt of an earlier run)")
+    p.add_argument("--work", default=None,
+                   help="folder for the copies of the pictures and the training results (default: "
+                        "<training folder>_work next to the first --data folder)")
     p.add_argument("--imgsz", type=int, default=256, help="must match the kiosk's --imgsz (256)")
     p.add_argument("--batch", type=int, default=16)
     p.add_argument("--device", default=None, help="e.g. cpu, 0 (first GPU), mps (Apple)")
@@ -112,38 +142,60 @@ def main():
     except ImportError:
         sys.exit("Install the training library first:  pip install ultralytics")
     generic = os.path.basename(args.base) == "yolo11n.pt"
-    if not os.path.exists(args.base) and not generic:
+    if args.trained and not os.path.exists(args.trained):
+        sys.exit(f"{args.trained} not found")
+    if not args.trained and not os.path.exists(args.base) and not generic:
         sys.exit(f"{args.base} not found. Copy it from the Pi (see the top of this file), "
                  "or use --base yolo11n.pt")
     min_balls = args.min_balls if args.min_balls is not None else (300 if generic else 150)
     epochs = args.epochs or (150 if generic else 80)
 
-    yaml, balls = build_dataset(args.data or ["training"], "dataset_modus", args.val_share, args.seed)
-    if balls < min_balls:
-        sys.exit(f"Only {balls} ball pictures; about {min_balls}+ are needed for a reliable model. "
-                 "Save more (Camera view -> Save frame), or use --min-balls 0 to train anyway.")
-    model = YOLO(args.base)
-    # The camera is black and white: no colour changes. Small shifts, scale and
-    # brightness changes stand in for other ball spots and lighting. No
-    # mosaic: it shrinks an already small ball.
-    model.train(data=yaml, epochs=epochs, imgsz=args.imgsz, batch=args.batch,
-                device=args.device, project="runs_modus", name="ball", exist_ok=True,
-                single_cls=True, patience=20 if not generic else 30, hsv_h=0.0, hsv_s=0.0, hsv_v=0.4,
-                degrees=0.0, translate=0.15, scale=0.3, fliplr=0.5, mosaic=0.0,
-                seed=args.seed, plots=True)
-    best = os.path.join("runs_modus", "ball", "weights", "best.pt")
+    # (The same --seed gives the same held-back pictures every run, so a
+    # --trained model is scored on pictures it never trained on.)
+    data = args.data or ["training"]
+    work = os.path.abspath(args.work or os.path.abspath(data[0]).rstrip("\\/") + "_work")
+    runs = os.path.join(work, "runs")
+    print(f"Work folder (picture copies and results): {work}")
+    yaml, balls = build_dataset(data, os.path.join(work, "dataset"), args.val_share, args.seed)
+    if args.trained:
+        best = args.trained
+    else:
+        if balls < min_balls:
+            sys.exit(f"Only {balls} ball pictures; about {min_balls}+ are needed for a reliable model. "
+                     "Save more (Camera view -> Save frame), or use --min-balls 0 to train anyway.")
+        model = YOLO(args.base)
+        # The camera is black and white: no colour changes. Small shifts, scale and
+        # brightness changes stand in for other ball spots and lighting. No
+        # mosaic: it shrinks an already small ball. An absolute project folder:
+        # newer Ultralytics versions put a relative one under runs/detect/.
+        model.train(data=yaml, epochs=epochs, imgsz=args.imgsz, batch=args.batch,
+                    device=args.device, project=runs, name="ball", exist_ok=True,
+                    single_cls=True, patience=20 if not generic else 30, hsv_h=0.0, hsv_s=0.0, hsv_v=0.4,
+                    degrees=0.0, translate=0.15, scale=0.3, fliplr=0.5, mosaic=0.0,
+                    seed=args.seed, plots=True)
+        # Where the training really saved it (asked from Ultralytics itself).
+        save_dir = getattr(getattr(model, "trainer", None), "save_dir", None) \
+            or os.path.join(runs, "ball")
+        best = os.path.join(str(save_dir), "weights", "best.pt")
+        if not os.path.exists(best):
+            sys.exit(f"Training finished but {best} is missing; look for best.pt under {runs} or "
+                     "runs/ and run again with --trained <that file>")
     tuned = YOLO(best)
-    metrics = tuned.val(data=yaml, imgsz=args.imgsz, device=args.device)
+    metrics = tuned.val(data=yaml, imgsz=args.imgsz, device=args.device, project=runs, name="val",
+                        exist_ok=True)
     print(f"Retrained model on the held-back pictures: precision {metrics.box.mp:.2f}, "
           f"recall {metrics.box.mr:.2f}, mAP50 {metrics.box.map50:.2f}")
     if args.compare:
         other = YOLO(args.compare, task="detect").val(data=yaml, imgsz=args.imgsz, device=args.device,
-                                                     single_cls=True)
+                                                     single_cls=True, project=runs, name="val_compare",
+                                                     exist_ok=True)
         print(f"{os.path.basename(args.compare)} on the same pictures: precision {other.box.mp:.2f}, "
               f"recall {other.box.mr:.2f}, mAP50 {other.box.map50:.2f}")
     onnx = tuned.export(format="onnx", imgsz=args.imgsz, simplify=True)
     out = os.path.join(os.path.dirname(best), f"best_{args.imgsz}.onnx")
     shutil.move(onnx, out)
+    short = os.path.relpath(out) if os.path.splitdrive(out)[0] == os.path.splitdrive(os.getcwd())[0] else out
+    out = short if not short.startswith("..") else out      # (a short path for the copy command, if any)
     print(f"\nNew model: {out}\nCopy it to the Pi:\n  ssh modusgolf@modus.local mkdir -p MODUS-Golf/models\n"
           f"  scp {out} modusgolf@modus.local:~/MODUS-Golf/models/modus_ball_256.onnx\n"
           "then set MODEL=~/MODUS-Golf/models/modus_ball_256.onnx in start_kiosk.sh")
