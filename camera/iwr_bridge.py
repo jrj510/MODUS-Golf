@@ -24,6 +24,7 @@ value biases every launch angle without raising an error.
 """
 
 import dataclasses
+import inspect
 import logging
 import math
 import os
@@ -376,7 +377,15 @@ class OPSBridge:
     the raw samples after every sound trigger, re-arms the radar, and works out
     ball speed, club speed and spin. Only real shots come out: triggers with
     nothing flying away from the radar (claps) are dropped by OpenFlight's code.
+
+    It also keeps track of the camera's trigger pulses (pulsed / outcome), so
+    the kiosk can ask, for each camera trigger, whether the radar saw a ball
+    fly away. While the radar is reading out its recording after a pulse it
+    can't record another one: outcome() says so too.
     """
+
+    BUSY_S = 10.0   # a pulse still unanswered after this long is given up on
+    NOTHING_FLEW = ("no_outbound_speed", "shot_validation_failed", "no_ball_speed")
 
     def __init__(self, args):
         _openflight_root(args)
@@ -384,6 +393,10 @@ class OPSBridge:
 
         self.lock = threading.Lock()
         self.shots = []      # (arrival time, Shot)
+        self.answers = []    # (arrival time, "ball" or "none", details): the radar's verdict on a trigger
+        self.pulses = {}     # camera trigger time -> True if the radar was free to record it
+        self.waiting = None  # time of the camera pulse the radar is still working on
+        self.reports_no_ball = False   # does this OpenFlight copy say when nothing flew away?
         self.listeners = []  # called with (shot, arrival time) for every shot
         self.trigger_listeners = []   # speed mode: called the moment the OPS triggers
         self.trigger_type = getattr(args, "ops_trigger", "sound")
@@ -434,7 +447,18 @@ class OPSBridge:
             club_text = f"club {self.club.value}"
         else:
             club_text = "club NOT set: this OpenFlight copy has no matching club setting"
-        self.monitor.start(shot_callback=self._on_shot)
+        # OpenFlight reports every trigger it has finished with (diagnostic
+        # callback), not only shots: accepted=False means nothing usable flew
+        # away. Copies without that callback only report shots.
+        try:
+            params = inspect.signature(self.monitor.start).parameters
+            self.reports_no_ball = "diagnostic_callback" in params
+        except (TypeError, ValueError):
+            self.reports_no_ball = False
+        if self.reports_no_ball:
+            self.monitor.start(shot_callback=self._on_shot, diagnostic_callback=self._on_trigger_report)
+        else:
+            self.monitor.start(shot_callback=self._on_shot)
         window = (f", keeps {segs} of 32 blocks ({segs * 4096 / 32 / (args.ops_ksps * 1000) * 1000:.0f} ms) "
                   f"from before the trigger" if isinstance(segs, int) and self.trigger_type == "sound" else "")
         print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
@@ -444,10 +468,63 @@ class OPSBridge:
         for listener in list(self.trigger_listeners):
             listener()
 
+    def _answer(self, now, kind, details):
+        """Record the radar's verdict on the trigger it was working on (lock held)."""
+        self.answers = [a for a in self.answers if now - a[0] < 120] + [(now, kind, details)]
+        self.waiting = None
+
+    def _on_trigger_report(self, report):
+        """OpenFlight's report on one trigger. accepted=False: nothing usable
+        flew away (no ball, or the recording couldn't be processed). Shots
+        arrive through _on_shot, so accepted reports are left to that."""
+        try:
+            if not isinstance(report, dict) or report.get("accepted", True):
+                return
+            details = {"reason": str(report.get("reason") or ""),
+                       "peak_mph": report.get("peak_outbound_mph")}
+            # Only these mean "looked, and nothing flew away fast enough". A
+            # recording that couldn't be read or processed says nothing either way.
+            kind = "none" if details["reason"] in self.NOTHING_FLEW else "error"
+            with self.lock:
+                self._answer(time.monotonic(), kind, details)
+        except Exception as e:
+            print(f"Speed radar trigger report error: {e}")
+
+    def pulsed(self, t):
+        """The camera has just sent its trigger pulse for its trigger at time t
+        (time.monotonic()). Called from the camera thread: quick."""
+        with self.lock:
+            free = self.waiting is None or t - self.waiting > self.BUSY_S
+            if free:
+                self.waiting = t
+            self.pulses = {k: v for k, v in self.pulses.items() if t - k < 120}
+            self.pulses[t] = free
+
+    def outcome(self, t):
+        """What the radar made of the camera trigger at time t:
+          ("ball", details)  it saw a ball fly away (a shot is on its way),
+          ("none", details)  nothing flew away (OpenFlight dropped it),
+          ("error", details) it couldn't use its recording (can't say either way),
+          ("busy", None)     it was still reading out an earlier trigger, so it
+                             couldn't record this one,
+          ("unknown", None)  no pulse was sent for this trigger,
+          None               no answer yet."""
+        with self.lock:
+            free = self.pulses.get(t)
+            if free is None:
+                return ("unknown", None)
+            if not free:
+                return ("busy", None)
+            for when, kind, details in self.answers:
+                if when >= t:
+                    return (kind, details)
+        return None
+
     def _on_shot(self, shot):
         now = time.monotonic()
         with self.lock:
             self.shots = [s for s in self.shots if now - s[0] < 120] + [(now, shot)]
+            self._answer(now, "ball", {"ball_mph": getattr(shot, "ball_speed_mph", None)})
         print(f"[{time.strftime('%H:%M:%S')}] Speed radar shot: "
               f"ball {getattr(shot, 'ball_speed_mph', None)} mph, "
               f"club {getattr(shot, 'club_speed_mph', None)} mph, "

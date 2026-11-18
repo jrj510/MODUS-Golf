@@ -1048,6 +1048,10 @@ def _spin_possible(club, rpm):
     return 0.35 * typical <= rpm <= 1.5 * typical
 
 
+def _mph_text(v):
+    return f"{v:.0f} mph" if isinstance(v, (int, float)) else "speed unknown"
+
+
 def _publish(shot, o, r, final):
     """Show the radar numbers for this shot. Returns the metrics, or None if a
     newer shot has replaced it."""
@@ -1248,6 +1252,15 @@ def main():
     p.add_argument("--verify-seconds", type=float, default=1.5,
                    help="after a camera trigger, watch the ball's spot this long: if the ball shows up "
                         "again (a club tapped down behind it) it was no shot. 0 = off")
+    p.add_argument("--radar-confirm", choices=("on", "off"), default="off",
+                   help="on: a camera trigger only counts as a shot if the speed radar saw a ball fly away "
+                        "(OpenFlight reports each trigger it drops); with nothing flying away (a shadow, "
+                        "the golfer moving) it is no shot and the ball goes back to Ready, once the radar "
+                        "is ready again. Needs --ops and the camera as the radar's trigger "
+                        "(--trigger-out-gpio). off = as before")
+    p.add_argument("--radar-confirm-wait", type=float, default=8.0,
+                   help="longest wait, after a camera trigger, for the speed radar's answer; with no "
+                        "answer by then the camera decides on its own, as before")
     p.add_argument("--settle-seconds", type=float, default=8.0,
                    help="after a shot, pause ball finding while the radars work out the numbers, "
                         "up to this long (spreads out the power draw)")
@@ -1505,6 +1518,9 @@ def main():
                     print(f"[{time.strftime('%H:%M:%S')}] Camera trigger ({source}): "
                           f"pulse on GPIO{args.trigger_out_gpio} to both radars")
                     trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
+                    if ops is not None:
+                        # So the radar's verdict can be matched to this trigger.
+                        ops.pulsed(sh.trigger_time or time.monotonic())
             sh.on_fire = fire
             print(f"Camera is the shot trigger: pulses GPIO{args.trigger_out_gpio} "
                   f"(wired to OPS J3-3 and GPIO{args.gate_gpio})")
@@ -1512,6 +1528,21 @@ def main():
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
     print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"
                               if shadow_guard_on(args) else "off"))
+    # Radar check: the speed radar has the last word on whether a camera
+    # trigger was a shot (see --radar-confirm).
+    radar_confirm = False
+    if args.radar_confirm == "on":
+        if ops is None:
+            why = "no speed radar"
+        elif not getattr(ops, "reports_no_ball", False):
+            why = "this OpenFlight copy doesn't report triggers with nothing flying away"
+        elif sh.on_fire is None:
+            why = "the camera isn't the speed radar's trigger (--trigger-out-gpio)"
+        else:
+            why, radar_confirm = None, True
+        print("Radar check: " + (f"off ({why})" if why else
+                                 "on (a camera trigger only counts as a shot if the speed radar saw a ball "
+                                 "fly away; Ready again only once the radar is ready again)"))
     if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice
@@ -1535,6 +1566,41 @@ def main():
     rates = {"SEARCHING": args.search_checks_per_second, "BALL": args.checks_per_second,
              "READY": args.ready_checks_per_second, "MEASURING": 4.0, "CHECKING": 20.0}
     verify = None               # a camera trigger being checked: is the ball really gone?
+
+    def recheck_ball():
+        """No shot after all: forget the trigger. The ball finder confirms the
+        ball where it was, and it is Ready again on a fresh picture of it (in
+        the light as it is now). Not found there: Looking for Ball as usual."""
+        with sh.lock:
+            sh.pending = None
+            sh.armed = False
+            sh.roi = sh.roi_ref = sh.ball_ref = None
+        trk["still_since"] = None
+        trk["lost_since"] = None
+        K.state = "BALL"
+
+    def radar_saw_nothing(details, v):
+        """The radar check's no: the speed radar saw nothing fly away after a
+        camera trigger, so it was no shot (a shadow, the golfer moving)."""
+        details = details or {}
+        peak, reason = details.get("peak_mph"), details.get("reason") or ""
+        fast = f"{peak:.0f} mph" if isinstance(peak, (int, float)) and peak > 0 else None
+        if reason == "shot_validation_failed":
+            what = "nothing fast enough to be a ball fly away" + (f" (fastest {fast}; a ball needs 15+)" if fast else "")
+        else:
+            what = "nothing fly away" + (f" (fastest thing moving away {fast}; a ball needs 15+)" if fast else "")
+        print(f"[{time.strftime('%H:%M:%S')}] No shot: camera trigger, but the speed radar saw {what}"
+              f" ({time.monotonic() - v['t']:.1f} s after the trigger): a shadow or someone moving. "
+              f"Back to Ready once the ball is confirmed in its spot")
+        try:
+            if sh.pending is not None and sh.ball_check is not None:
+                window = sh.pending[2]          # (pictures for tuning the shadow guard)
+                at = min(window, key=lambda f: abs(f[0] - v["t"]))[2] if window else None
+                save_check(args, "radar_no_ball", [window[0][2] if window else None, at, sh.latest],
+                           sh.ball_check.area)
+        except Exception as e:
+            print(f"Radar check: could not save the check picture ({type(e).__name__}: {e})")
+        recheck_ball()
     K.state = "SEARCHING"
     view_settle_until = 0.0     # frames from before a zoom change are still arriving
     focus_best, focus_where = None, None
@@ -1707,10 +1773,36 @@ def main():
             # --verify-seconds, it was no shot: back to Ready with nothing
             # counted. The radar numbers take longer than this to arrive anyway,
             # so a real shot loses nothing by the wait.
-            if sh.pending is not None and verify is None and args.verify_seconds > 0 \
-                    and not args.swing_test and sh.roi is not None and sh.ball_ref is not None:
-                verify = {"until": time.monotonic() + args.verify_seconds, "back": 0, "peak": 0.0}
+            # With the radar check (--radar-confirm) the speed radar has the last
+            # word: it recorded the moment of the trigger, and OpenFlight says
+            # whether anything flew away. Nothing flew away = no shot, however
+            # different the ball's spot looks (a shadow, the golfer moving).
+            # Ready comes back only once the radar has finished reading out its
+            # recording (it can't record a shot until then), so Ready always
+            # means the camera AND the radar are ready.
+            if sh.pending is not None and verify is None and not args.swing_test:
+                tt = sh.pending[0]
+                first = ops.outcome(tt) if radar_confirm else ("unknown", None)
+                by_radar = first is None or first[0] not in ("unknown", "busy")
+                by_camera = args.verify_seconds > 0 and sh.roi is not None and sh.ball_ref is not None
+                if radar_confirm and not by_radar:
+                    print(f"[{time.strftime('%H:%M:%S')}] Radar check: the speed radar "
+                          + ("was still reading out the last trigger, so it couldn't record this one"
+                             if first[0] == "busy" else "got no pulse for this trigger")
+                          + "; the camera decides on its own")
+                if by_camera or by_radar:
+                    now_v = time.monotonic()
+                    verify = {"until": now_v + (args.verify_seconds if by_camera else 0.0), "back": 0,
+                              "peak": 0.0, "t": tt, "camera": by_camera, "radar": by_radar,
+                              "radar_until": now_v + args.radar_confirm_wait, "still_there": None}
             if verify is not None:
+                now_v = time.monotonic()
+                ans = ops.outcome(verify["t"]) if verify["radar"] else None
+                if ans is not None and ans[0] == "none":
+                    radar_saw_nothing(ans[1], verify)
+                    verify = None
+                    continue
+            if verify is not None and verify["camera"] and verify["still_there"] is None:
                 latest = sh.latest
                 d = _ball_diff(sh, latest)         # against the ball as it looked when armed
                 if d is not None:
@@ -1724,6 +1816,13 @@ def main():
                     if seen[0]:
                         back, shaded = True, seen[1]
                 verify["back"] = verify["back"] + 1 if back else 0
+                if verify["back"] >= 3 and verify["radar"] and ans is None:
+                    # The camera has its answer, but the radar is still reading
+                    # out (it can't record a shot until it has): Ready after that.
+                    verify["still_there"] = (verify["peak"], d, shaded)
+                    K.state = "CHECKING"
+                    time.sleep(0.05)
+                    continue
                 if verify["back"] >= 3:               # ball seen in its spot on 3 checks in a row
                     print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
                           f"(its spot changed by up to {verify['peak']:.1f}, now {d if d is not None else -1:.1f}"
@@ -1744,7 +1843,41 @@ def main():
                     K.state = "CHECKING"
                     time.sleep(1.0 / rates["CHECKING"])
                     continue
-                verify = None                         # the ball didn't come back: a shot
+                verify["camera"] = False              # the camera's verdict: the ball didn't come back
+            if verify is not None and verify["still_there"] is not None:
+                # The camera saw the ball still there; waiting for the radar to
+                # finish so it is ready for the real shot.
+                if ans is None and now_v < verify["radar_until"]:
+                    K.state = "CHECKING"
+                    time.sleep(0.05)
+                    continue
+                peak, d, shaded = verify["still_there"]
+                radar = ("the speed radar was ready again" if ans is not None else
+                         f"no answer from the speed radar in {args.radar_confirm_wait:g} s")
+                if ans is not None and ans[0] == "ball":
+                    radar = (f"the speed radar did see something fly away "
+                             f"({_mph_text((ans[1] or {}).get('ball_mph'))}), not counted as the ball "
+                             f"never left its spot")
+                print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
+                      f"(its spot changed by up to {peak:.1f}, then {d if d is not None else -1:.1f}"
+                      + (f"; shadow guard: {describe_check(shaded)}" if shaded else "")
+                      + f"; {radar}); back to Ready once the ball is confirmed")
+                recheck_ball()
+                verify = None
+                continue
+            if verify is not None and verify["radar"]:
+                # The ball didn't come back: the speed radar decides.
+                if ans is None and now_v < verify["radar_until"]:
+                    K.state = "CHECKING"
+                    time.sleep(0.05)
+                    continue
+                if ans is None:
+                    print(f"[{time.strftime('%H:%M:%S')}] Radar check: no answer from the speed radar in "
+                          f"{args.radar_confirm_wait:g} s; the camera decides on its own: a shot")
+                elif ans[0] == "error":
+                    print(f"[{time.strftime('%H:%M:%S')}] Radar check: the speed radar couldn't use its "
+                          f"recording ({(ans[1] or {}).get('reason', '?')}); the camera decides on its own: a shot")
+            verify = None                             # the ball didn't come back: a shot
 
             # A shot was captured: save it, work out the numbers, and carry on.
             if sh.pending is not None:
