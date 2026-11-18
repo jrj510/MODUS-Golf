@@ -110,6 +110,7 @@ class Shared:
                                   # picture: also re-taken when a club settles beside the ball)
         self.ball_ref = None      # the patch as the BALL looked when armed (never re-taken onto
                                   # a club or hand): used to tell "covered" from "still there"
+        self.ball_check = None    # BallCheck for the armed ball: "still there?" whatever the light
         self.trigger_time = None  # when a trigger fired
         self.trigger_source = None
         self.pending = None       # frames handed over for saving
@@ -570,6 +571,43 @@ def sharpness(gray, box):
     return round(1000.0 * float(lap.std()) / max(float(patch.mean()), 10.0), 1)
 
 
+class BallModels:
+    """Our ball model first, a second model (OpenFlight's) as the backup.
+
+    Used wherever a single model is (it has the same predict()). When ours
+    finds nothing in a picture, the backup looks at it too, at most once every
+    `every` seconds so looking for a ball doesn't cost twice the processor;
+    whatever it finds is used like our model's finds. Each time the backup
+    finds a ball ours missed it is counted and noted in the log (at most every
+    30 s), which shows where our model needs more training pictures."""
+
+    def __init__(self, primary, backup, every=1.0, backup_name="backup model"):
+        self.primary, self.backup, self.every = primary, backup, every
+        self.backup_name = backup_name
+        self.last_backup = -1e9
+        self.rescues, self.looks, self.last_note = 0, 0, -1e9
+
+    def predict(self, img, **kw):
+        r = self.primary.predict(img, **kw)
+        if len(r[0].boxes) or self.backup is None:
+            return r
+        now = time.monotonic()
+        if now - self.last_backup < self.every:
+            return r
+        self.last_backup = now
+        self.looks += 1
+        rb = self.backup.predict(img, **kw)
+        if len(rb[0].boxes):
+            self.rescues += 1
+            if now - self.last_note >= 30.0:
+                self.last_note = now
+                print(f"[{time.strftime('%H:%M:%S')}] Ball model: the {self.backup_name} found a ball ours "
+                      f"missed ({self.rescues} times so far, in {self.looks} backup looks); more "
+                      f"training pictures like this one would help ours")
+            return rb
+        return r
+
+
 TRAINING_DIR = "training"   # inside the shots folder: images/, labels/, review/
 
 
@@ -681,6 +719,166 @@ def _set_patch(sh, gray, ball):
         sh.roi_ref = gray[y0:y1, x0:x1].copy()
         sh.ball_ref = sh.roi_ref.copy()
         sh.roi = (x0, y0, x1, y1)
+        old = sh.ball_check
+        if old is None or max(abs(a - int(b)) for a, b in zip(old.box, ball)) > 1:
+            sh.ball_check = BallCheck(ball, gray.shape)   # (only rebuilt when the box moves)
+
+
+class BallCheck:
+    """Is the ball still lying in its spot, whatever the light is doing?
+
+    The motion trigger and the "still there?" checks compare the ball's spot
+    with an earlier picture of it, so a shadow falling on the ball (the
+    golfer's, late in the day) looks just like the ball leaving. This asks a
+    different question: is there still a ball-sized circle, where the ball
+    was and about its size, that is brighter just inside than just outside
+    all the way round, with its middle brighter than nearly all of the turf
+    round it? A white ball is brighter than the turf next to it in sun and in
+    shade alike, and brightness is compared as a ratio, so a shadow over both
+    hardly changes the answer. Once the ball has gone the spot is turf (or a
+    tee, a divot, a shadow's edge), which fails it.
+
+    Tested on rendered range scenes (low sun, the ball's own long shadow, the
+    golfer's shadow arriving, leaving or half over the ball, clouds, tees,
+    divots, alignment sticks, club heads; linear and tone-curved pictures):
+    none of ~8,000 empty spots passed. A ball fully in the golfer's shadow
+    passed ~90% of the time, one half in shadow ~60%; when it doesn't pass,
+    things go on exactly as without the guard.
+    """
+    SECTORS = 24
+    OFFSETS = (-0.45, -0.3, -0.15, 0.0, 0.15, 0.3, 0.45)   # where its centre may be, x the box radius
+    RADII = (0.7, 0.85, 1.0, 1.15, 1.3, 1.45, 1.6)          # how big it may be, x the box radius
+    INNER = (0.55, 0.7, 0.85)       # "just inside", x the circle's radius (averaged)
+    OUTER = (1.15, 1.3, 1.45)       # "just outside"
+    STEP = 0.2          # inside brighter than outside by at least this (log; about 22%) ...
+    STEP_TEXTURE = 1.75  # ... and by this many times the turf's own ups and downs round it
+    STEP_MAX = 0.5       # (rough turf), up to this
+    SHARE = 0.6         # ... in at least this share of the directions round it
+    QUARTER = 0.33      # ... and in at least a third of each quarter (so not just one side)
+    DISC = 0.7          # this share of its middle brighter than 3/4 of the ring round it
+    SHARE_AGAIN, DISC_AGAIN = 0.55, 0.65   # the looser check one frame later (see look)
+    MIN_RADIUS = 5.0    # a smaller ball has too few pixels to tell: no answer
+
+    def __init__(self, box, shape):
+        self.box = [int(v) for v in box]
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        r0 = ((box[2] - box[0]) + (box[3] - box[1])) / 4.0
+        m = int(np.ceil(r0 * (max(self.RADII) * max(self.OUTER) + max(map(abs, self.OFFSETS))))) + 3
+        x0, y0, x1, y1 = int(cx) - m, int(cy) - m, int(cx) + m + 1, int(cy) + m + 1
+        self.area = (x0, y0, x1, y1)
+        self.ok = r0 >= self.MIN_RADIUS and x0 >= 0 and y0 >= 0 and x1 <= shape[1] and y1 <= shape[0]
+        if not self.ok:
+            return
+        w, h = x1 - x0, y1 - y0
+        o = np.array(self.OFFSETS) * r0
+        self.cx = (cx - x0 + o[:, None] + 0 * o[None, :]).ravel()     # the centres tried
+        self.cy = (cy - y0 + 0 * o[:, None] + o[None, :]).ravel()
+        self.r = np.array(self.RADII) * r0                            # the sizes tried
+        a = np.linspace(0, 2 * np.pi, self.SECTORS, endpoint=False)
+
+        def where(fracs):   # pixel index of every sample: (size, centre, direction, step)
+            rr = self.r[:, None, None, None] * np.array(fracs)[None, None, None, :]
+            xs = self.cx[None, :, None, None] + rr * np.cos(a)[None, None, :, None]
+            ys = self.cy[None, :, None, None] + rr * np.sin(a)[None, None, :, None]
+            xs = np.clip(np.rint(xs), 0, w - 1).astype(np.int32)
+            ys = np.clip(np.rint(ys), 0, h - 1).astype(np.int32)
+            return ys * w + xs
+
+        self.inside, self.outside = where(self.INNER), where(self.OUTER)
+        self.quarter = (np.arange(self.SECTORS) * 4) // self.SECTORS
+        self.yy, self.xx = np.mgrid[0:h, 0:w]
+        rho = np.hypot(self.xx - (cx - x0), self.yy - (cy - y0))
+        self.turf = (rho >= 1.7 * r0) & (rho <= 2.6 * r0)    # turf round the ball, for its texture
+        self.blur = 3 if r0 < 8 else 5
+
+    def look(self, gray, again=False):
+        """(present, details): present is True/False, or None when this ball
+        can't be checked (too small, or too near the edge of the picture).
+        again=True: the ball passed a frame ago, so only check it is still
+        broadly there (a ball that has just been hit leaves bare turf, which
+        fails this easily); this lets a shadow edge that is still moving
+        across it through."""
+        if not self.ok or gray is None:
+            return None, {}
+        x0, y0, x1, y1 = self.area
+        crop = gray[y0:y1, x0:x1].astype(np.float32)
+        lum = np.log(cv2.GaussianBlur(crop, (self.blur, self.blur), 0) + 8.0)
+        flat = lum.ravel()
+        diff = flat[self.inside].mean(axis=3) - flat[self.outside].mean(axis=3)
+        # How much brighter counts: more on rough or noisy turf, so its own
+        # texture can't add up to a ball. (A ratio of the turf's spread, so it
+        # works the same whatever tone curve the camera applies.)
+        turf = lum[self.turf]
+        spread = 1.4826 * float(np.median(np.abs(turf - np.median(turf))))
+        step = min(max(self.STEP, self.STEP_TEXTURE * spread), self.STEP_MAX)
+        hit = diff >= step
+        share = hit.mean(axis=2)
+        side = np.min([hit[:, :, self.quarter == i].mean(axis=2) for i in range(4)], axis=0)
+        i, j = np.unravel_index(np.argmax(share + 0.25 * side), share.shape)
+        bx, by, r = self.cx[j], self.cy[j], self.r[i]
+        rho = np.hypot(self.xx - bx, self.yy - by)
+        disc, ring = lum[rho <= 0.8 * r], lum[(rho >= 1.2 * r) & (rho <= 1.8 * r)]
+        mid = float((disc > np.percentile(ring, 75)).mean()) if disc.size and ring.size else 0.0
+        s, q = float(share[i, j]), float(side[i, j])
+        if again:
+            present = s >= self.SHARE_AGAIN and mid >= self.DISC_AGAIN
+        else:
+            present = s >= self.SHARE and q >= self.QUARTER and mid >= self.DISC
+        return present, {"edge": s, "sides": q, "middle": mid, "step": round(step, 2),
+                         "circle": (round(bx + x0, 1), round(by + y0, 1), round(float(r), 1))}
+
+
+def shadow_guard_on(args):
+    return getattr(args, "shadow_guard", "off") == "on"
+
+
+def ball_still_there(sh, gray, again=False):
+    """BallCheck on the ball being watched: (present, details); present is
+    None when there is nothing to check."""
+    bc = sh.ball_check
+    if bc is None or sh.roi is None or gray is None:
+        return None, {}
+    try:
+        return bc.look(gray, again)
+    except Exception as e:          # never let the check stop the camera: old behaviour instead
+        print(f"Shadow guard: ball check failed ({type(e).__name__}: {e}); not used this time")
+        return None, {}
+
+
+def describe_check(info):
+    """The ball check's numbers, for the log."""
+    if not info:
+        return "ball check not possible here"
+    return (f"ball edge in {info['edge']:.0%} of directions, weakest side {info['sides']:.0%}, "
+            f"middle brighter than the turf round it: {info['middle']:.0%}")
+
+
+def save_check(args, kind, frames, area):
+    """Small pictures of the ball's spot around a shadow-guard decision, for
+    tuning: <out>/shadow_checks/<time>_<kind>.png (before | decided on | now).
+    Written by a background thread; the newest 40 of each kind are kept."""
+    out = getattr(args, "out", None)
+    if not out or area is None:
+        return
+    x0, y0, x1, y1 = area
+    crops = [f[y0:y1, x0:x1].copy() for f in frames if f is not None]
+
+    def write():
+        try:
+            folder = os.path.join(out, "shadow_checks")
+            os.makedirs(folder, exist_ok=True)
+            strip = np.hstack(crops)
+            if strip.shape[0] < 120:
+                strip = cv2.resize(strip, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+            name = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}_{kind}.png"
+            cv2.imwrite(os.path.join(folder, name), strip)
+            old = sorted(f for f in os.listdir(folder) if f.endswith(f"_{kind}.png"))
+            for f in old[:-40]:
+                os.remove(os.path.join(folder, f))
+        except Exception as e:
+            print(f"Shadow guard: could not save the check picture ({e})")
+    if crops:
+        threading.Thread(target=write, daemon=True).start()
 
 
 def add_blob_args(p):
@@ -712,6 +910,11 @@ def add_tracking_args(p):
     p.add_argument("--assist-conf", type=float, default=0.15,
                    help="lowest model confidence that still backs up a ball seen being set down "
                         "(or one that was tapped)")
+    p.add_argument("--shadow-guard", choices=("on", "off"), default="on",
+                   help="on = before a sudden change at the ball's spot counts as a shot (and the "
+                        "radars are pulsed), check the ball isn't simply still there under a shadow "
+                        "or a change of light; the same check keeps READY while a shadow sits on "
+                        "the ball, and stops a shadow being counted as a shot (see BallCheck)")
 
 
 def _search_area(args):
@@ -1271,6 +1474,7 @@ class ZoneWatch:
         self.leftover = None      # box of a ball still lying where it was after a "shot"
         self.busy_since = None
         self.noise = None         # picture noise, in the same relative units
+        self.why_not = None       # for the log: why nothing was taken as set down (see _spots)
 
     @property
     def active(self):
@@ -1327,6 +1531,9 @@ class ZoneWatch:
 
         diff = rel - self.bg
         busy = float(np.mean(np.abs(diff) > thr))
+        self.why_not = (f"{busy:.0%} of the zone looks different from when it was empty "
+                        f"({float(np.mean(diff < -thr)):.0%} darker): taken as someone in it"
+                        if busy > self.BUSY else None)
         if protect is not None:
             self.leftover = None              # a ball is being followed again
         if busy <= self.BUSY:
@@ -1411,6 +1618,11 @@ class ZoneWatch:
             ring = int(changed[ry0:ry1, rx0:rx1].sum()) - int(changed[y:y + h, x:x + w].sum())
             ring_px = (rx1 - rx0) * (ry1 - ry0) - w * h
             if ring > 0.06 * ring_px:
+                dark = diff[ry0:ry1, rx0:rx1] < -thr
+                dark = int(dark.sum()) - int((diff[y:y + h, x:x + w] < -thr).sum())
+                self.why_not = (f"a ball-like spot at x{self.area[0] + x + w // 2} y{self.area[1] + y + h // 2} "
+                                f"was not taken: {ring / ring_px:.0%} of the turf round it changed too "
+                                f"({dark / ring_px:.0%} darker, e.g. its own shadow)")
                 continue
             strength = float(diff[y:y + h, x:x + w][mask[y:y + h, x:x + w] > 0].mean())
             side = max(w, h)
@@ -1462,19 +1674,31 @@ def update_ready(sh, args, gray, ball, trk, now):
             trk["confirmed_at"] = now
             trk["box"] = ball
         visible = diff is None or diff <= args.motion_threshold
+        seen = (None, {})
+        if not visible and shadow_guard_on(args):
+            # Looks different: a hand or club over it, or just a shadow on it?
+            seen = ball_still_there(sh, gray)
+            if seen[0]:
+                visible = True
+                if now - trk.get("shade_note", -1e9) >= 10.0:
+                    trk["shade_note"] = now
+                    print(f"[{time.strftime('%H:%M:%S')}] Shadow guard: the ball's spot looks different "
+                          f"(change {diff:.1f}) but the ball is still there ({describe_check(seen[1])}); "
+                          f"staying Ready")
         blind = now - (trk["confirmed_at"] or now)
         if visible and (same or blind <= getattr(args, "blind_seconds", 30.0)):
             trk["lost_since"] = None
             if same and diff is not None and diff <= args.motion_threshold * 0.5:
                 _set_patch(sh, gray, ball)  # follow slow lighting changes
-            return "READY"  # the ball's spot looks as it did when armed
+            return "READY"  # the ball's spot looks as it did when armed (or the ball is still in it)
         if trk["lost_since"] is None:
             trk["lost_since"] = now
         if now - trk["lost_since"] < args.hold_seconds:
             return "READY"  # briefly covered; give it a moment
         print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: the ball's spot has looked "
               f"different (change {diff if diff is not None else -1:.1f}, limit {args.motion_threshold:.0f}) "
-              f"for {now - trk['lost_since']:.1f} s")
+              f"for {now - trk['lost_since']:.1f} s"
+              + (f"; shadow guard: {describe_check(seen[1])}" if shadow_guard_on(args) else ""))
         sh.armed = False
         sh.roi = sh.roi_ref = sh.ball_ref = None
         trk.update(new_track())
@@ -1533,6 +1757,16 @@ class PatchWatch:
         self.steady_since = None
         self.last_note = -1e9
 
+    def prime(self):
+        """After the reference picture was just re-taken: count the patch as
+        having been still, so a shot right away is caught as quickly as usual."""
+        self.hist.extend([0.0] * 7)
+
+    @property
+    def since_jump(self):
+        """Frames since a jump started a check (0-3), or None."""
+        return None if self.cand is None else self.n - self.cand[0]
+
     def step(self, diff, now, thr):
         h = self.hist
         h.append(diff)
@@ -1583,6 +1817,9 @@ def camera_thread(cam, sh, args):
     count, t0 = 0, time.monotonic()
     prev_small = None
     watch = PatchWatch()
+    guard = shadow_guard_on(args)   # the shadow guard (see BallCheck)
+    looked = None                   # (ball check, frame) one frame before a trigger is decided
+    vetoes, last_veto_note = 0, -1e9
     while sh.running:
         req = cam.capture_request()
         try:
@@ -1603,9 +1840,54 @@ def camera_thread(cam, sh, args):
                 watch.reset()
             else:
                 verdict = watch.step(diff, now, args.motion_threshold)
+                if guard and watch.since_jump == 0:
+                    looked = None                     # a new jump: nothing looked at yet
+                elif guard and watch.since_jump == 3:
+                    # The frame before the trigger is decided: look for the
+                    # ball now, so a real shot isn't held up by it next frame.
+                    looked = (ball_still_there(sh, img), img)
+                note = None
+                if verdict == "trigger" and guard:
+                    before = looked[0] if looked is not None else (None, {})
+                    # Still there a frame ago? Then make sure it still is now
+                    # (it may have just been hit).
+                    seen = ball_still_there(sh, img, again=True) if before[0] else before
+                    roi = sh.roi
+                    if seen[0] and roi is not None:
+                        # A shadow or the light: no trigger, no radar pulse.
+                        watch.reset()
+                        x0, y0, x1, y1 = roi
+                        sh.roi_ref = img[y0:y1, x0:x1].copy()   # this light is the new normal
+                        watch.prime()
+                        vetoes += 1
+                        if now - last_veto_note >= 2.0:
+                            print(f"[{time.strftime('%H:%M:%S')}] Shadow guard: the ball's spot changed "
+                                  f"(by {diff:.1f}) but the ball is still there ({describe_check(seen[1])})"
+                                  f": a shadow or the light, not a shot; no radar pulse"
+                                  + (f" ({vetoes} times since the last note)" if vetoes > 1 else ""))
+                            last_veto_note, vetoes = now, 0
+                        frames = list(sh.frames)
+                        save_check(args, "light_not_shot",
+                                   [frames[-7][2] if len(frames) >= 7 else None, looked[1], img],
+                                   sh.ball_check.area if sh.ball_check is not None else None)
+                        verdict, looked = None, None
+                    elif before[0] is None:
+                        note = "no ball check possible here (ball too small or at the picture's edge)"
+                    elif before[0]:
+                        note = f"ball still there a frame ago, gone now ({describe_check(seen[1])})"
+                    else:
+                        note = f"ball not in its spot ({describe_check(seen[1])})"
                 if verdict == "trigger":
                     watch.reset()
                     sh.trigger("motion")
+                    if note is not None:              # (after the pulse: costs the radars nothing)
+                        print(f"[{time.strftime('%H:%M:%S')}] Shadow guard: {note}: shot")
+                        frames = list(sh.frames)
+                        save_check(args, "shot",
+                                   [frames[-7][2] if len(frames) >= 7 else None,
+                                    looked[1] if looked is not None else None, img],
+                                   sh.ball_check.area if sh.ball_check is not None else None)
+                    looked = None
                 elif verdict == "reref" and sh.roi is not None:
                     # Something (usually the club) has settled beside the ball.
                     x0, y0, x1, y1 = sh.roi

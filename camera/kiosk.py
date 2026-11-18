@@ -58,14 +58,15 @@ import numpy as np
 from picamera2 import Picamera2
 from ultralytics import YOLO
 
-from ballflight import club_defaults, shot_flight
+from ballflight import club_defaults, estimate_spin, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, ZoneWatch, add_blob_args,
+from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, BallModels, Shared, View, ZoneWatch, add_blob_args,
                           convert_area, count_training, fits_zoomed, save_training_frame, set_view,
                           sharpness, zoom_on,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
-                          smooth_box, start_camera, update_ready, _ball_diff)
+                          smooth_box, start_camera, update_ready, _ball_diff,
+                          ball_still_there, describe_check, save_check, shadow_guard_on)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 # Clubs for the Club button (same list and names as the start menu, launcher.py).
@@ -269,7 +270,7 @@ async function tick(){
         const v=s.metrics[k],el=$('m_'+k),none=(v===null||v===undefined);
         el.textContent=none?(waiting.includes(k)?'...':'--'):Number(v).toFixed(dp);
         el.classList.toggle('none',none);
-        $('u_'+k).textContent=unit+(((k=='carry'||k=='total')&&s.metrics.carry_estimated&&!none)?' est.':'');
+        $('u_'+k).textContent=unit+(((s.metrics.estimated||[]).includes(k)&&!none)?' est.':'');
         $('t_'+k).classList.add('fresh');
       }
       setTimeout(()=>{for(const [k] of TILES)$('t_'+k).classList.remove('fresh');},1500);
@@ -480,7 +481,7 @@ class Backlight:
 
 def empty_metrics():
     return {"ball_speed": None, "club_speed": None, "smash": None, "carry": None,
-            "carry_estimated": True, "launch_angle": None, "launch_dir": None,
+            "estimated": ["carry", "total"], "launch_angle": None, "launch_dir": None,
             "spin": None, "total": None}
 
 
@@ -571,7 +572,7 @@ class Kiosk:
             self.shot += 1
             m = empty_metrics()
             m.update(ball_speed=round(speed, 1), carry=round(f["carry"]), total=round(f["total"]),
-                     carry_estimated=True, flight=f, test=True)
+                     estimated=["carry", "total"], flight=f, test=True)
             self.metrics = m
             self.history = (self.history + [dict(f, shot=self.shot, at=time.strftime("%H:%M:%S"))])[-30:]
             self.rev += 1
@@ -966,7 +967,8 @@ def save_metrics(folder, metrics, radar_log):
 SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
                    "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
                    "ti_radar", "ball_speed_raw_mph", "launch_dir_deg",
-                   "club_speed_hidden_mph", "spin_measured_rpm", "total_yd", "landing_angle_deg"]
+                   "club_speed_hidden_mph", "spin_measured_rpm", "total_yd", "landing_angle_deg",
+                   "spin_source", "spin_model_rpm", "contact", "smash_efficiency", "roll_yd"]
 
 # The highest smash (ball speed / club speed) each kind of club can really
 # produce: a conforming driver tops out near 1.50 (the USGA's COR limit), and
@@ -1008,13 +1010,42 @@ def _log_session(shot, m, f, r):
                (r or {}).get("error") or (r or {}).get("quality") or "",
                m.get("ball_speed_raw"), m.get("launch_dir"),
                m.get("club_speed_rejected"), m.get("spin_raw"),
-               f.get("total"), f.get("landing_angle")]
+               f.get("total"), f.get("landing_angle"),
+               m.get("spin_source"), m.get("spin_model"), m.get("contact"), m.get("contact_eff"),
+               f.get("roll")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
             out.write(",".join("" if v is None else str(v) for v in row) + "\n")
     except OSError as e:
         print(f"Could not write the session log: {e}")
+
+
+# Tour-average ball speed per club (TrackMan 2024), to spot a shot far off a
+# full swing with that club (topped, half swing), where the spin estimate's
+# assumptions (a full swing's spin loft) don't hold.
+TOUR_BALL_MPH = {"driver": 171, "3w": 162, "5w": 156, "hybrid": 149, "4i": 140, "5i": 135,
+                 "6i": 130, "7i": 123, "8i": 118, "9i": 112}
+
+
+def _spin_model_doubt(club, m, est, launch):
+    """Why our spin estimate may be off for this shot, or None."""
+    name = club_defaults(club)[2]
+    if est.get("contact") == "poor":
+        return f"poor contact: smash {m.get('smash')} for a {CLUB_LABEL.get(club, club)}"
+    tour = TOUR_BALL_MPH.get(name)
+    if tour and m.get("ball_speed") and m["ball_speed"] < 0.4 * tour:
+        return f"ball speed {m['ball_speed']} mph is far below a full swing with this club"
+    if launch is not None and abs(launch - club_defaults(name)[0]) > 10:
+        return f"launch {launch} deg is far from this club's usual {club_defaults(name)[0]}"
+    return None
+
+
+def _spin_possible(club, rpm):
+    """Whether a club can produce this spin at all (a broad band round its
+    typical value), so a stray radar reading isn't used as the backup."""
+    typical = club_defaults(club)[1]
+    return 0.35 * typical <= rpm <= 1.5 * typical
 
 
 def _publish(shot, o, r, final):
@@ -1031,10 +1062,8 @@ def _publish(shot, o, r, final):
                 m["ball_speed"] = round(o["ball_speed"], 1)
             if o["club_speed"] is not None:
                 m["club_speed"] = round(o["club_speed"], 1)
-            if o["spin"] is not None:
-                m["spin"] = round(o["spin"])
             if o.get("spin_raw") is not None:
-                m["spin_raw"] = round(o["spin_raw"])     # logged; shown only if trusted
+                m["spin_raw"] = round(o["spin_raw"])     # OpenFlight's radar spin: logged, used as a backup
         if r:
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:
@@ -1074,15 +1103,38 @@ def _publish(shot, o, r, final):
                 m["club_speed_rejected"] = m.pop("club_speed")
                 m.pop("smash", None)
         if m.get("ball_speed"):
-            # Fly the ball: measured ball speed, plus the TI radar's launch angle
-            # when there is one (otherwise the club's typical launch). Spin uses
-            # the club's typical value: the speed radar's spin is experimental.
-            f = shot_flight(m["ball_speed"], club, launch_angle=m.get("launch_angle"))
+            # Spin: our own estimate from the club, its speed (when the club
+            # reading is trusted) and the contact, plus the launch angle when
+            # it is measured (ballflight.estimate_spin). OpenFlight's radar
+            # spin is the backup: used only when our estimate is doubtful for
+            # this shot and the radar's reading is one OpenFlight trusts and
+            # one that club can produce.
+            launch = m.get("launch_angle")          # measured (TI radar) or None
+            est = estimate_spin(club, m["ball_speed"], m.get("club_speed"), launch)
+            radar_spin = round(o["spin"]) if (o and o.get("spin") is not None) else None
+            doubt = _spin_model_doubt(club, m, est, launch)
+            use_radar = doubt is not None and radar_spin is not None and _spin_possible(club, radar_spin)
+            m["spin"] = radar_spin if use_radar else est["spin"]
+            m["spin_source"] = "radar" if use_radar else "model"
+            m["spin_model"], m["contact"], m["contact_eff"] = est["spin"], est["contact"], est["efficiency"]
+            if final and radar_spin is not None:
+                print(f"Shot {shot}: spin check: our estimate {est['spin']} rpm, OpenFlight's radar "
+                      f"{radar_spin} rpm ({(radar_spin - est['spin']) / max(est['spin'], 1):+.0%})"
+                      + (f"; using the radar's ({doubt})" if use_radar else
+                         (f"; our estimate is doubtful ({doubt}) but the radar's reading isn't one a "
+                          f"{CLUB_LABEL.get(club, club)} makes" if doubt else "")))
+            elif final and doubt:
+                print(f"Shot {shot}: spin estimate is doubtful ({doubt}) and the radar has no trusted spin")
+            # Fly the ball: measured ball speed, the TI radar's launch angle when
+            # there is one (otherwise the club's typical launch), and that spin.
+            f = shot_flight(m["ball_speed"], club, launch_angle=launch,
+                            spin=m["spin"] if use_radar else None, club_speed=m.get("club_speed"))
             m["carry"] = round(f["carry"])
-            # Total: carry plus OpenFlight's roll estimate from the landing angle
-            # (flat ground, average conditions). Estimated whenever carry is.
+            # Total: carry plus our roll estimate (ballflight.rollout: landing
+            # speed, angle and spin; flat average fairway).
             m["total"] = round(f["total"])
-            m["carry_estimated"] = "launch" in f["assumed"]
+            m["estimated"] = (["carry", "total"] if ("launch" in f["assumed"] or not use_radar) else []) \
+                + ([] if use_radar else ["spin"])
             m["flight"] = f
             if final and not any(h.get("shot") == shot for h in K.history):
                 K.history = (K.history + [dict(f, shot=shot, at=time.strftime("%H:%M:%S"))])[-30:]
@@ -1113,9 +1165,6 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
         if m is None:
             return
     save_metrics(folder if K.folder == folder else None, m, radar_log)
-    if getattr(K, "sim", None) is not None and o:
-        K.sim.send(o.get("shot"), r.get("launch_angle") if r else None,
-                   ball_speed=m.get("ball_speed"), launch_dir=m.get("launch_dir"))
 
     if ops is not None and not o:
         print(f"Shot {shot}: speed radar gave no reading (no ball seen flying away from it)")
@@ -1164,6 +1213,9 @@ def open_browser(url):
 def main():
     p = argparse.ArgumentParser(description="Launch monitor kiosk")
     p.add_argument("--model", default=DEFAULT_MODEL, help="path to the golf ball model")
+    p.add_argument("--backup-model", default="",
+                   help="a second ball model used when --model finds nothing (e.g. OpenFlight's, "
+                        "once --model is our own); empty = none")
     p.add_argument("--imgsz", type=int, default=256)
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
     p.add_argument("--tile", type=int, default=256,
@@ -1271,14 +1323,6 @@ def main():
                    help="GPIO number the sound sensor's GATE is wired to (17 = pin 11, 26 = pin 37)")
     p.add_argument("--club", default="52",
                    help="club being hit, for typical launch and spin: driver, 7i, pw, 52, sw ...")
-    p.add_argument("--sim", action="store_true",
-                   help="send each shot to a golf simulator (OpenGolfSim by default)")
-    p.add_argument("--sim-type", default="opengolfsim", choices=("opengolfsim", "gspro", "partee"))
-    p.add_argument("--sim-host", default="192.168.137.1",
-                   help="IP address of the computer running the simulator")
-    p.add_argument("--sim-port", type=int, default=0, help="0 = the simulator's usual port")
-    p.add_argument("--sim-club", default="",
-                   help="club the simulator should assume, e.g. driver, 7i, pw (default: OpenFlight's)")
     p.add_argument("--min-speed", type=float, default=10.0,
                    help="ignore radar readings slower than this (mph)")
     p.add_argument("--assume-launch", type=float, default=0.0,
@@ -1337,6 +1381,18 @@ def main():
         print("Loading model...")
         model = YOLO(os.path.expanduser(args.model), task="detect")
         model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
+        backup = os.path.expanduser(args.backup_model or "")
+        if backup and os.path.realpath(backup) != os.path.realpath(os.path.expanduser(args.model)):
+            if os.path.exists(backup):
+                spare = YOLO(backup, task="detect")
+                spare.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
+                model = BallModels(model, spare, backup_name=f"backup model ({os.path.basename(backup)})")
+                print(f"Ball model: {os.path.basename(args.model)}, with {os.path.basename(backup)} as "
+                      f"the backup when it finds nothing")
+            else:
+                print(f"Backup ball model {backup} not found; using {os.path.basename(args.model)} alone")
+        else:
+            print(f"Ball model: {os.path.basename(args.model)}")
 
     # Exposure is picked by measuring the area around the ball (see
     # ExposureControl in shot_capture.py); --exposure fixes it by hand.
@@ -1393,16 +1449,6 @@ def main():
             ops = OPSBridge(args)
         except Exception as e:
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
-    K.sim = None
-    if args.sim:
-        if ops is None:
-            print("Simulator needs the speed radar (--ops); not sending shots")
-        else:
-            try:
-                from sim_bridge import SimBridge
-                K.sim = SimBridge(args)
-            except Exception as e:
-                print(f"Simulator not available ({type(e).__name__}: {e}); continuing without it")
     def start_ti():
         """The TI radar (launch angle), through OpenFlight. Also used on waking up."""
         try:
@@ -1464,6 +1510,8 @@ def main():
                   f"(wired to OPS J3-3 and GPIO{args.gate_gpio})")
         except Exception as e:
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
+    print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"
+                              if shadow_guard_on(args) else "off"))
     if "sound" in args.triggers and bridge is None:
         try:
             from gpiozero import DigitalInputDevice
@@ -1478,6 +1526,7 @@ def main():
     zone = None if args.swing_test else ZoneWatch(args)
     rearm_at = time.monotonic() + 2.0
     settle_until = 0.0          # after a shot: let the radars work before looking again
+    searching_since, last_search_note = None, -1e9   # how long it has been Looking for Ball
     # Lower frame rate while no ball is READY (only with a fixed/ladder exposure:
     # libcamera's auto exposure would change brightness with the frame rate).
     idle_fps = args.idle_fps if (0 < args.idle_fps < args.fps and not args.swing_test
@@ -1662,16 +1711,31 @@ def main():
                     and not args.swing_test and sh.roi is not None and sh.ball_ref is not None:
                 verify = {"until": time.monotonic() + args.verify_seconds, "back": 0, "peak": 0.0}
             if verify is not None:
-                d = _ball_diff(sh, sh.latest)      # against the ball as it looked when armed
+                latest = sh.latest
+                d = _ball_diff(sh, latest)         # against the ball as it looked when armed
                 if d is not None:
                     verify["peak"] = max(verify["peak"], d)
-                verify["back"] = verify["back"] + 1 if (d is not None and d <= args.motion_threshold * 0.5) else 0
+                back = d is not None and d <= args.motion_threshold * 0.5
+                shaded = None
+                if not back and shadow_guard_on(args):
+                    # Looks different from when it was armed, but is the ball
+                    # simply still there under a shadow?
+                    seen = ball_still_there(sh, latest)
+                    if seen[0]:
+                        back, shaded = True, seen[1]
+                verify["back"] = verify["back"] + 1 if back else 0
                 if verify["back"] >= 3:               # ball seen in its spot on 3 checks in a row
                     print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
-                          f"(its spot changed by up to {verify['peak']:.1f}, now {d:.1f}); back to Ready")
+                          f"(its spot changed by up to {verify['peak']:.1f}, now {d if d is not None else -1:.1f}"
+                          + (f"; shadow guard: {describe_check(shaded)}" if shaded else "")
+                          + "); back to Ready")
                     with sh.lock:
                         sh.pending = None
-                        sh.roi_ref = sh.ball_ref.copy()   # motion trigger back on the ball's own picture
+                        if shaded and sh.roi is not None:
+                            x0, y0, x1, y1 = sh.roi       # the motion trigger goes on the ball as it is
+                            sh.roi_ref = latest[y0:y1, x0:x1].copy()  # now (in the shadow)
+                        else:
+                            sh.roi_ref = sh.ball_ref.copy()   # motion trigger back on the ball's own picture
                         sh.armed = True               # same ball
                     verify = None
                     K.state = "READY"
@@ -1724,7 +1788,7 @@ def main():
                     job.start()
                     K.radar_jobs = [j for j in K.radar_jobs if j.is_alive()] + [job]
                     settle_until = time.monotonic() + args.settle_seconds
-                shown = {k: v for k, v in metrics.items() if v is not None and k != "carry_estimated"}
+                shown = {k: v for k, v in metrics.items() if v is not None and k != "estimated"}
                 print(f"Shot {K.shot}: {shown if shown else 'no sensor readings'} "
                       f"(camera running at {sh.camera_fps:.0f} fps)")
                 with sh.lock:
@@ -1788,6 +1852,19 @@ def main():
                     print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
                           f"(found by {trk.get('found_by') or trk.get('source')}; now {trk.get('source')}), "
                           f"exposure {sh.exposure[0]} us x{sh.exposure[1]}")
+                # Looking for a ball for a while (with the shadow guard on): say
+                # why in the log and keep a picture in shots/shadow_checks/, so
+                # a ball in plain view that isn't found can be looked at later.
+                if K.state == "SEARCHING" and shadow_guard_on(args):
+                    searching_since = searching_since or now
+                    if now - searching_since >= 8.0 and now - last_search_note >= 20.0:
+                        last_search_note = now
+                        why = zone.why_not if zone is not None else None
+                        print(f"[{time.strftime('%H:%M:%S')}] Still looking for a ball after "
+                              f"{now - searching_since:.0f} s" + (f"; hitting zone: {why}" if why else ""))
+                        save_check(args, "searching", [gray], (0, 0, gray.shape[1], gray.shape[0]))
+                else:
+                    searching_since = None
 
             # Full frame rate only while READY or recording; slower otherwise.
             if idle_fps:
@@ -1887,8 +1964,6 @@ def main():
             bridge.stop()
         if ops is not None:
             ops.stop()
-        if K.sim is not None:
-            K.sim.stop()
         if browser is not None:
             browser.terminate()
         time.sleep(0.2)
