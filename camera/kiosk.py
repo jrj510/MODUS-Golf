@@ -1372,9 +1372,9 @@ def main():
                    help="on = launch angle and direction from the camera: the ball's first frames of "
                         "flight, through the pixel-to-angle grid (launch_camera.py), with the speed "
                         "radar's ball speed; combined with the TI radar's angle when it has one")
-    p.add_argument("--cam-height-m", type=float, default=0.10,
+    p.add_argument("--cam-height-m", type=float, default=0.119,
                    help="camera lens height above the ground, metres (measure it)")
-    p.add_argument("--cam-ball-m", type=float, default=1.575,
+    p.add_argument("--cam-ball-m", type=float, default=1.578,
                    help="distance along the ground from the camera lens to the ball, metres (measure "
                         "it; with the ball's size this calibrates the lens)")
     p.add_argument("--cam-zone-place", type=float, default=0.75,
@@ -1686,7 +1686,10 @@ def main():
                               if shadow_guard_on(args) else "off"))
     K.cam_calib = None
     if args.cam_launch == "on":
-        K.cam_calib = FocalCalibration(os.path.join(args.out, "camera_grid.json"), args.cam_ball_m)
+        # The ball's size in the picture goes with its straight-line distance
+        # from the lens (the lens is higher than the ball's centre).
+        lens_to_ball = math.hypot(args.cam_ball_m, args.cam_height_m - getattr(args, "iwr_ball_height_m", 0.021))
+        K.cam_calib = FocalCalibration(os.path.join(args.out, "camera_grid.json"), lens_to_ball)
         f = K.cam_calib.focal
         print("Camera launch angle: on (" + (
             (f"lens calibrated: focal length {f:.0f} px, "

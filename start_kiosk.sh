@@ -101,8 +101,8 @@ INSIDE_RECORDING=flight # flight = the frames of the ball leaving are saved per 
 # itself from balls at rest; for that, measure these two once:
 INSIDE_CAM_LAUNCH=on
 OUTSIDE_CAM_LAUNCH=off
-CAM_HEIGHT_M=0.10      # camera lens height above the ground, metres
-CAM_BALL_M=1.575       # camera lens to the ball, along the ground, metres
+CAM_HEIGHT_M=0.119     # camera lens height above the ground, metres (4 11/16 in, measured)
+CAM_BALL_M=1.578       # camera lens to the ball, along the ground, metres (1/8 in farther than the radar)
 # Sleep. The moon button (top right) puts the box to sleep: camera and TI
 # radar off, screen dark; tap the screen to wake (about 3-5 s, the TI radar is
 # set up again). It also sleeps by itself after this many minutes of Looking
@@ -110,7 +110,7 @@ CAM_BALL_M=1.575       # camera lens to the ball, along the ground, metres
 # Never in the middle of a shot. The speed radar stays on (its mode can't be
 # switched safely at runtime).
 OUTSIDE_SLEEP_MINUTES=3   # on the course: sleeps on the walk to the ball
-INSIDE_SLEEP_MINUTES=10
+INSIDE_SLEEP_MINUTES=5
 SLEEP_SCREEN=off   # off = backlight off while asleep (saves the most);
                    # black = backlight on, screen black (only if a tap doesn't wake it with the backlight off)
 SCREEN_BRIGHTNESS=max   # set when this script starts (every boot): max = the screen's brightest,
