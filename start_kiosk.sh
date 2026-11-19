@@ -19,7 +19,7 @@ BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the g
 AZIMUTH_DEG=0      # radars point this far right of the target line (left = negative), degrees
 GATE_GPIO=20       # trigger input the TI radar listens on: GPIO20 = pin 38 (was 17 = pin 11)
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-HOLD_SECONDS=5      # ball covered (hand, club, foot) this long -> back to Looking for Ball
+HOLD_SECONDS=5      # ball covered (club at address, hand, foot) this long -> back to Looking for Ball
 MOTION_THRESHOLD=12 # camera trigger: how much the ball's spot must change (0-255) when the ball leaves.
                    # Was 25; lab shots only changed it by 13-16, so half were missed
 # Shadow guard: before a sudden change at the ball's spot counts as a shot (and
@@ -38,6 +38,15 @@ INSIDE_SHADOW_GUARD=off
 # numbers anyway. off = the camera decides on its own, as before.
 OUTSIDE_RADAR_CONFIRM=on
 INSIDE_RADAR_CONFIRM=off
+# Cover guard: setting the club down behind the ball hides it from the camera,
+# which looked like the ball leaving (Checking at address, then Looking for
+# Ball). on = the camera tells the club at address from the ball leaving (the
+# top of the ball is still there, the turf beside it goes dark), keeps Ready
+# while the ball is covered (up to HOLD_SECONDS), sends no radar pulse, and
+# arms the trigger again the moment the backswing uncovers the ball. Pictures
+# of each decision go to shots/shadow_checks/ (..._covered.png). off = as before.
+OUTSIDE_COVER_GUARD=on
+INSIDE_COVER_GUARD=on
 OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera or the sound detector);
                    # speed = the OPS triggers itself (picked up noise here, so not used)
 TRIGGER_OUT_GPIO=21 # camera trigger: GPIO21 (pin 40) pulses OPS J3-3 and GPIO20 (pin 38) when the
@@ -148,11 +157,11 @@ while true; do
     case "$MODE" in
         inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING
                 SLEEP_MIN=$INSIDE_SLEEP_MINUTES; OPS_PRE=$INSIDE_OPS_PRE_TRIGGER
-                GUARD=$INSIDE_SHADOW_GUARD; CONFIRM=$INSIDE_RADAR_CONFIRM ;;
+                GUARD=$INSIDE_SHADOW_GUARD; CONFIRM=$INSIDE_RADAR_CONFIRM; COVER=$INSIDE_COVER_GUARD ;;
         *)      MODE=outside
                 CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING
                 SLEEP_MIN=$OUTSIDE_SLEEP_MINUTES; OPS_PRE=$OUTSIDE_OPS_PRE_TRIGGER
-                GUARD=$OUTSIDE_SHADOW_GUARD; CONFIRM=$OUTSIDE_RADAR_CONFIRM ;;
+                GUARD=$OUTSIDE_SHADOW_GUARD; CONFIRM=$OUTSIDE_RADAR_CONFIRM; COVER=$OUTSIDE_COVER_GUARD ;;
     esac
     DETECT="'--trigger','motion,sound','--blob'"
     MODELARG=""
@@ -179,8 +188,8 @@ while true; do
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     [ -n "$MODELNOTE" ] && echo "$MODELNOTE" >> "$LOG"
     reset_ops
-    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off} (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off}, cover guard ${COVER:-off} (log: $LOG)"
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--cover-guard','${COVER:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"

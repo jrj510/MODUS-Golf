@@ -66,7 +66,8 @@ from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, BallModels, Shared
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready, _ball_diff,
-                          ball_still_there, describe_check, save_check, shadow_guard_on)
+                          ball_still_there, cover_guard_on, describe_check, save_check, shadow_guard_on,
+                          _top_change)
 
 DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
 # Clubs for the Club button (same list and names as the start menu, launcher.py).
@@ -1528,6 +1529,9 @@ def main():
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
     print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"
                               if shadow_guard_on(args) else "off"))
+    print("Cover guard: " + (f"on (the club set down at address is not taken for a shot; Ready kept while "
+                             f"the ball is covered, up to {args.hold_seconds:g} s)"
+                             if cover_guard_on(args) else "off"))
     # Radar check: the speed radar has the last word on whether a camera
     # trigger was a shot (see --radar-confirm).
     radar_confirm = False
@@ -1579,6 +1583,42 @@ def main():
         trk["lost_since"] = None
         K.state = "BALL"
 
+    def back_to_ready(shaded=None):
+        """No shot after all: the same ball, Ready again at once. The trigger
+        goes back on the ball's own picture (or on the ball as it looks now,
+        when it was seen whole under a shadow). With the cover guard, a ball
+        still hidden (the club at address) is held Ready while covered, up to
+        --hold-seconds, and the trigger arms itself the moment it is back in
+        view. Without a picture of the ball to go back to, or when even the
+        top of the ball has changed (a shadow over it, or the ball has gone:
+        a shot the radar couldn't see): the ball finder rechecks it."""
+        with sh.lock:
+            top = _top_change(sh, sh.latest)
+            if sh.roi is None or sh.ball_ref is None or (
+                    not shaded and top is not None and top > args.motion_threshold):
+                ok = False
+            else:
+                ok = True
+                sh.pending = None
+                latest = sh.latest
+                if shaded and latest is not None:
+                    x0, y0, x1, y1 = sh.roi            # the trigger on the ball as it is now
+                    sh.roi_ref = latest[y0:y1, x0:x1].copy()
+                else:
+                    sh.roi_ref = sh.ball_ref.copy()    # the trigger back on the ball's own picture
+                d0 = _ball_diff(sh, latest)
+                sh.covered = (cover_guard_on(args) and not shaded and d0 is not None
+                              and d0 > args.motion_threshold * 0.5)
+                sh.armed = True                        # same ball
+        if not ok:
+            recheck_ball()
+            return
+        trk["lost_since"] = None
+        K.state = "READY"
+        if sh.covered:
+            print(f"[{time.strftime('%H:%M:%S')}] Cover guard: the ball is hidden (change {d0:.1f}): "
+                  f"Ready kept for up to {args.hold_seconds:g} s; armed again as soon as it is in view")
+
     def radar_saw_nothing(details, v):
         """The radar check's no: the speed radar saw nothing fly away after a
         camera trigger, so it was no shot (a shadow, the golfer moving)."""
@@ -1591,7 +1631,7 @@ def main():
             what = "nothing fly away" + (f" (fastest thing moving away {fast}; a ball needs 15+)" if fast else "")
         print(f"[{time.strftime('%H:%M:%S')}] No shot: camera trigger, but the speed radar saw {what}"
               f" ({time.monotonic() - v['t']:.1f} s after the trigger): a shadow or someone moving. "
-              f"Back to Ready once the ball is confirmed in its spot")
+              f"Back to Ready")
         try:
             if sh.pending is not None and sh.ball_check is not None:
                 window = sh.pending[2]          # (pictures for tuning the shadow guard)
@@ -1600,7 +1640,7 @@ def main():
                            sh.ball_check.area)
         except Exception as e:
             print(f"Radar check: could not save the check picture ({type(e).__name__}: {e})")
-        recheck_ball()
+        back_to_ready()
     K.state = "SEARCHING"
     view_settle_until = 0.0     # frames from before a zoom change are still arriving
     focus_best, focus_where = None, None
@@ -1861,8 +1901,8 @@ def main():
                 print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
                       f"(its spot changed by up to {peak:.1f}, then {d if d is not None else -1:.1f}"
                       + (f"; shadow guard: {describe_check(shaded)}" if shaded else "")
-                      + f"; {radar}); back to Ready once the ball is confirmed")
-                recheck_ball()
+                      + f"; {radar}); back to Ready")
+                back_to_ready(shaded)
                 verify = None
                 continue
             if verify is not None and verify["radar"]:

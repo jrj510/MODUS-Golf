@@ -117,6 +117,10 @@ class Shared:
         self.camera_fps = 0.0
         self.exposure = (None, None)  # (microseconds, gain) the sensor last used
         self.on_fire = None           # called with the source when a trigger is accepted
+        self.covered = False      # something (the club at address) is over the armed ball: no
+                                  # trigger until the ball is back in view (see RingWatch)
+        self.ring = None          # RingWatch for the armed ball: the turf round it
+        self.ring_ref = None      # that turf as it looked when the ball was armed
 
     def trigger(self, source, need_armed=True):
         with self.lock:
@@ -722,6 +726,12 @@ def _set_patch(sh, gray, ball):
         old = sh.ball_check
         if old is None or max(abs(a - int(b)) for a, b in zip(old.box, ball)) > 1:
             sh.ball_check = BallCheck(ball, gray.shape)   # (only rebuilt when the box moves)
+        ring = sh.ring
+        if ring is None or max(abs(a - int(b)) for a, b in zip(ring.box, ball)) > 1:
+            ring = RingWatch(ball, gray.shape)
+        sh.ring_ref = ring.stats(gray) if ring.ok else None
+        sh.ring = ring
+        sh.covered = False
 
 
 class BallCheck:
@@ -828,6 +838,95 @@ class BallCheck:
                          "circle": (round(bx + x0, 1), round(by + y0, 1), round(float(r), 1))}
 
 
+class RingWatch:
+    """The turf just round the ball, in 16 directions: tells "the ball has
+    gone" from "something has been put over it" (the club at address).
+
+    From where the camera sits, setting the club down behind the ball hides
+    the ball, and its patch changes just as when the ball is hit. But the club
+    head is three or four times the ball's width: it also darkens the turf
+    beside the ball, and then stays there, still. When the ball is hit, the
+    club is gone again within a frame or two and the turf round the spot looks
+    as it did. (Measured on our camera's pictures of a wedge at address: 4 of
+    the 16 directions 33 to 122 levels darker; frames of the same ball without
+    the club: none.)
+
+    Means of the turf at 1.4 to 2.6 ball radii from the ball's centre, in 16
+    sectors. A sector "went darker" when it lost at least DARKER_SHARE of its
+    brightness (and DARKER_LEVELS). Only the sectors beside and below the
+    ball count for that: the club rests between the camera and the ball, so
+    it shows at the ball's height and lower, while a divot thrown up by a
+    shot lands beyond the ball (higher in the picture) and the ball's own
+    shadow only gets brighter when the ball goes. Cheap enough to take every
+    frame.
+    """
+    SECTORS = 16
+    INNER, OUTER = 1.4, 2.6
+    DARKER_LEVELS, DARKER_SHARE = 6.0, 0.15
+    STILL_LEVELS, STILL_SHARE = 4.0, 0.08
+    NEED = 2            # sectors beside/below the ball gone darker: "something is over the ball"
+    MIN_RADIUS = 4.0
+
+    def __init__(self, box, shape):
+        self.box = [int(v) for v in box]
+        cx, cy = (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+        r0 = ((box[2] - box[0]) + (box[3] - box[1])) / 4.0
+        m = int(np.ceil(self.OUTER * r0)) + 1
+        x0, y0 = max(int(cx) - m, 0), max(int(cy) - m, 0)
+        x1, y1 = min(int(cx) + m + 1, shape[1]), min(int(cy) + m + 1, shape[0])
+        self.area = (x0, y0, x1, y1)
+        self.ok = False
+        if r0 < self.MIN_RADIUS or x1 <= x0 or y1 <= y0:
+            return
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        rho = np.hypot(xx - cx, yy - cy)
+        sector = ((np.arctan2(yy - cy, xx - cx) + np.pi) / (2 * np.pi) * self.SECTORS).astype(np.int32)
+        sector = np.clip(sector, 0, self.SECTORS - 1)
+        keep = (rho >= self.INNER * r0) & (rho <= self.OUTER * r0)
+        self.index = np.flatnonzero(keep)
+        self.sector = sector.ravel()[self.index]
+        self.count = np.bincount(self.sector, minlength=self.SECTORS).astype(np.float32)
+        # A sector cut off by the picture's edge isn't counted.
+        self.valid = self.count >= 6
+        self.ok = int(self.valid.sum()) >= self.SECTORS // 2
+        mid = -np.pi + (np.arange(self.SECTORS) + 0.5) * 2 * np.pi / self.SECTORS
+        self.low = self.valid & (np.sin(mid) > -0.2)      # beside and below the ball
+
+    def stats(self, gray):
+        """Mean brightness of each sector."""
+        x0, y0, x1, y1 = self.area
+        vals = gray[y0:y1, x0:x1].ravel()[self.index].astype(np.float32)
+        return np.bincount(self.sector, weights=vals, minlength=self.SECTORS) / np.maximum(self.count, 1)
+
+    def darker(self, now, before, low=True):
+        """How many sectors (beside and below the ball; low=False: all round
+        it) went clearly darker from before to now."""
+        if now is None or before is None:
+            return 0
+        drop = before - now
+        dark = drop >= np.maximum(self.DARKER_LEVELS, self.DARKER_SHARE * before)
+        return int(((self.low if low else self.valid) & dark).sum())
+
+    def brighter(self, now, before):
+        """How many sectors beside and below the ball went clearly brighter
+        (something that was in front of the ball has gone)."""
+        if now is None or before is None:
+            return 0
+        rise = now - before
+        return int((self.low & (rise >= np.maximum(self.DARKER_LEVELS, self.DARKER_SHARE * before))).sum())
+
+    def moving(self, now, before):
+        """How many sectors changed at all from before to now."""
+        if now is None or before is None:
+            return self.SECTORS
+        step = np.abs(now - before)
+        return int((self.valid & (step >= np.maximum(self.STILL_LEVELS, self.STILL_SHARE * before))).sum())
+
+
+def cover_guard_on(args):
+    return getattr(args, "cover_guard", "off") == "on"
+
+
 def shadow_guard_on(args):
     return getattr(args, "shadow_guard", "off") == "on"
 
@@ -910,6 +1009,12 @@ def add_tracking_args(p):
     p.add_argument("--assist-conf", type=float, default=0.15,
                    help="lowest model confidence that still backs up a ball seen being set down "
                         "(or one that was tapped)")
+    p.add_argument("--cover-guard", choices=("on", "off"), default="off",
+                   help="on = the club set down at address (which hides the ball from the camera) "
+                        "is not taken for a shot: the turf beside the ball goes dark too and stays "
+                        "still (see RingWatch). Ready is kept while the ball is covered (up to "
+                        "--hold-seconds), and the motion trigger is armed again the moment the "
+                        "ball is back in view (the backswing), ready for the shot")
     p.add_argument("--shadow-guard", choices=("on", "off"), default="on",
                    help="on = before a sudden change at the ball's spot counts as a shot (and the "
                         "radars are pulsed), check the ball isn't simply still there under a shadow "
@@ -1081,6 +1186,7 @@ def _seen(trk, box, blob=False, keep_rivals=False, conf=None, source=None, sure=
     """The followed (or newly confirmed) ball was found. sure (set when a new
     ball is taken on): False if only the small-ball finder vouched for it."""
     trk["misses"], trk["spots"], trk["blobs"], trk["blob"] = 0, [], [], blob
+    trk["conf"] = conf                        # the model's rating of this sighting (None: not the model)
     trk["source"] = source or ("spot finder" if blob else
                                (f"model {conf:.2f}" if conf is not None else "model"))
     if sure is not None:                      # a new ball taken on
@@ -1643,6 +1749,16 @@ def smooth_box(shown, box, weight=0.4):
     return [int(round(s + weight * (b - s))) for s, b in zip(shown, box)]
 
 
+def _ring_clear(sh, gray):
+    """Nothing over the turf round the armed ball (or a shadow over all of
+    it, which is the light, not an object)."""
+    ring, ref = sh.ring, sh.ring_ref
+    if ring is None or not ring.ok or ref is None:
+        return False
+    n = ring.darker(ring.stats(gray), ref, low=False)
+    return n <= 2 or n >= int(ring.valid.sum()) - 2
+
+
 def update_ready(sh, args, gray, ball, trk, now):
     """Decide SEARCHING / BALL / READY from the model's latest answer.
 
@@ -1678,13 +1794,34 @@ def update_ready(sh, args, gray, ball, trk, now):
         if not visible and shadow_guard_on(args):
             # Looks different: a hand or club over it, or just a shadow on it?
             seen = ball_still_there(sh, gray)
-            if seen[0]:
+            if seen[0] and getattr(sh, "covered", False) and trk.get("box") is not None:
+                # The whole ball is seen (in a shadow): it is not the club over
+                # it. The trigger goes on the ball as it looks now.
+                _set_patch(sh, gray, trk["box"])
+                visible = True
+                print(f"[{time.strftime('%H:%M:%S')}] Cover guard: the whole ball is in view under a "
+                      f"shadow ({describe_check(seen[1])}): armed on it as it looks now")
+            elif seen[0]:
                 visible = True
                 if now - trk.get("shade_note", -1e9) >= 10.0:
                     trk["shade_note"] = now
                     print(f"[{time.strftime('%H:%M:%S')}] Shadow guard: the ball's spot looks different "
                           f"(change {diff:.1f}) but the ball is still there ({describe_check(seen[1])}); "
                           f"staying Ready")
+        if not visible and getattr(sh, "covered", False) and cover_guard_on(args):
+            # Covered, but the model clearly sees the whole ball where it was and
+            # nothing is over the turf round it (or a shadow is over all of it):
+            # the light changed, not the club. Armed on the ball as it looks now.
+            clear = (same and (trk.get("conf") or 0.0) >= max(args.conf, 0.6)
+                     and _ring_clear(sh, gray))
+            trk["clear_seen"] = trk.get("clear_seen", 0) + 1 if clear else 0
+            if trk["clear_seen"] >= 2:
+                trk["clear_seen"] = 0
+                _set_patch(sh, gray, ball)
+                visible = True
+                print(f"[{time.strftime('%H:%M:%S')}] Cover guard: the ball is clearly in view "
+                      f"(model {trk.get('conf', 0):.2f}) and nothing is over the turf round it: "
+                      f"armed on it as it looks now")
         blind = now - (trk["confirmed_at"] or now)
         if visible and (same or blind <= getattr(args, "blind_seconds", 30.0)):
             trk["lost_since"] = None
@@ -1698,8 +1835,10 @@ def update_ready(sh, args, gray, ball, trk, now):
         print(f"[{time.strftime('%H:%M:%S')}] READY lost before a shot: the ball's spot has looked "
               f"different (change {diff if diff is not None else -1:.1f}, limit {args.motion_threshold:.0f}) "
               f"for {now - trk['lost_since']:.1f} s"
+              + ("; covered the whole time (cover guard)" if getattr(sh, "covered", False) else "")
               + (f"; shadow guard: {describe_check(seen[1])}" if shadow_guard_on(args) else ""))
         sh.armed = False
+        sh.covered = False
         sh.roi = sh.roi_ref = sh.ball_ref = None
         trk.update(new_track())
         # Show "Looking for Ball" for a moment instead of re-arming at once on a
@@ -1812,14 +1951,69 @@ class PatchWatch:
         return None
 
 
+def _top_change(sh, gray):
+    """How much the top of the ball's patch (its upper 40%) differs from the
+    ball as armed, or None. The club at address hides the ball's lower half
+    from the camera; its top stays exactly as it was (measured on our
+    pictures of a wedge at address: under 2 levels, while the whole patch
+    changed by 12 to 62). When the ball is hit, the top goes too."""
+    roi, ref = sh.roi, sh.ball_ref
+    if roi is None or ref is None or gray is None:
+        return None
+    x0, y0, x1, y1 = roi
+    rows = max(2, int(round(0.4 * (y1 - y0))))
+    patch = gray[y0:y0 + rows, x0:x1]
+    if patch.shape != ref[:rows].shape:
+        return None
+    return float(cv2.absdiff(patch, ref[:rows]).mean())
+
+
+def _cover_verdict(sh, rings, ring_now, img, thr):
+    """At a motion trigger, with the cover guard: ("back", why) if the ball's
+    spot looks like the ball again (the club taken away), ("covered", why) if
+    something has been put in front of the ball (the club at address): the
+    top of the ball is still exactly as it was, or the turf beside and below
+    it went darker (both since just before the jump and since the ball was
+    armed) and has stayed still while the ball's top hardly changed; or
+    (None, numbers) for a shot."""
+    d0 = _ball_diff(sh, img)
+    if d0 is not None and d0 <= 0.5 * thr:
+        return "back", f"the ball is in view again (change {d0:.1f} from its own picture)"
+    top = _top_change(sh, img)
+    top_text = f"top of the ball changed {top:.1f}" if top is not None else "top of the ball not checked"
+    ring = sh.ring
+    if top is not None and top <= 0.35 * thr:
+        # The ball is still there. Something in front of its lower half has
+        # gone (the turf beside and below it brighter, and still): the ball
+        # is in view as it looks now. Otherwise something is in front of it.
+        if ring is not None and ring.ok and ring_now is not None and len(rings) >= 9 \
+                and ring.brighter(ring_now, rings[-9]) >= ring.NEED and ring.moving(ring_now, rings[-3]) <= 1:
+            return "left", f"{top_text}, the turf beside/below it brighter: the ball is in view again"
+        return "covered", f"{top_text}, the rest {d0 if d0 is not None else -1:.1f}: the ball is still there"
+    if ring is None or not ring.ok or ring_now is None or len(rings) < 9:
+        return None, f"{top_text}; turf round the ball not checked (ball too small, or just armed)"
+    vs_jump = ring.darker(ring_now, rings[-9])        # ~8 frames ago: before the jump
+    vs_armed = ring.darker(ring_now, sh.ring_ref)
+    moving = ring.moving(ring_now, rings[-3])         # the last two frames
+    numbers = (f"{top_text}; turf beside/below it: {vs_jump} of {int(ring.low.sum())} directions darker "
+               f"than just before, {vs_armed} than when armed; {moving} of 16 still changing")
+    if vs_jump >= ring.NEED and vs_armed >= ring.NEED and moving <= 1 \
+            and top is not None and top <= thr:
+        return "covered", numbers
+    return None, numbers
+
+
 def camera_thread(cam, sh, args):
     """Grab every frame at full speed into the rolling memory."""
     count, t0 = 0, time.monotonic()
     prev_small = None
     watch = PatchWatch()
     guard = shadow_guard_on(args)   # the shadow guard (see BallCheck)
+    cover = cover_guard_on(args)    # the cover guard (see RingWatch)
     looked = None                   # (ball check, frame) one frame before a trigger is decided
     vetoes, last_veto_note = 0, -1e9
+    rings = collections.deque(maxlen=12)   # the turf round the ball, frame by frame (cover guard)
+    back_frames, last_cover_note, last_back_note = 0, -1e9, -1e9
     while sh.running:
         req = cam.capture_request()
         try:
@@ -1835,9 +2029,37 @@ def camera_thread(cam, sh, args):
 
         # Motion trigger: has the ball suddenly gone from where it was sitting?
         if "motion" in args.triggers and sh.armed and sh.trigger_time is None:
+            thr = args.motion_threshold
+            ring = sh.ring if cover else None
+            ring_now = ring.stats(img) if ring is not None and ring.ok else None
             diff = _patch_diff(sh, img)
-            if diff is None:
+            if cover and sh.covered:
+                # The club is over the ball (address): no trigger, and nothing
+                # re-taken onto the club, until the ball is back in view (the
+                # backswing). Then the trigger is armed on the ball's own
+                # picture, ready for the shot.
+                rings.clear()
                 watch.reset()
+                d0 = _ball_diff(sh, img)
+                back_frames = back_frames + 1 if (d0 is not None and d0 <= 0.5 * thr) else 0
+                if back_frames >= 2:
+                    with sh.lock:
+                        if sh.armed and sh.ball_ref is not None:
+                            sh.roi_ref = sh.ball_ref.copy()
+                        sh.covered = False
+                    watch.prime()
+                    back_frames = 0
+                    if now - last_back_note >= 1.0:
+                        last_back_note = now
+                        print(f"[{time.strftime('%H:%M:%S')}] Cover guard: the ball is in view again "
+                              f"(change {d0:.1f}): armed for the shot")
+                diff = None                       # (nothing more to do this frame)
+            elif ring_now is not None:
+                back_frames = 0
+                rings.append(ring_now)
+            if diff is None:
+                if not (cover and sh.covered):
+                    watch.reset()
             else:
                 verdict = watch.step(diff, now, args.motion_threshold)
                 if guard and watch.since_jump == 0:
@@ -1858,6 +2080,8 @@ def camera_thread(cam, sh, args):
                         watch.reset()
                         x0, y0, x1, y1 = roi
                         sh.roi_ref = img[y0:y1, x0:x1].copy()   # this light is the new normal
+                        if ring_now is not None:
+                            sh.ring_ref = ring_now
                         watch.prime()
                         vetoes += 1
                         if now - last_veto_note >= 2.0:
@@ -1877,9 +2101,56 @@ def camera_thread(cam, sh, args):
                         note = f"ball still there a frame ago, gone now ({describe_check(seen[1])})"
                     else:
                         note = f"ball not in its spot ({describe_check(seen[1])})"
+                cover_note = None
+                if verdict == "trigger" and cover:
+                    what, cover_note = _cover_verdict(sh, rings, ring_now, img, thr)
+                    if what == "back":
+                        # The ball's spot looks like the ball again: the club
+                        # was taken away (it had been re-taken onto the club).
+                        watch.reset()
+                        with sh.lock:
+                            if sh.ball_ref is not None:
+                                sh.roi_ref = sh.ball_ref.copy()
+                        watch.prime()
+                        if now - last_back_note >= 1.0:
+                            last_back_note = now
+                            print(f"[{time.strftime('%H:%M:%S')}] Cover guard: {cover_note}: no trigger, "
+                                  f"armed for the shot")
+                        verdict, looked = None, None
+                    elif what == "left":
+                        # Armed on the ball as it looks now, nothing in front.
+                        watch.reset()
+                        roi = sh.roi
+                        if roi is not None:
+                            x0, y0, x1, y1 = roi
+                            with sh.lock:
+                                sh.roi_ref = img[y0:y1, x0:x1].copy()
+                                sh.ball_ref = sh.roi_ref.copy()
+                                sh.ring_ref = ring_now
+                        watch.prime()
+                        if now - last_back_note >= 1.0:
+                            last_back_note = now
+                            print(f"[{time.strftime('%H:%M:%S')}] Cover guard: {cover_note}: no trigger, "
+                                  f"armed for the shot")
+                        verdict, looked = None, None
+                    elif what == "covered":
+                        watch.reset()
+                        sh.covered = True
+                        if now - last_cover_note >= 2.0:
+                            last_cover_note = now
+                            print(f"[{time.strftime('%H:%M:%S')}] Cover guard: something is over the ball "
+                                  f"({cover_note}: the club at address?): not a shot, no radar pulse; "
+                                  f"Ready kept while it is covered")
+                        frames = list(sh.frames)
+                        area = sh.ball_check.area if sh.ball_check is not None else (ring.area if ring else None)
+                        save_check(args, "covered", [frames[-9][2] if len(frames) >= 9 else None,
+                                                     frames[-5][2] if len(frames) >= 5 else None, img], area)
+                        verdict, looked = None, None
                 if verdict == "trigger":
                     watch.reset()
                     sh.trigger("motion")
+                    if cover_note is not None:        # (after the pulse: costs the radars nothing)
+                        print(f"[{time.strftime('%H:%M:%S')}] Cover guard: {cover_note}: shot")
                     if note is not None:              # (after the pulse: costs the radars nothing)
                         print(f"[{time.strftime('%H:%M:%S')}] Shadow guard: {note}: shot")
                         frames = list(sh.frames)
@@ -1889,11 +2160,26 @@ def camera_thread(cam, sh, args):
                                    sh.ball_check.area if sh.ball_check is not None else None)
                     looked = None
                 elif verdict == "reref" and sh.roi is not None:
-                    # Something (usually the club) has settled beside the ball.
-                    x0, y0, x1, y1 = sh.roi
-                    sh.roi_ref = img[y0:y1, x0:x1].copy()
+                    if cover and ring_now is not None and sh.ring_ref is not None and len(rings) >= 3 \
+                            and ring.darker(ring_now, sh.ring_ref) >= ring.NEED \
+                            and ring.moving(ring_now, rings[-3]) <= 1 \
+                            and (_ball_diff(sh, img) or 0.0) > 0.5 * thr:
+                        # It settled OVER the ball (the club eased in at address):
+                        # don't take it as the new normal; wait for the ball.
+                        sh.covered = True
+                        if now - last_cover_note >= 2.0:
+                            last_cover_note = now
+                            print(f"[{time.strftime('%H:%M:%S')}] Cover guard: something settled over the ball "
+                                  f"({ring.darker(ring_now, sh.ring_ref)} of {int(ring.low.sum())} directions beside/"
+                                  f"below it darker than when armed): Ready kept while it is covered")
+                    else:
+                        # Something (usually the club) has settled beside the ball.
+                        x0, y0, x1, y1 = sh.roi
+                        sh.roi_ref = img[y0:y1, x0:x1].copy()
         else:
             watch.reset()
+            rings.clear()
+            back_frames = 0
 
         # Swing test (no ball): fire when a lot of the picture changes between two
         # consecutive frames. A club at full speed does that; slow movement at
