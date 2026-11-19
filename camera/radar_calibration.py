@@ -41,6 +41,10 @@ What is ours:
 With OpenFlight's own settings (fixed drag, 70 ms, no gravity, lift, net or
 beam) this model gives OpenFlight's numbers to within 0.1 mph (tested).
 
+Club speed is ours too (club_speed_from_readings): the peak of the club
+head's climb in the radar's readings, read without OpenFlight's club types.
+OpenFlight's club speed is kept only as a logged check.
+
 TI RADAR (IWR6843)
 ------------------
 Two layers:
@@ -68,6 +72,7 @@ from dataclasses import dataclass
 from ballflight import AIR, CD0, CDK, CLK, CLMAX, G, MASS, RADIUS, club_defaults
 
 MPH = 0.44704                  # m/s per mph
+WAVELENGTH_M = 299792458.0 / 24.125e9   # the OPS243-A radar wave (24.125 GHz): 12.43 mm
 OPS_FILE = "ops_calibration.json"
 TI_FILE = "ti_calibration.json"
 
@@ -312,6 +317,159 @@ def _median(sorted_values):
     if not n:
         return 0.0
     return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+# =========================================================================
+# Speed radar (OPS243-A): club-head speed, our own
+# =========================================================================
+#
+# Through the downswing the club head is the fastest thing moving away from
+# the radar, and it keeps speeding up until it meets the ball. In the radar's
+# readings (one set of speed peaks per 4.3 ms FFT window, a window every
+# 1.07 ms) that is a branch that climbs steadily, about 1-2 mph per window.
+# At impact the head gives up its speed: right after, its readings drop away,
+# and the ball appears. How the ball appears decides how we read the club:
+#
+#   - "jump": the ball comes in as a sudden jump, well above anything the
+#     club could reach in one window, and stays there (drivers, woods, irons,
+#     pitching wedges: the ball is 20-40% faster than the head). The club
+#     speed is the peak of the club's climb in the 12 ms before that jump.
+#   - "merge": no jump. The club's readings run straight into the ball's,
+#     because the ball leaves at about the club's speed along the radar's
+#     line of sight (sand and lob wedges, and thin or heeled strikes with any
+#     club). The club speed is where that climb levels off.
+#
+# The club's branch is followed on the strong peaks only (at least a tenth
+# as strong as the strongest echo around the shot): weak ones are mostly
+# glints off the shaft and FFT sidelobes. A share, not a fixed strength,
+# because how strong the echoes are depends on the box and the distances. Each value is the middle of
+# 3 neighbouring windows, so a single noisy window can't set the speed.
+# A very strong club echo overloads the radar's input and makes false copies
+# of itself at 2x and 3x its speed, some folded back by the sample rate (at
+# 30,000 samples a second everything wraps every 417 mph: a 3x copy of an
+# 82 mph club shows up near 172 mph). In the recordings these looked like the
+# ball arriving, so any peak at such a copy of a stronger peak in the same
+# window is dropped first (but never one at the ball's own speed).
+# The club picked on the kiosk isn't needed for any of this: jump or merge is
+# read from the readings themselves. (Afterwards kiosk.py still checks the
+# smash factor against what that club can really give: SMASH_MAX.)
+#
+# Checked on the 22 real recordings that have TrackMan's club speed for the
+# same swings (OpenFlight's public sample session of 6 May 2026: 7-iron,
+# driver, pitching wedge, incl. one thin pitching-wedge strike that merges):
+# median miss 1.0 mph, 21 of 22 within 2 mph, worst +3.5 mph. OpenFlight's
+# own club-speed pick on the same recordings: median 3.6 mph, 8 of 22 within
+# 2 mph, worst -15.3 mph. On 17 more driver recordings from that project
+# (no TrackMan) it gave a believable smash factor on all but one, where the
+# ball speed itself was misread. No sand- or lob-wedge recordings were
+# available, so the merge case has been seen on one shot only: check it
+# against a reference launch monitor (club_speed_check_mph in the session
+# CSV is OpenFlight's club speed, for comparison).
+
+CLUB_SPAN_MS = (-30.0, 5.0)  # readings used: around the ball's strongest reading
+CLUB_MIN_MPH = 15.0          # slower: the golfer, the net, room clutter
+CLUB_MIN_SHARE = 0.10        # peaks weaker than this share of the strongest one are left out of the club's branch
+BALL_JUMP_MPH = 8.0          # the ball arriving: this much faster than the club's last 3 windows
+BALL_LEVEL = 0.88            # ... at no less than this share of the ball speed
+BALL_NEAR = 0.04             # ... and seen again (within 4%, at least 3 mph) in 2 of the next 3 windows
+CLUB_LOOK_MS = 12.0          # the club's peak is looked for this far before the jump
+MERGE_TOP = 1.02             # merge: club readings up to 2% above the ball's speed
+ECHO_COPIES = (2, 3)         # false copies of a strong echo: at 2x and 3x its speed ...
+ECHO_FOLD_KSPS = 30          # ... or folded back by the radar's sample rate (ksps)
+ECHO_MATCH = 0.02            # ... within 2% (never a peak at the ball's own speed)
+MERGE_FROM = 0.45            # merge: the climb ends at a jump only past this share of the ball speed
+
+
+def _echo_copy(speed, stronger, fold_mph):
+    """Is speed a false copy (2x, 3x, or folded back) of one of the stronger peaks?"""
+    for c in stronger:
+        for k in ECHO_COPIES:
+            for copy in (k * c, fold_mph - k * c):
+                if abs(speed - copy) <= ECHO_MATCH * speed:
+                    return True
+    return False
+
+
+def club_speed_from_readings(readings, ball_mph, ball_ms, sample_ksps=ECHO_FOLD_KSPS):
+    """Club-head speed from the speed radar's FFT readings (see above).
+
+    readings: (time ms, speed mph, strength) for every peak moving away from
+    the radar, from each FFT window of the recording; ball_mph, ball_ms: the
+    ball's speed and the time of its strongest reading; sample_ksps: the
+    radar's sample rate (thousand samples a second).
+    Returns {"club_mph": speed or None, "how": "jump" / "merge" / None,
+    "ball_arrives_ms": time of the jump or None}."""
+    out = {"club_mph": None, "how": None, "ball_arrives_ms": None}
+    try:
+        ball_mph, ball_ms = float(ball_mph), float(ball_ms)
+    except (TypeError, ValueError):
+        return out
+    if not ball_mph > CLUB_MIN_MPH:
+        return out
+    fold_mph = sample_ksps * 1000.0 * WAVELENGTH_M / 2.0 / MPH     # 417 mph at 30 ksps
+    windows = {}
+    for t, s, m in readings:
+        if s is None or t is None or s < CLUB_MIN_MPH:
+            continue
+        if ball_ms + CLUB_SPAN_MS[0] <= t <= ball_ms + CLUB_SPAN_MS[1]:
+            windows.setdefault(t, []).append((s, m if m is not None else 0.0))
+    strongest = max((m for peaks in windows.values() for _, m in peaks), default=0.0)
+    every, strong = {}, {}
+    for t, peaks in windows.items():
+        peaks.sort(key=lambda p: -p[1])                 # strongest first
+        for i, (s, m) in enumerate(peaks):
+            at_ball = abs(s - ball_mph) <= max(3.0, BALL_NEAR * ball_mph)
+            if not at_ball and _echo_copy(s, [p[0] for p in peaks[:i]], fold_mph):
+                continue
+            every.setdefault(t, []).append(s)
+            if m >= CLUB_MIN_SHARE * strongest:
+                strong.setdefault(t, []).append(s)
+    times = sorted(every)
+    top = {t: max(v) for t, v in strong.items()}       # the fastest strong peak in each window
+
+    def seen(t, level):
+        return any(abs(s - level) <= max(3.0, BALL_NEAR * level) for s in every.get(t, ()))
+
+    arrives = level = None
+    for i, t in enumerate(times):
+        before = [top[x] for x in times[max(0, i - 3):i] if x in top]
+        if len(before) < 2:
+            continue
+        for lvl in sorted(every[t], reverse=True):
+            if lvl < BALL_LEVEL * ball_mph:
+                break
+            if lvl - max(before) >= BALL_JUMP_MPH and sum(seen(x, lvl) for x in times[i + 1:i + 4]) >= 2:
+                arrives, level = t, lvl
+                break
+        if arrives is not None:
+            break
+
+    def smoothed(cap):
+        """The fastest strong peak under cap in each window, as the middle of 3 neighbours."""
+        tops = {t: max(v for v in vals if v < cap) for t, vals in strong.items() if any(v < cap for v in vals)}
+        tt = sorted(tops)
+        return [(tt[i], sorted((tops[tt[i - 1]], tops[tt[i]], tops[tt[i + 1]]))[1]) for i in range(1, len(tt) - 1)]
+
+    if arrives is not None:
+        # The club is slower than the ball that has just jumped in.
+        values = [v for t, v in smoothed(level - BALL_JUMP_MPH / 2) if arrives - CLUB_LOOK_MS <= t < arrives]
+        how = "jump"
+    else:
+        # The club's climb, up to where it levels off: it ends once the ball's
+        # strongest reading has passed, or at a sudden jump once the club is
+        # well under way (something faster than the club has come in, even if
+        # the ball speed doesn't say so).
+        values = []
+        for t, v in smoothed(MERGE_TOP * ball_mph):
+            if t > ball_ms + 2.0:
+                break
+            if values and values[-1] >= MERGE_FROM * ball_mph and v - values[-1] >= BALL_JUMP_MPH:
+                break
+            values.append(v)
+        how = "merge"
+    if values:
+        out.update(club_mph=max(values), how=how, ball_arrives_ms=arrives)
+    return out
 
 
 # =========================================================================

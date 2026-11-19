@@ -976,7 +976,7 @@ SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "
                    "spin_check", "spin_model_rpm", "contact", "smash_efficiency", "roll_yd",
                    "launch_source", "cam_launch_deg", "cam_dir_deg", "cam_quality", "cam_frames",
                    "ti_launch_deg", "ball_speed_model_mph", "ball_speed_check_mph",
-                   "ti_launch_raw_deg", "ti_dir_raw_deg"]
+                   "ti_launch_raw_deg", "ti_dir_raw_deg", "club_speed_check_mph", "club_speed_how"]
 
 # The highest smash (ball speed / club speed) each kind of club can really
 # produce: a conforming driver tops out near 1.50 (the USGA's COR limit), and
@@ -1023,7 +1023,7 @@ def _log_session(shot, m, f, r):
                f.get("roll"), m.get("launch_source"), m.get("cam_launch"), m.get("cam_dir"),
                m.get("cam_quality"), m.get("cam_frames"), m.get("ti_launch"),
                m.get("ball_speed_model"), m.get("ball_speed_check"), m.get("ti_launch_raw"),
-               m.get("ti_dir_raw")]
+               m.get("ti_dir_raw"), m.get("club_speed_check"), m.get("club_speed_how")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
@@ -1076,8 +1076,15 @@ def _publish(shot, o, r, final, cam=None):
         if o:
             if o["ball_speed"] is not None:
                 m["ball_speed"] = round(o["ball_speed"], 1)
-            if o["club_speed"] is not None:
+            if o["club_speed"] is not None:            # ours (radar_calibration.club_speed_from_readings)
                 m["club_speed"] = round(o["club_speed"], 1)
+                m["club_speed_how"] = o.get("club_speed_how")
+            if o.get("club_speed_check") is not None:  # OpenFlight's, only logged as a check
+                m["club_speed_check"] = round(o["club_speed_check"], 1)
+                if final:
+                    ours = "none" if o["club_speed"] is None else f"{o['club_speed']:.1f} mph"
+                    print(f"Shot {shot}: club speed {ours} (MODUS, {o.get('club_speed_how') or 'not read'}); "
+                          f"check: OpenFlight's club speed {m['club_speed_check']} mph")
         if r:
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:

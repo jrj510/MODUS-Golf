@@ -28,3 +28,7 @@ Thumbs.db
 
 *.pt
 ----------------------------------------------------------------------------------------------
+
+Credits
+
+MODUS-Golf learned its radar processing from OpenFlight (https://github.com/open-flight/openflight, AGPL-3.0). The OPS243 speed radar and the TI radar still run OpenFlight's code. See OPENFLIGHT_CREDITS.md for exactly what comes from OpenFlight, what we learned from it, and what is ours.

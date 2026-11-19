@@ -2,11 +2,13 @@
 Bridges between our kiosk and OpenFlight's radar code.
 
 OPSBridge: the OPS243-A in rolling-buffer mode: ball speed and club speed.
-  The radar driver and its signal processing are OpenFlight's (the one place
-  MODUS keeps OpenFlight); what MODUS does with the readings is ours: the
-  line-of-sight correction (radar_calibration.py, with OpenFlight's
-  correction logged next to it as a check) and the club-speed sanity check
-  (kiosk.py). OpenFlight's spin and carry for the shot are not used: spin,
+  The radar driver and its signal processing (the FFT readings and the ball
+  speed pick) are OpenFlight's (the one place MODUS keeps OpenFlight); what
+  MODUS does with the readings is ours: club speed read from those readings
+  (radar_calibration.club_speed_from_readings, with OpenFlight's own club
+  speed logged next to it as a check), the line-of-sight correction
+  (radar_calibration.py, with OpenFlight's correction logged as a check) and
+  the club-speed sanity check (kiosk.py). OpenFlight's spin and carry for the shot are not used: spin,
   carry, total and smash are all MODUS's own (ballflight.py, kiosk.py).
 IWRBridge: the TI IWR6843LEVM (launch angle). Its angles still come from
   OpenFlight's TI processing, with MODUS's own calibration on top
@@ -42,12 +44,13 @@ import sys
 import threading
 import time
 
-# Our club names (start menu, ballflight.py) -> OpenFlight's ClubType values.
-# OpenFlight needs the real club: the TI ball tracker ignores anything slower
-# than that club class's slowest real ball (radial: wedge 26.5 m/s, 9-6 iron
-# 34, 5 iron and longer 40, driver and woods 50), and the OPS processing
-# handles wedges and their spin differently. Left alone, both radars assume a
-# driver, so wedge and short-iron balls were thrown out by the TI tracker.
+# Our club names (start menu, ballflight.py) -> OpenFlight's club names, for
+# OpenFlight's TI processing, which needs the real club: its ball tracker
+# ignores anything slower than that club class's slowest real ball (radial:
+# wedge 26.5 m/s, 9-6 iron 34, 5 iron and longer 40, driver and woods 50).
+# Left alone it assumes a driver, so wedge and short-iron balls were thrown
+# out. The speed radar no longer needs the club: club speed is read by our
+# own code, which doesn't depend on it.
 OPENFLIGHT_CLUBS = {
     "driver": "driver", "3w": "3-wood", "5w": "5-wood", "hybrid": "3-hybrid",
     "4i": "4-iron", "5i": "5-iron", "6i": "6-iron", "7i": "7-iron", "8i": "8-iron",
@@ -94,22 +97,6 @@ def openflight_club_name(name):
     """OpenFlight's club name for one of ours ('52' -> 'gw', '7i' -> '7-iron')."""
     from ballflight import club_defaults
     return OPENFLIGHT_CLUBS.get(club_defaults(name)[2], "unknown")
-
-
-def openflight_club(name):
-    """OpenFlight's ClubType for one of our club names, or None if this copy of
-    OpenFlight doesn't have one that matches (then nothing is set)."""
-    try:
-        from openflight.clubs import ClubType
-    except ImportError:
-        try:                                  # older OpenFlight layouts
-            from openflight.launch_monitor import ClubType
-        except ImportError:
-            return None
-    try:
-        return ClubType(openflight_club_name(name))
-    except ValueError:
-        return None
 
 
 def _number(v):
@@ -290,10 +277,12 @@ class IWRBridge:
         """Run OpenFlight's TI estimator for one speed-radar shot."""
         result = _empty(None)
         try:
-            # The speed radar's shot carries the club we set on it; fall back
-            # to the start-menu club if it doesn't.
-            club = getattr(shot, "club", None)
-            club = getattr(club, "value", club) or self.club
+            # The club picked on the kiosk (start menu or Club button, kept
+            # current by set_club). The speed radar's shot no longer carries it.
+            club = self.club if self.club and self.club != "unknown" else None
+            if club is None:
+                club = getattr(shot, "club", None)
+                club = getattr(club, "value", club)
             # Raw (uncorrected) OPS speed, exactly as OpenFlight's server
             # passes it: the TI tracker works in radial speed.
             r = self.runtime.process_shot(
@@ -383,9 +372,12 @@ class OPSBridge:
 
     It connects to the radar, keeps its trigger pin set up as an input, collects
     the raw samples after every sound trigger, re-arms the radar, and reads
-    ball speed and club speed (OpenFlight also works out a spin and a carry;
-    MODUS doesn't use them). Only real shots come out: triggers with nothing
-    flying away from the radar (claps) are dropped by OpenFlight's code.
+    ball speed (OpenFlight also works out a club speed, a spin and a carry;
+    MODUS only logs its club speed, as a check). Club speed is ours: read from
+    the FFT readings OpenFlight's processor works out for each recording
+    (radar_calibration.club_speed_from_readings). Only real shots come out:
+    triggers with nothing flying away from the radar (claps) are dropped by
+    OpenFlight's code.
 
     It also keeps track of the camera's trigger pulses (pulsed / outcome), so
     the kiosk can ask, for each camera trigger, whether the radar saw a ball
@@ -448,14 +440,15 @@ class OPSBridge:
                 trig.min_trigger_speed_mph = float(mph)
             if trig is not None and hasattr(trig, "min_trigger_speed_mph"):
                 print(f"Speed trigger fires at {trig.min_trigger_speed_mph:.0f} mph outbound or faster")
-        # Without this OpenFlight assumes a driver for every shot. Its shots
-        # also carry this club to the TI radar (see OPENFLIGHT_CLUBS).
-        self.club = openflight_club(getattr(args, "club", None))
-        if self.club is not None and hasattr(self.monitor, "set_club"):
-            self.monitor.set_club(self.club)
-            club_text = f"club {self.club.value}"
-        else:
-            club_text = "club NOT set: this OpenFlight copy has no matching club setting"
+        # Club speed is ours, read from the radar's FFT readings, which
+        # OpenFlight's processor works out for every recording: keep the latest
+        # one for _on_shot. OpenFlight isn't told the club: only its own club
+        # speed (kept as a check) and its spin and carry (not used) need it.
+        self.ksps = args.ops_ksps
+        self._processed = None
+        self.reads_club = self._keep_readings()
+        club_text = ("club speed: MODUS" if self.reads_club else
+                     "club speed: NONE (this OpenFlight copy doesn't share its readings)")
         # OpenFlight reports every trigger it has finished with (diagnostic
         # callback), not only shots: accepted=False means nothing usable flew
         # away. Copies without that callback only report shots.
@@ -472,6 +465,44 @@ class OPSBridge:
                   f"from before the trigger" if isinstance(segs, int) and self.trigger_type == "sound" else "")
         print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
               f"{self.trigger_type} trigger, {club_text}{window})")
+
+    def _keep_readings(self):
+        """Have OpenFlight's processor hand us each recording's FFT readings
+        (its ProcessedCapture) as well. False if this copy has no processor
+        to wrap."""
+        proc = getattr(self.monitor, "processor", None)
+        run = getattr(proc, "process_capture", None)
+        if not callable(run):
+            return False
+
+        def process_and_keep(*a, **kw):
+            out = run(*a, **kw)
+            with self.lock:
+                self._processed = out
+            return out
+        proc.process_capture = process_and_keep
+        return True
+
+    def _club_speed(self, shot):
+        """Our club speed for this shot: (mph or None, "jump"/"merge"/None).
+        Read from the FFT readings of the recording the shot came from."""
+        with self.lock:
+            p, self._processed = self._processed, None
+        timeline = getattr(p, "timeline", None)
+        if timeline is None:
+            return None, None
+        ball, ball_ms = getattr(p, "ball_speed_mph", None), getattr(p, "ball_timestamp_ms", None)
+        if ball is None or abs(ball - (getattr(shot, "ball_speed_mph", None) or 0.0)) > 0.05:
+            return None, None          # not this shot's recording
+        try:
+            from radar_calibration import club_speed_from_readings
+            readings = [(r.timestamp_ms, r.speed_mph, r.magnitude) for r in timeline.readings
+                        if getattr(r, "is_outbound", getattr(r, "direction", "outbound") == "outbound")]
+            res = club_speed_from_readings(readings, ball, ball_ms, self.ksps)
+            return res["club_mph"], res["how"]
+        except Exception as e:
+            print(f"Club speed from the radar's readings failed ({type(e).__name__}: {e})")
+            return None, None
 
     def _on_trigger(self):
         for listener in list(self.trigger_listeners):
@@ -531,27 +562,24 @@ class OPSBridge:
 
     def _on_shot(self, shot):
         now = time.monotonic()
+        club, how = self._club_speed(shot)
+        try:
+            shot.modus_club_speed_mph, shot.modus_club_how = club, how
+        except Exception:
+            pass
         with self.lock:
             self.shots = [s for s in self.shots if now - s[0] < 120] + [(now, shot)]
             self._answer(now, "ball", {"ball_mph": getattr(shot, "ball_speed_mph", None)})
+        of_club = getattr(shot, "club_speed_mph", None)
         print(f"[{time.strftime('%H:%M:%S')}] Speed radar shot: "
               f"ball {getattr(shot, 'ball_speed_mph', None)} mph, "
-              f"club {getattr(shot, 'club_speed_mph', None)} mph")
+              f"club {'none' if club is None else f'{club:.1f}'} mph (MODUS{', ' + how if how else ''}); "
+              f"OpenFlight's club {'none' if of_club is None else f'{of_club:.1f}'} mph (check)")
         for listener in list(self.listeners):
             try:
                 listener(shot, now)
             except Exception as e:
                 print(f"Speed radar listener error: {e}")
-
-    def set_club(self, name):
-        """Club changed from the kiosk's Club button: the radar's processing
-        reads club speed differently for wedges, so it is told straight away."""
-        club = openflight_club(name)
-        if club is not None and hasattr(self.monitor, "set_club"):
-            self.monitor.set_club(club)
-            self.club = club
-            return club.value
-        return None
 
     def result_for(self, shot_time, wait_s=35.0):
         """The speed radar's shot that goes with a camera shot, or None.
@@ -564,7 +592,9 @@ class OPSBridge:
             if near:
                 shot = min(near, key=lambda s: abs(s[0] - shot_time))[1]
                 return {"ball_speed": getattr(shot, "ball_speed_mph", None),
-                        "club_speed": getattr(shot, "club_speed_mph", None),
+                        "club_speed": getattr(shot, "modus_club_speed_mph", None),      # ours
+                        "club_speed_how": getattr(shot, "modus_club_how", None),
+                        "club_speed_check": getattr(shot, "club_speed_mph", None),      # OpenFlight's
                         "shot": shot}
             if time.monotonic() > deadline:
                 return None
