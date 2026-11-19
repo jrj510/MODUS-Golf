@@ -198,6 +198,15 @@ while true; do
         sleep 2
         continue
     fi
+    if [ "$CHOICE" = "shutdown" ]; then
+        # Shut Down button on the start menu: the same as typing sudo shutdown now.
+        echo "$(date '+%F %T') Shut Down pressed on the start menu" >> logs/launcher.log
+        sudo -n shutdown -h now 2>>logs/launcher.log || systemctl poweroff 2>>logs/launcher.log
+        sleep 20     # powering off; if it didn't, the menu comes back and says so
+        OPEN=""      # the menu's browser window is still open and reloads itself
+        NOTE="Couldn't shut down from the menu (see logs/launcher.log). Use sudo shutdown now over SSH."
+        continue
+    fi
     OPEN=""
     NOTE=""
     MODE=${CHOICE%%,*}

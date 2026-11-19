@@ -10,7 +10,9 @@ used is remembered here and passed on.
 
     python3 camera/launcher.py [--open-browser]
 
-Prints one line when Start is pressed, for example "outside,7i" or "inside,driver".
+Prints one line when Start is pressed, for example "outside,7i" or "inside,driver",
+or "shutdown" when Shut Down is pressed and confirmed (start_kiosk.sh then turns
+the Pi off, same as sudo shutdown now).
 Modes (both use the camera + sound trigger and the slow-motion shot preview):
        outside = Outside Golf: slower camera so a battery pack lasts and doesn't cut out;
        inside  = Inside Golf: fastest camera, needs a wall outlet.
@@ -59,8 +61,20 @@ h1 span{color:#2ecc71}
 #hint{color:#6f7c89;font-size:2.1vh;text-align:center}
 #clubnow{color:#8a97a5;font-size:2.6vh;text-align:center}#clubnow b{color:#2ecc71}
 #msg{color:#f0b429;font-size:2.4vh;text-align:center;min-height:2.6vh}
+.top{display:flex;align-items:center;justify-content:space-between}
+#off{background:transparent;color:#e5675b;border:2px solid #5a2a26;border-radius:12px;font:inherit;
+  font-size:2.6vh;font-weight:700;padding:1.2vh 2vw}
+#confirm{position:fixed;inset:0;background:rgba(5,8,11,.92);display:none;flex-direction:column;
+  align-items:center;justify-content:center;gap:3vh;padding:4vh 6vw;text-align:center}
+#confirm.on{display:flex}
+#confirm h2{margin:0;font-size:5vh}
+#confirm p{margin:0;color:#8a97a5;font-size:2.8vh;max-width:70vw}
+#confirm .btns{display:flex;gap:3vw}
+#confirm button{font:inherit;font-size:3.8vh;font-weight:800;border:0;border-radius:16px;padding:2.2vh 4vw}
+#yes{background:#e5675b;color:#2a0a07}
+#no{background:#1e2733;color:#eef3f7}
 </style></head><body>
-<h1>MODUS <span>Golf</span></h1>
+<div class="top"><h1>MODUS <span>Golf</span></h1><button id="off">Shut Down</button></div>
 <div class="grow">
   <div class="lbl">Where are you playing?</div>
   <div class="row modes">
@@ -74,6 +88,9 @@ h1 span{color:#2ecc71}
 <div id="msg"></div>
 <button id="start">Start</button>
 <div id="hint">Phone: join WiFi <b>MODUS</b>, open <b>10.42.0.1:8000</b></div>
+<div id="confirm"><h2 id="ctitle">Shut down MODUS?</h2>
+  <p id="ctext">The Pi turns off. To start it again, unplug the power and plug it back in.</p>
+  <div class="btns" id="cbtns"><button id="no">Cancel</button><button id="yes">Shut Down</button></div></div>
 <script>
 const CLUBS=__CLUBS__, LABEL=__LABELS__;
 let mode=__MODE__, club=__CLUB__;
@@ -92,6 +109,19 @@ $('start').onclick=async()=>{
 async function waitForKiosk(){
   try{const r=await fetch('/state',{cache:'no-store'});if(r.ok){location.href='/';return;}}catch(e){}
   setTimeout(waitForKiosk,1000);
+}
+$('off').onclick=()=>$('confirm').classList.add('on');
+$('no').onclick=()=>$('confirm').classList.remove('on');
+$('yes').onclick=async()=>{
+  $('cbtns').style.display='none';
+  $('ctitle').textContent='Shutting down...';
+  $('ctext').textContent='Wait until the screen goes dark, then a few more seconds before unplugging the power.';
+  try{await fetch('/shutdown',{method:'POST'});}catch(e){}
+  setTimeout(menuBack,25000);
+};
+async function menuBack(){     // the menu only comes back if the shutdown didn't happen
+  try{const r=await fetch('/ping',{cache:'no-store'});if(r.ok){location.reload();return;}}catch(e){}
+  setTimeout(menuBack,2000);
 }
 draw();
 __NOTE__
@@ -197,7 +227,10 @@ def main():
         def do_POST(self):
             path, _, query = self.path.partition("?")
             q = dict(x.split("=", 1) for x in query.split("&") if "=" in x)
-            if path == "/start":
+            if path == "/shutdown":
+                choice.update(shutdown=True)
+                done.set()
+            elif path == "/start":
                 m = q.get("mode") if q.get("mode") in MODES else "outside"
                 c = q.get("club") if q.get("club") in CLUBS else load_settings()[1]   # set in the kiosk
                 choice.update(mode=m, club=c)
@@ -217,6 +250,9 @@ def main():
     done.wait()
     server.shutdown()
     server.server_close()
+    if choice.get("shutdown"):
+        print("shutdown")
+        return
     save_settings(choice["mode"], choice["club"])
     print(f"{choice['mode']},{choice['club']}")
 
