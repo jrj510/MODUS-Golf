@@ -1,19 +1,18 @@
 r"""Retrain the camera's golf ball model on pictures from OUR camera.
 
 The ball model is the neural network that puts the box on the ball in the
-camera picture. It started as OpenFlight's model (a YOLO11n detector trained
-on OpenFlight's camera set-up; OpenFlight, AGPL-3.0). This script uses that
-model as the starting point and retrains it on our own pictures (our camera,
-mat, grass, sun, shade, low light), so it is conformed to our system. Starting
-from it rather than from nothing means far fewer pictures are needed. All the
-logic around the model (hitting zone, confirming a ball, the small-ball
-finder, motion trigger, shadow guard, exposure) is our own code.
-(Starting instead from Ultralytics' generic yolo11n.pt also works:
---base yolo11n.pt, but it needs about twice the pictures.)
+camera picture. It is the only one the kiosk uses. It is trained on our own
+pictures (our camera, mat, grass, sun, shade, low light), starting from
+Ultralytics' generic YOLO11n detector (yolo11n.pt, which knows shapes in
+general but nothing about golf balls; Ultralytics downloads it the first
+time). All the logic around the model (hitting zone, confirming a ball, the
+small-ball finder, motion trigger, shadow guard, cover guard) is our own code.
 
-On the Pi, the original OpenFlight model can stay as the backup
-(BACKUP_MODEL in start_kiosk.sh): it looks when ours finds nothing, and the
-log says when it found a ball ours missed.
+(Our first model, the one in use until this is run again, was retrained
+from OpenFlight's golf ball model, which needed fewer pictures. Starting from
+the generic yolo11n.pt leaves nothing of OpenFlight's in the model, but
+needs about twice the pictures: 300+ ball pictures. Use --compare with the
+model in use to check the new one is at least as good before switching.)
 
 1. Collect pictures on the Pi: Camera view -> "Save frame".
      - With the green box on the ball: saves the ball (in different spots,
@@ -28,12 +27,11 @@ log says when it found a ball ours missed.
      scp -r modusgolf@modus.local:~/MODUS-Golf/shots/training C:\Users\<you>\Documents\modus_training
    Look through review/: if a picture's green box is NOT on the ball, delete
    the files with the same name start from images/ and labels/.
-3. Get the starting model (once):
-     scp modusgolf@modus.local:~/openflight/models/golf_ball_yolo11n_new.pt .
+3. (The starting point, yolo11n.pt, downloads by itself the first time.)
 4. Train (needs: pip install ultralytics):
      python camera/train_ball_model.py --data C:\Users\<you>\Documents\modus_training
-   Add --compare golf_ball_yolo11n_new.pt to score the original model on the
-   same held-back pictures, to show what the retraining gained.
+   Add --compare <the model in use, its best.pt> to score it on the same
+   held-back pictures, to show whether the new one is better.
    A laptop CPU takes roughly 10-30 minutes; a GPU a few minutes.
    The copies of the pictures and the results go in a work folder next to
    the training folder (e.g. Documents\modus_training_work, or --work): not
@@ -45,9 +43,8 @@ log says when it found a ball ours missed.
 5. Copy the new model to the Pi and use it:
      ssh modusgolf@modus.local mkdir -p MODUS-Golf/models
      scp <work folder>/runs/ball/weights/best_256.onnx modusgolf@modus.local:~/MODUS-Golf/models/modus_ball_256.onnx
-   (the script prints these with the model's real path at the end), then in
-   start_kiosk.sh set  MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
-   (the original model becomes the backup automatically) and restart.
+   (the script prints these with the model's real path at the end); start_kiosk.sh
+   uses MODEL=~/MODUS-Golf/models/modus_ball_256.onnx. Restart the kiosk.
 """
 import argparse
 import os
@@ -114,12 +111,11 @@ def main():
     p.add_argument("--data", action="append", default=None,
                    help="a training folder copied from the Pi (give it more than once to combine; "
                         "default: training)")
-    p.add_argument("--base", default="golf_ball_yolo11n_new.pt",
-                   help="model to start from: OpenFlight's golf ball model (copy it from the Pi, see the "
-                        "top of this file), or yolo11n.pt (Ultralytics' generic one, needs more pictures)")
+    p.add_argument("--base", default="yolo11n.pt",
+                   help="model to start from: yolo11n.pt (Ultralytics' generic detector, downloaded "
+                        "the first time), or one of our earlier models to keep training it")
     p.add_argument("--compare", default=None,
-                   help="another model (e.g. OpenFlight's golf_ball_yolo11n_new.pt) to score on the "
-                        "same held-back pictures")
+                   help="another model (e.g. the one in use) to score on the same held-back pictures")
     p.add_argument("--min-balls", type=int, default=None,
                    help="refuse to train with fewer ball pictures than this (default 150, or 300 from "
                         "the generic yolo11n.pt; 0 = train anyway)")
@@ -145,8 +141,7 @@ def main():
     if args.trained and not os.path.exists(args.trained):
         sys.exit(f"{args.trained} not found")
     if not args.trained and not os.path.exists(args.base) and not generic:
-        sys.exit(f"{args.base} not found. Copy it from the Pi (see the top of this file), "
-                 "or use --base yolo11n.pt")
+        sys.exit(f"{args.base} not found (leave --base out to start from the generic yolo11n.pt)")
     min_balls = args.min_balls if args.min_balls is not None else (300 if generic else 150)
     epochs = args.epochs or (150 if generic else 80)
 

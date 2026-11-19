@@ -60,16 +60,17 @@ from ultralytics import YOLO
 
 from ballflight import club_defaults, estimate_spin, shot_flight
 from range_page import RANGE_PAGE
-from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, BallModels, Shared, View, ZoneWatch, add_blob_args,
+from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, ZoneWatch, add_blob_args,
                           convert_area, count_training, fits_zoomed, save_training_frame, set_view,
                           sharpness, zoom_on,
                           add_exposure_args, add_tracking_args, camera_thread, detect_ball,
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready, _ball_diff,
                           ball_still_there, cover_guard_on, describe_check, save_check, shadow_guard_on,
-                          _top_change)
+                          _top_change, zone_place)
+from launch_camera import FocalCalibration, camera_launch, fuse_launch, track_flight
 
-DEFAULT_MODEL = "~/openflight/models/golf_ball_yolo11n_new_256.onnx"
+DEFAULT_MODEL = "~/MODUS-Golf/models/modus_ball_256.onnx"   # our own ball model (train_ball_model.py)
 # Clubs for the Club button (same list and names as the start menu, launcher.py).
 CLUBS = ["driver", "3w", "hybrid", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
 CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "5i": "5 Iron",
@@ -616,7 +617,10 @@ class Kiosk:
         if a is None:          # no zone: zoom on the middle of the picture
             self.want_view = zoom_on(self.view.to_sensor(WIDTH / 2, HEIGHT / 2))
         elif fits_zoomed(a, self.view):
-            self.want_view = zoom_on(self.view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2))
+            place = self.args.cam_zone_place if self.args.cam_launch == "on" else 0.5
+            zh = (a[3] - a[1]) * self.view.scale
+            self.want_view = zoom_on(self.view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2),
+                                     zone_place((0, 0, 0, zh), place))
         else:
             print("Hitting zone is too big to zoom in on (it must be under about half the "
                   "picture's width and height); staying wide")
@@ -968,8 +972,11 @@ def save_metrics(folder, metrics, radar_log):
 SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "smash",
                    "launch_deg", "launch_measured", "spin_rpm_used", "carry_yd", "apex_yd",
                    "ti_radar", "ball_speed_raw_mph", "launch_dir_deg",
-                   "club_speed_hidden_mph", "spin_measured_rpm", "total_yd", "landing_angle_deg",
-                   "spin_source", "spin_model_rpm", "contact", "smash_efficiency", "roll_yd"]
+                   "club_speed_hidden_mph", "total_yd", "landing_angle_deg",
+                   "spin_check", "spin_model_rpm", "contact", "smash_efficiency", "roll_yd",
+                   "launch_source", "cam_launch_deg", "cam_dir_deg", "cam_quality", "cam_frames",
+                   "ti_launch_deg", "ball_speed_model_mph", "ball_speed_check_mph",
+                   "ti_launch_raw_deg", "ti_dir_raw_deg"]
 
 # The highest smash (ball speed / club speed) each kind of club can really
 # produce: a conforming driver tops out near 1.50 (the USGA's COR limit), and
@@ -1010,10 +1017,13 @@ def _log_session(shot, m, f, r):
                f.get("carry"), f.get("apex"),
                (r or {}).get("error") or (r or {}).get("quality") or "",
                m.get("ball_speed_raw"), m.get("launch_dir"),
-               m.get("club_speed_rejected"), m.get("spin_raw"),
+               m.get("club_speed_rejected"),
                f.get("total"), f.get("landing_angle"),
-               m.get("spin_source"), m.get("spin_model"), m.get("contact"), m.get("contact_eff"),
-               f.get("roll")]
+               m.get("spin_check"), m.get("spin_model"), m.get("contact"), m.get("contact_eff"),
+               f.get("roll"), m.get("launch_source"), m.get("cam_launch"), m.get("cam_dir"),
+               m.get("cam_quality"), m.get("cam_frames"), m.get("ti_launch"),
+               m.get("ball_speed_model"), m.get("ball_speed_check"), m.get("ti_launch_raw"),
+               m.get("ti_dir_raw")]
         with open(path, "a") as out:
             if new:
                 out.write(",".join(SESSION_COLUMNS) + "\n")
@@ -1022,40 +1032,41 @@ def _log_session(shot, m, f, r):
         print(f"Could not write the session log: {e}")
 
 
-# Tour-average ball speed per club (TrackMan 2024), to spot a shot far off a
-# full swing with that club (topped, half swing), where the spin estimate's
-# assumptions (a full swing's spin loft) don't hold.
-TOUR_BALL_MPH = {"driver": 171, "3w": 162, "5w": 156, "hybrid": 149, "4i": 140, "5i": 135,
-                 "6i": 130, "7i": 123, "8i": 118, "9i": 112}
-
-
-def _spin_model_doubt(club, m, est, launch):
-    """Why our spin estimate may be off for this shot, or None."""
-    name = club_defaults(club)[2]
-    if est.get("contact") == "poor":
-        return f"poor contact: smash {m.get('smash')} for a {CLUB_LABEL.get(club, club)}"
-    tour = TOUR_BALL_MPH.get(name)
-    if tour and m.get("ball_speed") and m["ball_speed"] < 0.4 * tour:
-        return f"ball speed {m['ball_speed']} mph is far below a full swing with this club"
-    if launch is not None and abs(launch - club_defaults(name)[0]) > 10:
-        return f"launch {launch} deg is far from this club's usual {club_defaults(name)[0]}"
-    return None
-
-
-def _spin_possible(club, rpm):
-    """Whether a club can produce this spin at all (a broad band round its
-    typical value), so a stray radar reading isn't used as the backup."""
-    typical = club_defaults(club)[1]
-    return 0.35 * typical <= rpm <= 1.5 * typical
-
-
 def _mph_text(v):
     return f"{v:.0f} mph" if isinstance(v, (int, float)) else "speed unknown"
 
 
-def _publish(shot, o, r, final):
-    """Show the radar numbers for this shot. Returns the metrics, or None if a
-    newer shot has replaced it."""
+def _pi5_pin_factory():
+    """gpiozero can't pick its pin factory by itself on a Pi 5 (its lgpio
+    factory looks for the GPIO chip with a missing import and gives up), so
+    give it the chip that carries the 40-pin header. Left alone if a factory
+    is already in place (the speed radar's code may have set one)."""
+    try:
+        from gpiozero import Device
+        if Device.pin_factory is None:
+            from gpiozero.pins.lgpio import LGPIOFactory
+            Device.pin_factory = LGPIOFactory(chip=4 if os.path.exists("/dev/gpiochip4") else 0)
+    except Exception as e:
+        print(f"GPIO pin factory: {type(e).__name__}: {e} (gpiozero picks its own)")
+
+
+def _corrected_speed(raw, launch, direction=None, club=None):
+    """The speed radar's reading corrected for its line of sight: (mph, our
+    model's mph before the trim, or None with OpenFlight's correction).
+    Raw back when there is no correction."""
+    cal = getattr(K, "ops_cal", None)
+    if cal is not None:
+        model, _ = cal.model(raw, launch, direction, club)
+        return cal.scale * model + cal.offset, model
+    fix = getattr(K, "correct_speed", None)
+    if fix is not None:
+        return fix(raw, launch), None
+    return raw, None
+
+
+def _publish(shot, o, r, final, cam=None):
+    """Show the radar numbers (and the camera's launch angle, cam) for this
+    shot. Returns the metrics, or None if a newer shot has replaced it."""
     with K.lock:
         if K.shot != shot:
             return None
@@ -1067,32 +1078,61 @@ def _publish(shot, o, r, final):
                 m["ball_speed"] = round(o["ball_speed"], 1)
             if o["club_speed"] is not None:
                 m["club_speed"] = round(o["club_speed"], 1)
-            if o.get("spin_raw") is not None:
-                m["spin_raw"] = round(o["spin_raw"])     # OpenFlight's radar spin: logged, used as a backup
         if r:
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:
                 m["launch_angle"] = round(r["launch_angle"], 1)
             if r.get("launch_dir") is not None:
                 m["launch_dir"] = round(r["launch_dir"], 1)
-            if m.get("ball_speed") is None and r["ball_speed"] is not None:
-                m["ball_speed"] = round(r["ball_speed"], 1)
-        fix = getattr(K, "correct_speed", None)
-        if fix is not None and o and o.get("ball_speed"):
+            for src, dst in (("launch_angle_raw", "ti_launch_raw"), ("launch_dir_raw", "ti_dir_raw")):
+                if r.get(src) is not None:          # before our TI calibration's trim
+                    m[dst] = round(r[src], 1)
+        if cam is not None or (r and r.get("launch_angle") is not None):
+            # Launch angle: the camera's and the TI radar's, weighted by how
+            # sure each is (launch_camera.fuse_launch); either alone if only
+            # one has it (the camera's only when it rates its fit good/fair).
+            ti = None
+            if r and r.get("launch_angle") is not None:
+                ti = {"launch_angle": r["launch_angle"], "sigma_angle": 1.5}
+                m["ti_launch"] = round(r["launch_angle"], 1)
+            angle, source, _ = fuse_launch(cam, ti)
+            if angle is not None:
+                m["launch_angle"], m["launch_source"] = round(angle, 1), source
+            if cam:
+                m["cam_launch"], m["cam_dir"] = cam.get("launch_angle"), cam.get("launch_dir")
+                m["cam_quality"], m["cam_frames"] = cam.get("quality"), cam.get("frames")
+                if cam.get("quality") in ("good", "fair") and cam.get("launch_dir") is not None \
+                        and not (r and r.get("launch_dir") is not None):
+                    m["launch_dir"] = round(cam["launch_dir"], 1)
+        if o and o.get("ball_speed") and (getattr(K, "ops_cal", None) is not None
+                                          or getattr(K, "correct_speed", None) is not None):
             # The OPS reads the ball's speed along its line of sight, which is
             # low for a ball climbing away at the launch angle. Correct it with
-            # the TI's angle, or the club's typical launch until that arrives
-            # (as OpenFlight does). Always from the raw reading, so the second
-            # pass with the TI angle replaces the first.
+            # the measured angle and direction, or the club's typical launch
+            # until one arrives. Always from the raw reading, so a later pass
+            # with a measured angle replaces the first.
             raw = float(o["ball_speed"])
             launch = m.get("launch_angle")
             if launch is None:
                 launch = club_defaults(club)[0]
             try:
-                m["ball_speed"] = round(fix(raw, launch), 1)
+                speed, model = _corrected_speed(raw, launch, m.get("launch_dir"), club)
+                m["ball_speed"] = round(speed, 1)
                 m["ball_speed_raw"] = round(raw, 1)
+                if model is not None:
+                    m["ball_speed_model"] = round(model, 1)
             except Exception as e:
                 print(f"Shot {shot}: ball-speed correction failed ({type(e).__name__}: {e})")
+            check = getattr(K, "speed_check", None)
+            if check is not None and m.get("ball_speed_raw") is not None:
+                try:
+                    m["ball_speed_check"] = round(check(raw, launch), 1)
+                    if final:
+                        print(f"Shot {shot}: ball speed {m['ball_speed']} mph (radar read {raw:.1f}, "
+                              f"launch {launch:g} deg); check: OpenFlight's correction gives "
+                              f"{m['ball_speed_check']} mph ({m['ball_speed'] - m['ball_speed_check']:+.1f})")
+                except Exception as e:
+                    print(f"Shot {shot}: OpenFlight's speed check failed ({type(e).__name__}: {e})")
         if m.get("ball_speed") and m.get("club_speed"):
             smash = m["ball_speed"] / m["club_speed"]
             top = smash_max(club)
@@ -1108,55 +1148,132 @@ def _publish(shot, o, r, final):
                 m["club_speed_rejected"] = m.pop("club_speed")
                 m.pop("smash", None)
         if m.get("ball_speed"):
-            # Spin: our own estimate from the club, its speed (when the club
-            # reading is trusted) and the contact, plus the launch angle when
-            # it is measured (ballflight.estimate_spin). OpenFlight's radar
-            # spin is the backup: used only when our estimate is doubtful for
-            # this shot and the radar's reading is one OpenFlight trusts and
-            # one that club can produce.
-            launch = m.get("launch_angle")          # measured (TI radar) or None
+            # Spin: our own estimate (ballflight.estimate_spin) from the club,
+            # its speed (when the club reading is trusted), the contact and the
+            # launch angle when it is measured, checked against what is
+            # physically possible for that club's loft, this ball speed, club
+            # speed and launch (ballflight.spin_limits). No radar spin is used.
+            launch = m.get("launch_angle")          # measured (camera / TI radar) or None
             est = estimate_spin(club, m["ball_speed"], m.get("club_speed"), launch)
-            radar_spin = round(o["spin"]) if (o and o.get("spin") is not None) else None
-            doubt = _spin_model_doubt(club, m, est, launch)
-            use_radar = doubt is not None and radar_spin is not None and _spin_possible(club, radar_spin)
-            m["spin"] = radar_spin if use_radar else est["spin"]
-            m["spin_source"] = "radar" if use_radar else "model"
-            m["spin_model"], m["contact"], m["contact_eff"] = est["spin"], est["contact"], est["efficiency"]
-            if final and radar_spin is not None:
-                print(f"Shot {shot}: spin check: our estimate {est['spin']} rpm, OpenFlight's radar "
-                      f"{radar_spin} rpm ({(radar_spin - est['spin']) / max(est['spin'], 1):+.0%})"
-                      + (f"; using the radar's ({doubt})" if use_radar else
-                         (f"; our estimate is doubtful ({doubt}) but the radar's reading isn't one a "
-                          f"{CLUB_LABEL.get(club, club)} makes" if doubt else "")))
-            elif final and doubt:
-                print(f"Shot {shot}: spin estimate is doubtful ({doubt}) and the radar has no trusted spin")
-            # Fly the ball: measured ball speed, the TI radar's launch angle when
-            # there is one (otherwise the club's typical launch), and that spin.
-            f = shot_flight(m["ball_speed"], club, launch_angle=launch,
-                            spin=m["spin"] if use_radar else None, club_speed=m.get("club_speed"))
+            m["spin"] = est["spin"]
+            m["spin_model"], m["spin_check"] = est["model_spin"], est["check"]
+            m["contact"], m["contact_eff"] = est["contact"], est["efficiency"]
+            if final and est["check"] != "ok":
+                lo, hi = est["limits"]
+                print(f"Shot {shot}: spin {est['model_spin']} rpm isn't possible for this shot "
+                      f"(possible {lo}-{hi} rpm"
+                      + (f"; {est['note']}" if est["note"] else "") + f"): {est['check']} to {est['spin']} rpm")
+            elif final and est["note"]:
+                print(f"Shot {shot}: spin check: {est['note']}")
+            # Fly the ball (ballflight: our flight model): the ball speed, the
+            # measured launch angle when there is one (otherwise the club's
+            # typical launch), and that spin. Total = carry + our roll estimate
+            # (ballflight.rollout: landing speed, angle and spin; flat fairway).
+            f = shot_flight(m["ball_speed"], club, launch_angle=launch, spin=m["spin"],
+                            club_speed=m.get("club_speed"))
             m["carry"] = round(f["carry"])
-            # Total: carry plus our roll estimate (ballflight.rollout: landing
-            # speed, angle and spin; flat average fairway).
             m["total"] = round(f["total"])
-            m["estimated"] = (["carry", "total"] if ("launch" in f["assumed"] or not use_radar) else []) \
-                + ([] if use_radar else ["spin"])
+            m["estimated"] = ["carry", "total", "spin"]
             m["flight"] = f
             if final and not any(h.get("shot") == shot for h in K.history):
                 K.history = (K.history + [dict(f, shot=shot, at=time.strftime("%H:%M:%S"))])[-30:]
                 _log_session(shot, m, f, r)
-        elif o and o.get("carry"):
-            m["carry"] = round(o["carry"])
         K.metrics = m
         K.rev += 1
         return m
 
 
-def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
+def _camera_track(cam):
+    """Find the ball in the shot's frames (launch_camera.track_flight), at low
+    priority. None if it can't run."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)   # this thread only
+    except (AttributeError, OSError):
+        pass
+    try:
+        win = cam["window"]
+        frames = [f[2] for f in win]
+        ns = [f[1] for f in win]
+        if all(ns):
+            times = [(n - ns[0]) / 1e9 for n in ns]            # the sensor's own frame times
+        else:
+            times = [f[0] - win[0][0] for f in win]
+        return track_flight(frames, times, cam["box"], cam["scale"], cam["origin"])
+    except Exception as e:
+        print(f"Camera launch: tracking failed ({type(e).__name__}: {e})")
+        return None
+
+
+def _camera_solve(shot, cam, track, o):
+    """The camera's launch angle for a shot, with the speed radar's ball speed
+    (corrected for the angle, which the camera then refines) when there is one."""
+    args = K.args
+    focal = K.cam_calib.focal if getattr(K, "cam_calib", None) else None
+    common = dict(view_scale=cam["scale"], view_origin=cam["origin"], focal_px=focal,
+                  height_m=args.cam_height_m, ball_height_m=getattr(args, "iwr_ball_height_m", 0.021),
+                  exposure_s=cam["exposure_s"])
+    try:
+        if o and o.get("ball_speed"):
+            raw = float(o["ball_speed"])
+            club = getattr(args, "club", "52")
+            guess, side = club_defaults(club)[0], None
+            res = None
+            for _ in range(2):
+                mph = _corrected_speed(raw, guess, side, club)[0]
+                res = camera_launch(None, None, cam["box"], speed_mps=mph * 0.44704, speed_sigma=1.0,
+                                    track=dict(track), **common)
+                if res.get("launch_angle") is None or res.get("quality") not in ("good", "fair"):
+                    break
+                guess, side = res["launch_angle"], res.get("launch_dir")
+        else:
+            res = camera_launch(None, None, cam["box"], track=dict(track), **common)
+    except Exception as e:
+        print(f"Shot {shot}: camera launch failed ({type(e).__name__}: {e})")
+        return None
+    if res.get("launch_angle") is not None and res.get("quality") in ("good", "fair"):
+        print(f"Shot {shot}: camera launch angle {res['launch_angle']} deg, direction "
+              f"{res['launch_dir']:+.1f} deg (right +), from {res['frames']} frames, {res['quality']} "
+              f"(+/-{res['sigma_angle']:.1f} deg)")
+    else:
+        why = res.get("why") or (f"fit rated {res.get('quality')} (+/-{res.get('sigma_angle')} deg, "
+                                 f"{res.get('frames')} frames)")
+        print(f"Shot {shot}: no camera launch angle ({why})")
+    return res
+
+
+def _save_camera_launch(folder, cam, track, res):
+    """With recording on: what the camera launch angle saw, next to the shot's
+    frames, so it can be run again and tuned on real shots."""
+    if not folder:
+        return
+    try:
+        os.makedirs(folder, exist_ok=True)
+        keep = {k: v for k, v in (res or {}).items() if k not in ("track",)}
+        with open(os.path.join(folder, "camera_launch.json"), "w") as fh:
+            json.dump({"rest_box": cam["box"], "view_scale": cam["scale"], "view_origin": list(cam["origin"]),
+                       "exposure_s": cam["exposure_s"],
+                       "focal_px": K.cam_calib.focal if getattr(K, "cam_calib", None) else None,
+                       "cam_height_m": K.args.cam_height_m, "cam_ball_m": K.args.cam_ball_m,
+                       "track": {k: v for k, v in (track or {}).items() if k != "obs"},
+                       "obs": (track or {}).get("obs"), "result": keep}, fh, indent=1, default=str)
+    except Exception as e:
+        print(f"Camera launch: could not save its notes ({type(e).__name__}: {e})")
+
+
+def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log, cam=None):
     """Put the radars' answers for this shot on screen: the speed radar's
     numbers as soon as they arrive (a few seconds), then the TI radar's launch
-    angle when its capture has been processed (several seconds more)."""
+    angle when its capture has been processed (several seconds more). With
+    the camera launch angle (cam), the ball is found in the frames first, and
+    the angle is worked out once the speed radar's ball speed is in."""
+    track = _camera_track(cam) if cam is not None else None
+    if track is not None and track.get("rest_source") == "frames" and getattr(K, "cam_calib", None):
+        K.cam_calib.add(track["rest"][2], kind="shot")      # the ball's width from its empty spot
     o = ops.result_for(trigger_time, wait_s=12.0) if ops is not None else None
-    m = _publish(shot, o, None, final=(iwr is None or o is None))
+    cam_res = _camera_solve(shot, cam, track, o) if track is not None else None
+    if cam is not None:
+        _save_camera_launch(folder, cam, track, cam_res)
+    m = _publish(shot, o, None, final=(iwr is None or o is None), cam=cam_res)
     if m is None:
         return                          # a newer shot has already replaced this one
     r = None
@@ -1166,7 +1283,7 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
         r = iwr.result_for(trigger_time, wait_s=30.0) if o else {
             "launch_angle": None, "launch_dir": None, "ball_speed": None, "quality": None,
             "error": "no speed-radar shot to guide the TI radar"}
-        m = _publish(shot, o, r, final=True)
+        m = _publish(shot, o, r, final=True, cam=cam_res)
         if m is None:
             return
     save_metrics(folder if K.folder == folder else None, m, radar_log)
@@ -1176,7 +1293,7 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log):
     if r and r["error"]:
         print(f"Shot {shot}: TI radar gave no angle ({r['error']})")
     shown = {x: m[x] for x in ("ball_speed", "ball_speed_raw", "club_speed", "smash",
-                               "launch_angle", "launch_dir", "spin", "carry")
+                               "launch_angle", "launch_source", "launch_dir", "spin", "carry")
              if m.get(x) is not None}
     print(f"Shot {shot}: {shown if shown else 'no radar numbers'}")
 
@@ -1217,10 +1334,8 @@ def open_browser(url):
 
 def main():
     p = argparse.ArgumentParser(description="Launch monitor kiosk")
-    p.add_argument("--model", default=DEFAULT_MODEL, help="path to the golf ball model")
-    p.add_argument("--backup-model", default="",
-                   help="a second ball model used when --model finds nothing (e.g. OpenFlight's, "
-                        "once --model is our own); empty = none")
+    p.add_argument("--model", default=DEFAULT_MODEL,
+                   help="our golf ball model (camera/train_ball_model.py makes it)")
     p.add_argument("--imgsz", type=int, default=256)
     p.add_argument("--conf", type=float, default=0.5, help="minimum model confidence, 0-1")
     p.add_argument("--tile", type=int, default=256,
@@ -1253,6 +1368,18 @@ def main():
     p.add_argument("--verify-seconds", type=float, default=1.5,
                    help="after a camera trigger, watch the ball's spot this long: if the ball shows up "
                         "again (a club tapped down behind it) it was no shot. 0 = off")
+    p.add_argument("--cam-launch", choices=("on", "off"), default="off",
+                   help="on = launch angle and direction from the camera: the ball's first frames of "
+                        "flight, through the pixel-to-angle grid (launch_camera.py), with the speed "
+                        "radar's ball speed; combined with the TI radar's angle when it has one")
+    p.add_argument("--cam-height-m", type=float, default=0.10,
+                   help="camera lens height above the ground, metres (measure it)")
+    p.add_argument("--cam-ball-m", type=float, default=1.575,
+                   help="distance along the ground from the camera lens to the ball, metres (measure "
+                        "it; with the ball's size this calibrates the lens)")
+    p.add_argument("--cam-zone-place", type=float, default=0.75,
+                   help="with --cam-launch, the zoomed picture puts the hitting zone this far down "
+                        "(0.5 = middle) so the ball has room to climb in it for more frames")
     p.add_argument("--radar-confirm", choices=("on", "off"), default="off",
                    help="on: a camera trigger only counts as a shot if the speed radar saw a ball fly away "
                         "(OpenFlight reports each trigger it drops); with nothing flying away (a shadow, "
@@ -1310,7 +1437,8 @@ def main():
     p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
                    help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
     p.add_argument("--iwr", action="store_true",
-                   help="use the TI radar through OpenFlight's code for launch angle")
+                   help="use the TI radar for launch angle (its angles come from OpenFlight's TI "
+                        "processing until ours replaces it; start_kiosk.sh: TI_RADAR, off for now)")
     p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
     p.add_argument("--iwr-port", default="/dev/ttyUSB0")
     p.add_argument("--iwr-config", default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg")
@@ -1331,7 +1459,17 @@ def main():
     p.add_argument("--iwr-azimuth-offset-deg", type=float, default=0.0,
                    help="degrees the radars point right of the target line (left = negative)")
     p.add_argument("--no-speed-correction", action="store_true",
-                   help="show the speed radar's raw ball speed (no launch-angle cosine correction)")
+                   help="show the speed radar's raw ball speed (same as --speed-correction off)")
+    p.add_argument("--speed-correction", default="modus", choices=("modus", "openflight", "off"),
+                   help="ball speed from the speed radar's line-of-sight reading: modus = our own model + "
+                        "this unit's trim (camera/radar_calibration.py; OpenFlight's correction is logged "
+                        "as a check), openflight = OpenFlight's correction, off = the raw reading")
+    p.add_argument("--speed-net", default="off", choices=("on", "off"),
+                   help="on = shots go into a net at --iwr-net-m (inside): the speed radar loses the "
+                        "ball there")
+    p.add_argument("--ops-window-ms", type=float, default=90.0,
+                   help="how much of the ball's flight the speed radar's buffer holds, ms (start_kiosk.sh: "
+                        "~90 ms with the camera trigger)")
     p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
     p.add_argument("--gate-gpio", type=int, default=17,
                    help="GPIO number the sound sensor's GATE is wired to (17 = pin 11, 26 = pin 37)")
@@ -1353,6 +1491,10 @@ def main():
     args.triggers = {t.strip() for t in args.trigger.split(",") if t.strip()}
     if args.pre is None:
         args.pre = 0.25 if args.recording == "full" else 0.03
+    if args.cam_launch == "on":
+        # The impact and a few still frames before it (the trigger fires
+        # ~4 frames after the ball leaves): the background for finding the ball.
+        args.pre = max(args.pre, 0.12)
     if args.post is None:
         args.post = 0.5 if args.recording == "full" else 0.15
     args.swing_test = args.no_ball
@@ -1392,21 +1534,17 @@ def main():
 
     model = None
     if not args.swing_test:
-        print("Loading model...")
-        model = YOLO(os.path.expanduser(args.model), task="detect")
-        model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
-        backup = os.path.expanduser(args.backup_model or "")
-        if backup and os.path.realpath(backup) != os.path.realpath(os.path.expanduser(args.model)):
-            if os.path.exists(backup):
-                spare = YOLO(backup, task="detect")
-                spare.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
-                model = BallModels(model, spare, backup_name=f"backup model ({os.path.basename(backup)})")
-                print(f"Ball model: {os.path.basename(args.model)}, with {os.path.basename(backup)} as "
-                      f"the backup when it finds nothing")
-            else:
-                print(f"Backup ball model {backup} not found; using {os.path.basename(args.model)} alone")
+        path = os.path.expanduser(args.model or "")
+        if path and os.path.exists(path):
+            print("Loading model...")
+            model = YOLO(path, task="detect")
+            model.predict(np.zeros((HEIGHT, WIDTH, 3), np.uint8), imgsz=args.imgsz, verbose=False)
+            print(f"Ball model: {os.path.basename(path)}")
         else:
-            print(f"Ball model: {os.path.basename(args.model)}")
+            # Only our own model is used (no other model to fall back on): until
+            # it is copied to the Pi, the small-ball finder looks for the ball alone.
+            print(f"Ball model {path or '(none given)'} not found: the camera looks for the ball with "
+                  f"its small-ball finder only. Copy our model there (camera/train_ball_model.py says how)")
 
     # Exposure is picked by measuring the area around the ball (see
     # ExposureControl in shot_capture.py); --exposure fixes it by hand.
@@ -1414,13 +1552,18 @@ def main():
     # ball twice as wide). Start in the view the zone was saved in, or zoom on
     # it now (--zoom auto/on); the zone is converted to whichever view is used.
     view = View()
+    place = args.cam_zone_place if args.cam_launch == "on" else 0.5
     if args.sensor == "full" and args.zoom != "off":
-        if saved_view.zoomed:
+        if saved_view.zoomed and place == 0.5:
             view = saved_view
         elif args.search_area:
             a = [int(float(v)) for v in args.search_area.split(",")]
-            if fits_zoomed(a, saved_view) or args.zoom == "on":
-                view = zoom_on(saved_view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2))
+            if saved_view.zoomed or fits_zoomed(a, saved_view) or args.zoom == "on":
+                zh = (a[3] - a[1]) * saved_view.scale                # the zone's height when zoomed
+                view = zoom_on(saved_view.to_sensor((a[0] + a[2]) / 2, (a[1] + a[3]) / 2),
+                               zone_place((0, 0, 0, zh), place))
+        elif saved_view.zoomed:
+            view = saved_view
         elif args.zoom == "on":
             view = zoom_on((640, 400))
     light_file = os.path.join(args.out, LIGHT_FILE)
@@ -1487,18 +1630,34 @@ def main():
 
     bridge = start_ti() if args.iwr else None
     K.ops, K.bridge = ops, bridge       # so the Club button can update both radars
-    # Ball-speed cosine correction, as in OpenFlight: with the TI radar's
-    # launch angle, or the club's typical launch while there is none (also
-    # when the TI radar is not running at all). The raw reading is kept in
-    # the session log.
-    K.correct_speed = None
-    if ops is not None and not args.no_speed_correction:
+    # Ball speed: the speed radar reads along its line of sight, low for a
+    # ball climbing away. Corrected with the launch angle (camera / TI radar,
+    # or the club's typical launch until one arrives). Ours by default
+    # (radar_calibration.OPSCalibration: our line-of-sight model + this
+    # unit's trim); OpenFlight's correction is worked out too and logged
+    # next to it as a check, and used instead if ours can't load. The raw
+    # reading is kept in the session log.
+    K.correct_speed = K.speed_check = K.ops_cal = None
+    speed_mode = "off" if args.no_speed_correction else args.speed_correction
+    if ops is not None and speed_mode != "off":
         from iwr_bridge import ops_speed_corrector
-        K.correct_speed = ops_speed_corrector(args)
-        if K.correct_speed is not None:
-            src = ("the TI radar's angle, or the club's typical launch until it arrives"
-                   if bridge is not None else "the club's typical launch (no TI radar)")
-            print(f"Ball speed: corrected for launch angle using {src}; raw OPS reading kept in the log")
+        openflight_fix = ops_speed_corrector(args)
+        if speed_mode == "modus":
+            try:
+                from radar_calibration import OPSCalibration
+                K.ops_cal = OPSCalibration.from_args(args)
+                K.speed_check = openflight_fix
+            except Exception as e:
+                print(f"MODUS speed calibration not available ({type(e).__name__}: {e}); "
+                      f"using OpenFlight's correction")
+        if K.ops_cal is None:
+            K.correct_speed = openflight_fix
+        if K.ops_cal is not None or K.correct_speed is not None:
+            src = ("the camera's or TI radar's angle, or the club's typical launch until one arrives"
+                   if (bridge is not None or args.cam_launch == "on") else "the club's typical launch")
+            how = (K.ops_cal.text() + (" (OpenFlight's correction logged as a check)" if K.speed_check else "")
+                   if K.ops_cal is not None else "OpenFlight's cosine correction")
+            print(f"Ball speed: {how}; launch angle from {src}; raw OPS reading kept in the log")
     if args.trigger_out_gpio:
         # The camera replaces the sound detector: when it sees the ball leave
         # (motion trigger) it sends the same 3.3 V pulse the detector's GATE did,
@@ -1506,11 +1665,7 @@ def main():
         # with the sound trigger. Made after the radars, which pick the Pi 5 pin
         # factory first.
         try:
-            try:
-                from openflight.gpio_factory import ensure_lgpio_pin_factory
-                ensure_lgpio_pin_factory()
-            except Exception:
-                pass
+            _pi5_pin_factory()
             from gpiozero import DigitalOutputDevice    # (plain OutputDevice has no blink())
             trig_out = DigitalOutputDevice(args.trigger_out_gpio, active_high=True, initial_value=False)
 
@@ -1529,6 +1684,17 @@ def main():
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
     print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"
                               if shadow_guard_on(args) else "off"))
+    K.cam_calib = None
+    if args.cam_launch == "on":
+        K.cam_calib = FocalCalibration(os.path.join(args.out, "camera_grid.json"), args.cam_ball_m)
+        f = K.cam_calib.focal
+        print("Camera launch angle: on (" + (
+            (f"lens calibrated: focal length {f:.0f} px, "
+             + {"grid": "from a grid", "shots": f"from {len(K.cam_calib.shot_samples)} shots",
+                "balls": f"from {len(K.cam_calib.samples)} balls"}.get(K.cam_calib.source, ""))
+            if f else f"lens not calibrated yet: it calibrates itself from the next balls at rest "
+                      f"{args.cam_ball_m:g} m from the lens")
+            + f"; lens {args.cam_height_m:g} m up; {args.pre * 1000:.0f} ms of frames kept before each trigger)")
     print("Cover guard: " + (f"on (the club set down at address is not taken for a shot; Ready kept while "
                              f"the ball is covered, up to {args.hold_seconds:g} s)"
                              if cover_guard_on(args) else "off"))
@@ -1946,7 +2112,12 @@ def main():
                                  radar.window(trigger_time - 0.6, time.monotonic())]
                     print("Radar readings (ms from trigger, mph):",
                           radar_log if radar_log else "none")
-                if bridge is not None or ops is not None:
+                cam_job = None
+                if args.cam_launch == "on" and trk.get("box") is not None and window:
+                    cam_job = {"window": window, "box": [float(v) for v in trk["box"]],
+                               "scale": K.view.scale, "origin": K.view.origin,
+                               "exposure_s": float((sh.exposure or (0, 0))[0] or 0) / 1e6}
+                if bridge is not None or ops is not None or cam_job is not None:
                     metrics["radar_pending"] = True
                 save_metrics(folder, metrics, radar_log)
                 with K.lock:
@@ -1954,10 +2125,10 @@ def main():
                     K.video = "pending" if (folder and replay) else "none"
                     K.shot += 1
                     K.rev += 1
-                if bridge is not None or ops is not None:
+                if bridge is not None or ops is not None or cam_job is not None:
                     job = threading.Thread(target=add_radar_results,
                                            args=(bridge, ops, K.shot, trigger_time, folder, radar_log),
-                                           daemon=True)
+                                           kwargs={"cam": cam_job}, daemon=True)
                     job.start()
                     K.radar_jobs = [j for j in K.radar_jobs if j.is_alive()] + [job]
                     settle_until = time.monotonic() + args.settle_seconds
@@ -2021,6 +2192,8 @@ def main():
                     b = trk["box"]
                     if zone is not None:          # set-down spots must be about this size
                         zone.ball_d = ((b[2] - b[0]) + (b[3] - b[1])) / 2.0
+                    if K.cam_calib is not None:   # a ball at rest at the measured distance: the lens
+                        K.cam_calib.add(((b[2] - b[0]) + (b[3] - b[1])) / 2.0 * K.view.scale)
                     # Logged so a box on the wrong spot can be traced to its finder.
                     print(f"[{time.strftime('%H:%M:%S')}] READY on {trk['box']} "
                           f"(found by {trk.get('found_by') or trk.get('source')}; now {trk.get('source')}), "

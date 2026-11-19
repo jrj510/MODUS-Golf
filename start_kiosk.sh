@@ -47,6 +47,16 @@ INSIDE_RADAR_CONFIRM=off
 # of each decision go to shots/shadow_checks/ (..._covered.png). off = as before.
 OUTSIDE_COVER_GUARD=on
 INSIDE_COVER_GUARD=on
+# Ball speed (camera/radar_calibration.py): the speed radar reads the ball's
+# speed along its line of sight, low for a ball climbing away, so it is
+# corrected with the launch angle. modus = our own line-of-sight model plus
+# this unit's trim (fitted against another launch monitor with
+# camera/calibrate_radars.py ops; OpenFlight's correction is still worked out
+# and logged as a check); openflight = OpenFlight's correction; off = raw.
+SPEED_CORRECTION=modus
+# Inside the ball goes into the net at NET_M and the speed radar loses it there.
+INSIDE_NET=on
+OUTSIDE_NET=off
 OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera or the sound detector);
                    # speed = the OPS triggers itself (picked up noise here, so not used)
 TRIGGER_OUT_GPIO=21 # camera trigger: GPIO21 (pin 40) pulses OPS J3-3 and GPIO20 (pin 38) when the
@@ -82,7 +92,17 @@ OUTSIDE_RECORDING=off   # no shot replay or saved frames: lightest load for the 
 #   gives about 250 fps instead, but no zoom.
 INSIDE_SENSOR=full
 INSIDE_FPS=144
-INSIDE_RECORDING=off    # no shot replay (full = slow-motion Shot Preview with Save/Delete)
+INSIDE_RECORDING=flight # flight = the frames of the ball leaving are saved per shot (no replay),
+                        # for tuning the camera launch angle; set back to off once it's tuned.
+                        # (off = nothing saved; full = slow-motion Shot Preview with Save/Delete)
+# Camera launch angle: the ball's first frames of flight, through the
+# pixel-to-angle grid, with the speed radar's ball speed (camera/launch_camera.py).
+# Combined with the TI radar's angle when the TI is back. The lens calibrates
+# itself from balls at rest; for that, measure these two once:
+INSIDE_CAM_LAUNCH=on
+OUTSIDE_CAM_LAUNCH=off
+CAM_HEIGHT_M=0.10      # camera lens height above the ground, metres
+CAM_BALL_M=1.575       # camera lens to the ball, along the ground, metres
 # Sleep. The moon button (top right) puts the box to sleep: camera and TI
 # radar off, screen dark; tap the screen to wake (about 3-5 s, the TI radar is
 # set up again). It also sleeps by itself after this many minutes of Looking
@@ -97,11 +117,14 @@ SCREEN_BRIGHTNESS=max   # set when this script starts (every boot): max = the sc
                         # a number = that level (see /sys/class/backlight/*/max_brightness),
                         # empty = leave it as it is
 MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
-                   # ball model: ours, retrained on our camera's pictures (camera/train_ball_model.py).
-                   # Empty, or the file not on the Pi yet = OpenFlight's model.
-BACKUP_MODEL=~/openflight/models/golf_ball_yolo11n_new_256.onnx
-                   # used only once MODEL is ours: looks when ours finds nothing (at most once a
-                   # second) and the log says when it found a ball ours missed. Empty = no backup.
+                   # ball model: ours, trained on our camera's pictures (camera/train_ball_model.py).
+                   # The only one used: if the file isn't on the Pi, the start menu says so and the
+                   # camera looks for the ball with its small-ball finder only.
+# TI radar (launch angle). Off while the board is out: launch angle and
+# direction then come from our camera alone (inside mode). on = start it; its
+# angles come from OpenFlight's TI processing (camera/iwr_bridge.py) with our
+# calibration on top, until we replace that processing with our own.
+TI_RADAR=off
 TI_DUMPS=0         # 1 = also save the TI radar's raw captures (for debugging angles only)
 export OPENBLAS_NUM_THREADS=1   # math on one core at a time instead of all four at once
 export PYTHONUNBUFFERED=1       # the kiosk's messages reach its log straight away
@@ -167,6 +190,9 @@ OPEN="--open-browser"   # open the full-screen browser the first time only
 NOTE=""
 while true; do
     screen_on
+    if [ -z "$NOTE" ] && [ ! -f "${MODEL/#\~/$HOME}" ]; then
+        NOTE="Ball model not found on the Pi ($MODEL): copy it there (camera/train_ball_model.py says how). Until then the camera only uses its small-ball finder."
+    fi
     CHOICE=$(python3 camera/launcher.py $OPEN --note "$NOTE" 2>>logs/launcher.log)
     if [ -z "$CHOICE" ]; then
         sleep 2
@@ -179,25 +205,19 @@ while true; do
     case "$MODE" in
         inside) CAM_SENSOR=$INSIDE_SENSOR;  FPS=$INSIDE_FPS;  RECORDING=$INSIDE_RECORDING
                 SLEEP_MIN=$INSIDE_SLEEP_MINUTES; OPS_PRE=$INSIDE_OPS_PRE_TRIGGER
-                GUARD=$INSIDE_SHADOW_GUARD; CONFIRM=$INSIDE_RADAR_CONFIRM; COVER=$INSIDE_COVER_GUARD ;;
+                GUARD=$INSIDE_SHADOW_GUARD; CONFIRM=$INSIDE_RADAR_CONFIRM; COVER=$INSIDE_COVER_GUARD
+                CAMLAUNCH=$INSIDE_CAM_LAUNCH; SPEEDNET=$INSIDE_NET ;;
         *)      MODE=outside
                 CAM_SENSOR=$OUTSIDE_SENSOR; FPS=$OUTSIDE_FPS; RECORDING=$OUTSIDE_RECORDING
                 SLEEP_MIN=$OUTSIDE_SLEEP_MINUTES; OPS_PRE=$OUTSIDE_OPS_PRE_TRIGGER
-                GUARD=$OUTSIDE_SHADOW_GUARD; CONFIRM=$OUTSIDE_RADAR_CONFIRM; COVER=$OUTSIDE_COVER_GUARD ;;
+                GUARD=$OUTSIDE_SHADOW_GUARD; CONFIRM=$OUTSIDE_RADAR_CONFIRM; COVER=$OUTSIDE_COVER_GUARD
+                CAMLAUNCH=$OUTSIDE_CAM_LAUNCH; SPEEDNET=$OUTSIDE_NET ;;
     esac
     DETECT="'--trigger','motion,sound','--blob'"
-    MODELARG=""
-    USE_MODEL=$MODEL
-    MODELNOTE=""
-    if [ -n "$USE_MODEL" ] && [ ! -f "$USE_MODEL" ]; then
-        MODELNOTE="Ball model $USE_MODEL not found on the Pi: using OpenFlight's model"
-        USE_MODEL=""
-    fi
-    if [ -n "$USE_MODEL" ]; then
-        MODELARG="'--model','$USE_MODEL',"
-        if [ -n "$BACKUP_MODEL" ]; then
-            MODELARG="$MODELARG'--backup-model','$BACKUP_MODEL',"
-        fi
+    MODELARG="'--model','$MODEL',"
+    IWRARG=""
+    if [ "$TI_RADAR" = "on" ]; then
+        IWRARG="'--iwr',"
     fi
     DUMPS=""
     if [ "$TI_DUMPS" = "1" ]; then
@@ -208,10 +228,9 @@ while true; do
         OPSPREARG="'--ops-pre-trigger','$OPS_PRE',"
     fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
-    [ -n "$MODELNOTE" ] && echo "$MODELNOTE" >> "$LOG"
     reset_ops
-    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off}, cover guard ${COVER:-off} (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py','--iwr','--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--cover-guard','${COVER:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off}, cover guard ${COVER:-off}, camera launch ${CAMLAUNCH:-off}, ball speed ${SPEED_CORRECTION:-modus} (net ${SPEEDNET:-off}), TI radar ${TI_RADAR:-off} (log: $LOG)"
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py',$IWRARG'--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--cover-guard','${COVER:-off}','--cam-launch','${CAMLAUNCH:-off}','--cam-height-m','$CAM_HEIGHT_M','--cam-ball-m','$CAM_BALL_M','--speed-correction','${SPEED_CORRECTION:-modus}','--speed-net','${SPEEDNET:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"

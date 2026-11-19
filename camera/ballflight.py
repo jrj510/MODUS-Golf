@@ -12,6 +12,8 @@ TrackMan's published averages say they do:
 
 Also here, all MODUS's own models (no OpenFlight code or formulas):
   - estimate_spin(): backspin from the club, its speed and the contact;
+  - spin_limits(): the only check on that spin: what is physically possible
+    for the club's loft, the ball speed, club speed and launch angle;
   - contact quality: how well the ball was struck for that club;
   - rollout(): how far the ball runs after landing.
 How each was built and checked is written above it.
@@ -131,12 +133,15 @@ def estimate_spin(club, ball_mph, club_mph=None, launch_deg=None):
     club_mph: a trusted club speed, or None (then it is ball speed divided by
     the club's solid-strike smash, and contact is taken as solid).
     launch_deg: a MEASURED launch angle, or None.
-    Returns {"spin", "spin_loft", "club_mph", "contact", "efficiency",
-    "inputs"}; spin is None without a ball speed."""
+    Returns {"spin" (checked), "model_spin" (before the check), "limits"
+    (lowest, highest possible: spin_limits), "check" (ok / raised / lowered),
+    "note", "spin_loft", "club_mph", "contact", "efficiency", "inputs"};
+    spin is None without a ball speed."""
     name = club_defaults(club)[2]
     loft, spin_loft, smash_ref = CLUB_PHYS[name]
     out = {"spin": None, "spin_loft": None, "club_mph": None, "contact": None,
-           "efficiency": None, "inputs": []}
+           "efficiency": None, "inputs": [], "model_spin": None, "limits": None, "note": None,
+           "check": None}
     if not ball_mph or float(ball_mph) <= 0:
         return out
     ball_mph = float(ball_mph)
@@ -158,9 +163,81 @@ def estimate_spin(club, ball_mph, club_mph=None, launch_deg=None):
         out["inputs"].append("launch angle")
     spin = SPIN_K * v_club * MPH * math.sin(math.radians(spin_loft)) * factor
     spin = min(spin, SPIN_MAX)      # (a wrong club picked for a fast shot)
-    out.update(spin=round(spin), spin_loft=round(spin_loft, 1), club_mph=round(v_club, 1),
-               contact=contact, efficiency=eff)
+    # The only check: is this spin physically possible for this club's loft,
+    # this ball speed, club speed and launch angle (spin_limits)? If not, it
+    # is brought to the nearest possible value.
+    lim = spin_limits(name, ball_mph, club_mph if contact is not None else None, launch_deg)
+    checked = min(max(spin, lim["low"]), lim["high"])
+    out.update(spin=round(checked), spin_loft=round(spin_loft, 1), club_mph=round(v_club, 1),
+               contact=contact, efficiency=eff, model_spin=round(spin),
+               limits=(round(lim["low"]), round(lim["high"])), note=lim["note"],
+               check="ok" if checked == spin else ("raised" if checked > spin else "lowered"))
     return out
+
+
+# --- Spin: what is physically possible ----------------------------------------
+#
+# Our spin estimate above is checked against what the shot could physically
+# have, from the same physics: spin = K * Vclub * sin(spin loft), where spin
+# loft = dynamic loft - attack angle, and nothing else:
+#   - club loft (from the club picked): the face at impact (dynamic loft) is
+#     between 0.65 x the club's loft (hands well ahead, a punch shot) and the
+#     loft + 8 deg (hands behind, flipped);
+#   - launch angle, when measured: the ball leaves at 0.6-0.95 of the dynamic
+#     loft (lower share for the lofted clubs, whose ball slides up the face),
+#     so the launch pins the dynamic loft down. A launch that doesn't fit the
+#     club at all (a topped or skied shot, or the wrong club picked) is said
+#     so, and the launch decides;
+#   - attack angle: irons and wedges -8 to +2 deg (down into the ball), woods
+#     -5 to +6 deg (a teed driver can hit up);
+#   - club speed: the trusted reading +/- 3%, or when there is none, what the
+#     ball speed allows: ball speed / (the club's solid smash + 4%) up to
+#     ball speed / 0.8 (the worst mishit we still count);
+#   - contact: a mishit keeps 60-105% of a solid strike's spin.
+# The lowest and highest spin those allow are the limits. They are wide on
+# purpose: this only catches impossible numbers (a topped iron can't spin
+# like a full one), it doesn't second-guess the estimate.
+
+DYN_LOFT_SHARE_MIN, DYN_LOFT_PLUS = 0.65, 8.0
+LAUNCH_SHARE = (0.60, 0.95)
+ATTACK_IRON, ATTACK_WOOD = (-8.0, 2.0), (-5.0, 6.0)
+SMASH_WORST, SMASH_MARGIN, CLUB_TOL = 0.80, 1.04, 0.03
+CONTACT_SPIN = (0.60, 1.05)
+WOODS = ("driver", "3w", "5w")
+
+
+def spin_limits(club, ball_mph, club_mph=None, launch_deg=None):
+    """The lowest and highest backspin (rpm) physically possible for this
+    shot (see above). club_mph: a trusted club speed or None; launch_deg: a
+    MEASURED launch angle or None. Returns {"low", "high", "spin_loft"
+    (lowest, highest deg), "dynamic_loft", "club_mph" (lowest, highest),
+    "fits" (the launch fits the club), "note"}."""
+    name = club_defaults(club)[2]
+    loft, _, smash_ref = CLUB_PHYS[name]
+    ball_mph = max(float(ball_mph or 0.0), 0.1)
+    d_lo, d_hi = DYN_LOFT_SHARE_MIN * loft, loft + DYN_LOFT_PLUS
+    fits, note = True, None
+    if launch_deg is not None and float(launch_deg) > 0.5:
+        la = float(launch_deg)
+        l_lo, l_hi = la / LAUNCH_SHARE[1], la / LAUNCH_SHARE[0]
+        if l_lo > d_hi or l_hi < d_lo:
+            fits = False
+            note = (f"launch {la:g} deg doesn't fit a {name} ({loft:g} deg loft): a topped or skied "
+                    f"shot, or the wrong club picked; the launch decides")
+            d_lo, d_hi = l_lo, l_hi
+        else:
+            d_lo, d_hi = max(d_lo, l_lo), min(d_hi, l_hi)
+    a_lo, a_hi = ATTACK_WOOD if name in WOODS else ATTACK_IRON
+    s_lo, s_hi = max(d_lo - a_hi, 1.0), min(d_hi - a_lo, 89.0)
+    if club_mph:
+        v_lo, v_hi = float(club_mph) * (1 - CLUB_TOL), float(club_mph) * (1 + CLUB_TOL)
+    else:
+        v_lo, v_hi = ball_mph / (smash_ref * SMASH_MARGIN), ball_mph / SMASH_WORST
+    low = SPIN_K * v_lo * MPH * math.sin(math.radians(s_lo)) * CONTACT_SPIN[0]
+    high = SPIN_K * v_hi * MPH * math.sin(math.radians(s_hi)) * CONTACT_SPIN[1]
+    return {"low": low, "high": max(min(high, SPIN_MAX), low), "spin_loft": (round(s_lo, 1), round(s_hi, 1)),
+            "dynamic_loft": (round(d_lo, 1), round(d_hi, 1)), "club_mph": (round(v_lo, 1), round(v_hi, 1)),
+            "fits": fits, "note": note}
 
 
 # --- Rollout ------------------------------------------------------------------

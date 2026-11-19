@@ -1,10 +1,20 @@
 """
 Bridges between our kiosk and OpenFlight's radar code.
 
-IWRBridge: the TI IWR6843LEVM (launch angle).
-OPSBridge: the OPS243-A in rolling-buffer mode (ball speed, club speed, spin).
-Both are driven by one shot trigger: the sound detector (OpenFlight's default),
-or, with --ops-trigger speed, the OPS243-A's own speed trigger. In speed mode
+OPSBridge: the OPS243-A in rolling-buffer mode: ball speed and club speed.
+  The radar driver and its signal processing are OpenFlight's (the one place
+  MODUS keeps OpenFlight); what MODUS does with the readings is ours: the
+  line-of-sight correction (radar_calibration.py, with OpenFlight's
+  correction logged next to it as a check) and the club-speed sanity check
+  (kiosk.py). OpenFlight's spin and carry for the shot are not used: spin,
+  carry, total and smash are all MODUS's own (ballflight.py, kiosk.py).
+IWRBridge: the TI IWR6843LEVM (launch angle). Its angles still come from
+  OpenFlight's TI processing, with MODUS's own calibration on top
+  (radar_calibration.py); off for now (start_kiosk.sh: TI_RADAR) while the
+  board is out, so launch angle and direction come from our camera alone.
+Both are driven by one shot trigger: our camera's trigger pulse (or a sound
+detector on the same pin), or, with --ops-trigger speed, the OPS243-A's own
+speed trigger. In speed mode
 there is nothing on GPIO17, so each OPS trigger is passed to the TI radar in
 software (IWR6843CaptureMonitor.notify_trigger) and to the camera.
 
@@ -141,39 +151,13 @@ def read_measurement(m):
     return out
 
 
-def spin_trusted(shot):
-    """Whether OpenFlight trusts this shot's measured spin enough to show it.
-
-    OpenFlight reports every spin it computes, but marks how far to trust it:
-    a reading stuck at either end of its search range found nothing real, and
-    one with a confidence below SPIN_CONFIDENCE_RELIABLE (0.6) is diagnostic
-    only (OpenFlight's own carry then uses the club's typical spin instead).
-    Its "ungated multitaper" spin is always below that level. Older copies of
-    OpenFlight without these marks: only readings at the ends of the old search
-    range (about 1,500 and 11,000 rpm) are left out."""
-    spin = getattr(shot, "spin_rpm", None)
-    if spin is None:
-        return False
-    if getattr(shot, "spin_at_lower_rail", False) or getattr(shot, "spin_at_upper_rail", False):
-        return False
-    confidence = getattr(shot, "spin_confidence", None)
-    if confidence is not None:
-        try:
-            from openflight.launch_monitor import SPIN_CONFIDENCE_RELIABLE as reliable
-        except Exception:
-            reliable = 0.6
-        try:
-            return float(confidence) >= reliable
-        except (TypeError, ValueError):
-            return False
-    try:
-        return 1600.0 < float(spin) < 10900.0
-    except (TypeError, ValueError):
-        return False
-
-
 def ops_speed_corrector(args):
     """OpenFlight's ball-speed cosine correction for our geometry, or None.
+
+    MODUS uses its own correction now (radar_calibration.OPSCalibration);
+    this one is worked out next to it on every shot and logged as a check,
+    and is used instead only if ours can't load or --speed-correction
+    openflight is given.
 
     The OPS243 reads the ball's speed along its line of sight. The ball leaves
     upward at the launch angle while the radar sits low behind it, so the
@@ -211,11 +195,22 @@ class IWRBridge:
         config = path(args.iwr_config)
         tx_order = tx_order_from_config(config)
 
-        # Same as OpenFlight's server: start from the reference calibration,
-        # then apply our mounting geometry. Tilt is the antenna face leaning
-        # back from vertical (boresight pointing up), positive = up. Heights are
-        # both from the same floor/ground surface.
-        cal = Calibration.load(path(args.iwr_cal))
+        # The array calibration: ours for this board (radar_calibration,
+        # shots/ti_calibration.json, from calibrate_radars.py ti-array) once it
+        # has been made; until then OpenFlight's reference board, its
+        # "validated starting point". Then our mounting geometry. Tilt is the
+        # antenna face leaning back from vertical (boresight pointing up),
+        # positive = up. Heights are both from the same floor/ground surface.
+        self.ti_cal = None
+        cal = None
+        try:
+            from radar_calibration import TICalibration
+            self.ti_cal = TICalibration.from_args(args)
+            cal = self.ti_cal.openflight_calibration(Calibration)
+        except Exception as e:
+            print(f"MODUS TI calibration not available ({type(e).__name__}: {e})")
+        if cal is None:
+            cal = Calibration.load(path(args.iwr_cal))
         cal.tee_range_m = args.iwr_tee_m
         cal.tee_ball_height_m = args.iwr_ball_height_m
         cal.tilt_rad = math.radians(args.iwr_tilt_deg)
@@ -248,6 +243,8 @@ class IWRBridge:
               f"tilt {args.iwr_tilt_deg} deg up, antenna height {args.iwr_radar_height_m} m, "
               f"ball height {args.iwr_ball_height_m} m, azimuth {azimuth} deg, "
               f"club {self.club}, {tx_order} TX order")
+        if self.ti_cal is not None:
+            print("TI calibration: " + self.ti_cal.text(tilt_deg=args.iwr_tilt_deg))
         self.has_ops = ops is not None
         if self.has_ops:
             ops.listeners.append(self._on_ops_shot)
@@ -314,11 +311,22 @@ class IWRBridge:
             else:
                 print(f"[{time.strftime('%H:%M:%S')}] TI radar details: {_summary(m)}")
                 result.update(read_measurement(m))
+                # The TI's own numbers are kept (for fitting the trim), then our
+                # angle trim for this unit, if one has been fitted (against the
+                # camera or a reference launch monitor).
+                result["launch_angle_raw"] = result["launch_angle"]
+                result["launch_dir_raw"] = result["launch_dir"]
+                trim = ""
+                if self.ti_cal is not None and self.ti_cal.trimmed:
+                    result["launch_angle"], result["launch_dir"] = self.ti_cal.apply(
+                        result["launch_angle"], result["launch_dir"])
+                    if result["launch_angle_raw"] is not None:
+                        trim = f" (TI read {result['launch_angle_raw']:.1f}; MODUS trim)"
                 if result["launch_angle"] is not None:
                     dir_text = ("" if result["launch_dir"] is None
                                 else f", direction {result['launch_dir']:+.1f} deg")
                     print(f"[{time.strftime('%H:%M:%S')}] TI launch angle "
-                          f"{result['launch_angle']:.1f} deg{dir_text} ({result['quality']})")
+                          f"{result['launch_angle']:.1f} deg{dir_text}{trim} ({result['quality']})")
         except Exception as e:
             result["error"] = f"{type(e).__name__}: {e}"
         event["result"] = result
@@ -374,9 +382,10 @@ class OPSBridge:
     """Runs OpenFlight's rolling-buffer monitor for the OPS243-A.
 
     It connects to the radar, keeps its trigger pin set up as an input, collects
-    the raw samples after every sound trigger, re-arms the radar, and works out
-    ball speed, club speed and spin. Only real shots come out: triggers with
-    nothing flying away from the radar (claps) are dropped by OpenFlight's code.
+    the raw samples after every sound trigger, re-arms the radar, and reads
+    ball speed and club speed (OpenFlight also works out a spin and a carry;
+    MODUS doesn't use them). Only real shots come out: triggers with nothing
+    flying away from the radar (claps) are dropped by OpenFlight's code.
 
     It also keeps track of the camera's trigger pulses (pulsed / outcome), so
     the kiosk can ask, for each camera trigger, whether the radar saw a ball
@@ -527,9 +536,7 @@ class OPSBridge:
             self._answer(now, "ball", {"ball_mph": getattr(shot, "ball_speed_mph", None)})
         print(f"[{time.strftime('%H:%M:%S')}] Speed radar shot: "
               f"ball {getattr(shot, 'ball_speed_mph', None)} mph, "
-              f"club {getattr(shot, 'club_speed_mph', None)} mph, "
-              f"spin {getattr(shot, 'spin_rpm', None)} rpm"
-              f"{'' if spin_trusted(shot) else ' (spin not trusted by OpenFlight: not shown)'}")
+              f"club {getattr(shot, 'club_speed_mph', None)} mph")
         for listener in list(self.listeners):
             try:
                 listener(shot, now)
@@ -537,8 +544,8 @@ class OPSBridge:
                 print(f"Speed radar listener error: {e}")
 
     def set_club(self, name):
-        """Club changed from the kiosk's Club button: OpenFlight's processing
-        handles wedges and their spin differently, so it is told straight away."""
+        """Club changed from the kiosk's Club button: the radar's processing
+        reads club speed differently for wedges, so it is told straight away."""
         club = openflight_club(name)
         if club is not None and hasattr(self.monitor, "set_club"):
             self.monitor.set_club(club)
@@ -558,9 +565,6 @@ class OPSBridge:
                 shot = min(near, key=lambda s: abs(s[0] - shot_time))[1]
                 return {"ball_speed": getattr(shot, "ball_speed_mph", None),
                         "club_speed": getattr(shot, "club_speed_mph", None),
-                        "spin": getattr(shot, "spin_rpm", None) if spin_trusted(shot) else None,
-                        "spin_raw": getattr(shot, "spin_rpm", None),
-                        "carry": getattr(shot, "estimated_carry_yards", None),
                         "shot": shot}
             if time.monotonic() > deadline:
                 return None

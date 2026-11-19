@@ -23,7 +23,7 @@ Triggers (any of them fires a capture)
 Live view:  http://modus.local:8000
 
 Run (inside vision-env):
-    python3 shot_capture.py --model ~/openflight/models/golf_ball_yolo11n_new_256.onnx
+    python3 shot_capture.py --model ~/MODUS-Golf/models/modus_ball_256.onnx
     python3 shot_capture.py --model <path> --trigger motion,key
 """
 
@@ -472,11 +472,23 @@ class View:
         return isinstance(other, View) and (self.zoomed, self.origin) == (other.zoomed, other.origin)
 
 
-def zoom_on(center_sensor):
-    """A zoomed view centred (as far as the sensor allows) on a sensor point."""
+def zoom_on(center_sensor, place=0.5):
+    """A zoomed view on a sensor point: centred (as far as the sensor allows),
+    or with place > 0.5 that far down the picture (0.75 = three quarters of the
+    way down), which leaves the ball room to climb in the picture (camera
+    launch angle)."""
     ox = int(min(max(center_sensor[0] - WIDTH / 2, 0), SENSOR_W - WIDTH))
-    oy = int(min(max(center_sensor[1] - HEIGHT / 2, 0), SENSOR_H - HEIGHT))
+    oy = int(min(max(center_sensor[1] - place * HEIGHT, 0), SENSOR_H - HEIGHT))
     return View(True, (ox & ~1, oy & ~1))   # even offsets keep the sensor's pixel order
+
+
+def zone_place(area, place):
+    """How far down a zoomed picture a hitting zone's centre can go and still
+    fit whole (8 px clear of the bottom)."""
+    if not area:
+        return 0.5
+    half = (area[3] - area[1]) / 2.0
+    return max(0.5, min(place, (HEIGHT - 8 - half) / HEIGHT))
 
 
 def convert_area(area, old, new):
@@ -573,43 +585,6 @@ def sharpness(gray, box):
     patch = gray[y0:y1, x0:x1].astype(np.float32)
     lap = cv2.Laplacian(patch, cv2.CV_32F, ksize=3)
     return round(1000.0 * float(lap.std()) / max(float(patch.mean()), 10.0), 1)
-
-
-class BallModels:
-    """Our ball model first, a second model (OpenFlight's) as the backup.
-
-    Used wherever a single model is (it has the same predict()). When ours
-    finds nothing in a picture, the backup looks at it too, at most once every
-    `every` seconds so looking for a ball doesn't cost twice the processor;
-    whatever it finds is used like our model's finds. Each time the backup
-    finds a ball ours missed it is counted and noted in the log (at most every
-    30 s), which shows where our model needs more training pictures."""
-
-    def __init__(self, primary, backup, every=1.0, backup_name="backup model"):
-        self.primary, self.backup, self.every = primary, backup, every
-        self.backup_name = backup_name
-        self.last_backup = -1e9
-        self.rescues, self.looks, self.last_note = 0, 0, -1e9
-
-    def predict(self, img, **kw):
-        r = self.primary.predict(img, **kw)
-        if len(r[0].boxes) or self.backup is None:
-            return r
-        now = time.monotonic()
-        if now - self.last_backup < self.every:
-            return r
-        self.last_backup = now
-        self.looks += 1
-        rb = self.backup.predict(img, **kw)
-        if len(rb[0].boxes):
-            self.rescues += 1
-            if now - self.last_note >= 30.0:
-                self.last_note = now
-                print(f"[{time.strftime('%H:%M:%S')}] Ball model: the {self.backup_name} found a ball ours "
-                      f"missed ({self.rescues} times so far, in {self.looks} backup looks); more "
-                      f"training pictures like this one would help ours")
-            return rb
-        return r
 
 
 TRAINING_DIR = "training"   # inside the shots folder: images/, labels/, review/

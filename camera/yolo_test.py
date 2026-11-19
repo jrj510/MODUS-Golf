@@ -6,7 +6,7 @@ Grabs frames from the OV9281, runs the model on each, prints what it found
 and how long it took, and saves the last annotated frame as yolo_test.jpg.
 
 Run (inside the vision-env environment):
-    python3 yolo_test.py --model ~/openflight/models/golf_ball_yolo11n_new_256.onnx
+    python3 yolo_test.py --model ~/MODUS-Golf/models/modus_ball_256.onnx
 """
 
 import argparse
