@@ -1892,16 +1892,16 @@ def main():
                     time.sleep(0.05)
                     continue
                 peak, d, shaded = verify["still_there"]
-                radar = ("the speed radar was ready again" if ans is not None else
-                         f"no answer from the speed radar in {args.radar_confirm_wait:g} s")
+                radar_note = ("the speed radar was ready again" if ans is not None else
+                              f"no answer from the speed radar in {args.radar_confirm_wait:g} s")
                 if ans is not None and ans[0] == "ball":
-                    radar = (f"the speed radar did see something fly away "
-                             f"({_mph_text((ans[1] or {}).get('ball_mph'))}), not counted as the ball "
-                             f"never left its spot")
+                    radar_note = (f"the speed radar did see something fly away "
+                                  f"({_mph_text((ans[1] or {}).get('ball_mph'))}), not counted as the ball "
+                                  f"never left its spot")
                 print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
                       f"(its spot changed by up to {peak:.1f}, then {d if d is not None else -1:.1f}"
                       + (f"; shadow guard: {describe_check(shaded)}" if shaded else "")
-                      + f"; {radar}); back to Ready")
+                      + f"; {radar_note}); back to Ready")
                 back_to_ready(shaded)
                 verify = None
                 continue

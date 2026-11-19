@@ -19,3 +19,6 @@ Thumbs.db
 dataset_modus/
 runs_modus/
 runs/
+
+# Logs copied from the Pi
+pilogs/
