@@ -93,6 +93,9 @@ OUTSIDE_SLEEP_MINUTES=3   # on the course: sleeps on the walk to the ball
 INSIDE_SLEEP_MINUTES=10
 SLEEP_SCREEN=off   # off = backlight off while asleep (saves the most);
                    # black = backlight on, screen black (only if a tap doesn't wake it with the backlight off)
+SCREEN_BRIGHTNESS=max   # set when this script starts (every boot): max = the screen's brightest,
+                        # a number = that level (see /sys/class/backlight/*/max_brightness),
+                        # empty = leave it as it is
 MODEL=~/MODUS-Golf/models/modus_ball_256.onnx
                    # ball model: ours, retrained on our camera's pictures (camera/train_ball_model.py).
                    # Empty, or the file not on the Pi yet = OpenFlight's model.
@@ -139,7 +142,26 @@ screen_on() {
     rm -f /tmp/modus-backlight
 }
 
+# Screen brightness, once at start (so after every reboot). Waking from sleep
+# puts back whatever level the screen had, so this level stays.
+set_brightness() {
+    [ -n "$SCREEN_BRIGHTNESS" ] || return 0
+    for d in /sys/class/backlight/*; do
+        [ -e "$d/brightness" ] || continue
+        if [ "$SCREEN_BRIGHTNESS" = max ]; then
+            level=$(cat "$d/max_brightness" 2>/dev/null) || continue
+        else
+            level=$SCREEN_BRIGHTNESS
+        fi
+        echo "$level" > "$d/brightness" 2>/dev/null \
+            || echo "$level" | sudo -n tee "$d/brightness" >/dev/null 2>&1 \
+            || echo "Screen brightness: couldn't set $d (needs write access or sudo)" >> logs/launcher.log
+    done
+}
+
 source ~/vision-env/bin/activate
+screen_on
+set_brightness
 
 OPEN="--open-browser"   # open the full-screen browser the first time only
 NOTE=""
