@@ -1,20 +1,29 @@
 """MODUS Golf: the speed radar as the kiosk sees it.
 
-Runs the OPS243-A on our own driver (ops243.py) and decides shots together
-with the camera (shot_fusion.py). Gives the kiosk the calls it uses:
+Runs the OPS243-A in rolling-buffer mode (ops_capture.py: the radar records
+raw I/Q nonstop; on a trigger we read its recording and work out the speeds
+with our own FFT) and decides shots together with the camera
+(shot_fusion.py). Gives the kiosk the calls it uses:
 
     result_for(trigger_time, wait_s) -> {"ball_speed", "club_speed", ...} or None
     outcome(t)                       -> None (not decided yet), ("ball", d) or ("none", d)
     camera_fired(t, source)          -> tell it the camera triggered at t
     stop()
 
-Both sensors trigger on their own:
+What starts a radar recording:
+  * the radar's own speed trigger (something moving away faster than
+    --ops-speed-trigger-mph: the club coming through), so it needs nothing else
+  * the camera's pulse on J3 pin 3 (--trigger-out-gpio), or, without that
+    wire, an S! over the serial line when the camera triggers
+
+Then:
   * camera trigger + radar shot        -> confirmed: the radar's numbers go with
                                           the camera's capture
   * radar shot, camera never triggered -> if the ball is still on its spot,
-                                          rejected; otherwise the camera is told
-                                          to capture (trigger_camera) so the shot
-                                          still gets frames, launch angle, replay
+                                          rejected; otherwise a shot with the
+                                          radar's numbers (the camera's frames
+                                          from back then are gone by the time
+                                          the radar's recording has come over)
   * camera trigger, no radar shot      -> a shot with no speeds (or, with
                                           --radar-confirm on, the kiosk calls
                                           it no shot)
@@ -26,12 +35,12 @@ import threading
 import time
 from typing import Callable, Optional
 
-from ops243 import OPS243, DetectorConfig, ShotDetector
+from ops243 import DetectorConfig
+from ops_capture import Capture, CaptureConfig, RollingBufferRadar, find_shot
 from shot_fusion import FusedShot, FusionConfig, ShotFusion
 
 MATCH_S = 0.02   # a stored result belongs to a trigger time within this
 NEAR_S = 0.5     # ...or, failing that, the radar shot nearest it within this
-                 # (the camera triggered late, after the radar had asked it to)
 
 
 class SpeedRadar:
@@ -40,75 +49,86 @@ class SpeedRadar:
     def __init__(self, args,
                  trigger_camera: Callable[[float], None],
                  ball_present: Callable[[], Optional[bool]] = lambda: None,
-                 radar: Optional[OPS243] = None):
+                 radar: Optional[RollingBufferRadar] = None):
         self.trigger_camera = trigger_camera
         self.cond = threading.Condition()
         self.results: list[tuple[float, Optional[dict], FusedShot]] = []  # (trigger time, numbers, shot)
         self.listeners: list[Callable] = []
         self.trigger_listeners: list[Callable] = []
+        self.hw_pulse = bool(getattr(args, "trigger_out_gpio", 0))
+        self.dcfg = DetectorConfig(min_ball_mph=getattr(args, "ops_min_ball", 40.0))
+        self.last_capture: Optional[Capture] = None
         # Camera-only shots are always passed on; with --radar-confirm on the
         # kiosk turns them down itself (outcome() answers "none").
         self.fusion = ShotFusion(self._on_shot, ball_present=ball_present,
                                  cfg=FusionConfig(camera_only="keep"),
                                  on_reject=lambda why: print(f"[{time.strftime('%H:%M:%S')}] "
                                                              f"Speed radar: not a shot ({why})"))
-        self.detector = ShotDetector(self.fusion.radar_shot,
-                                     DetectorConfig(min_ball_mph=getattr(args, "ops_min_ball", 40.0)))
-        self._last_report = 0.0
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-
-        self.radar = radar or OPS243(args.radar_port, getattr(args, "ops_baud", 57600))
-        print("Speed radar: sending the golf settings (AN-029)")
-        self.radar.configure()
-        self.radar.start(self._on_report)
-        threading.Thread(target=self._tick, daemon=True).start()
+        self.fusion.start()
+        if radar is None:
+            trig = getattr(args, "ops_speed_trigger_mph", 40.0)
+            cfg = CaptureConfig(split=getattr(args, "ops_split", 20),
+                                speed_trigger_mph=trig if trig and trig > 0 else None)
+            print(f"Speed radar: rolling buffer on {args.radar_port} "
+                  f"({cfg.split} of 32 blocks before the trigger; speed trigger "
+                  + (f"{cfg.speed_trigger_mph:g} mph" if cfg.speed_trigger_mph else "off") + ")")
+            radar = RollingBufferRadar(args.radar_port, cfg,
+                                       reset_gpio=getattr(args, "ops_reset_gpio", 23))
+            radar.setup()
+        self.radar = radar
+        self.radar.start(self._on_capture)
 
     # ---- radar side -------------------------------------------------------
-    def _on_report(self, rep, line) -> None:
-        with self._lock:
-            self._last_report = rep.t
-            self.detector.feed(rep)
-
-    def _tick(self) -> None:
-        """Every 20 ms: finish a shot once the radar goes quiet, settle timeouts."""
-        while not self._stop.wait(0.02):
-            with self._lock:
-                if self.detector.pending is not None and time.monotonic() - self._last_report > 0.1:
-                    self.detector.flush()
-            self.fusion.poll()
+    def _on_capture(self, cap: Capture) -> None:
+        self.last_capture = cap
+        took = time.monotonic() - cap.received
+        shot, reports = find_shot(cap, dcfg=DetectorConfig(min_ball_mph=self.dcfg.min_ball_mph))
+        t0 = cap.pi_time(cap.sample_time)
+        t1 = cap.pi_time(cap.sample_time + cap.duration)
+        stamp = time.strftime('%H:%M:%S')
+        if shot is None:
+            fastest = max((r.speeds[0] for r in reports), default=0.0)
+            print(f"[{stamp}] Speed radar: recording read ({took:.1f} s), no ball in it"
+                  + (f" (fastest {fastest:.0f} mph)" if fastest else ""))
+            self.fusion.radar_nothing(t0, t1)
+            return
+        print(f"[{stamp}] Speed radar: recording read ({took:.1f} s): ball {shot.ball_mph:.1f} mph"
+              + (f", club {shot.club_mph:.1f} mph" if shot.club_mph else ""))
+        self.fusion.radar_shot(shot)
 
     # ---- camera side ------------------------------------------------------
     def camera_fired(self, t: float, source: str) -> None:
-        if source != "radar":       # our own request coming back
-            self.fusion.camera_trigger(t, source)
+        if source == "radar":       # our own request coming back
+            return
+        self.fusion.camera_trigger(t, source)
+        if not self.hw_pulse:
+            self.radar.trigger()    # no pulse wire: trigger it over the serial line
 
     def pulsed(self, t: float) -> None:
-        """Kept for the kiosk's trigger-out pulse; this radar doesn't need it."""
+        """The kiosk's pulse on J3 pin 3 went out; the radar triggers on it itself."""
 
     # ---- decisions ---------------------------------------------------------
     def _on_shot(self, fs: FusedShot) -> None:
         nums = None
         if fs.ball_mph is not None:
             nums = {"ball_speed": fs.ball_mph, "club_speed": fs.club_mph,
-                    "club_speed_how": "ops243 club peak" if fs.club_mph is not None else None,
+                    "club_speed_how": "rolling buffer, club peak" if fs.club_mph is not None else None,
                     "smash": fs.smash, "source": fs.source}
         t = fs.camera_t
         if fs.source == "radar_only":
             t = fs.t_impact + self.fusion.cfg.cam_delay_est_s   # where a camera trigger would be
-        stamp = time.strftime('%H:%M:%S')
         speeds = (f"ball {fs.ball_mph:.1f} mph" + (f", club {fs.club_mph:.1f} mph" if fs.club_mph else "")
                   if fs.ball_mph is not None else "no speeds")
-        print(f"[{stamp}] Shot ({fs.source.replace('_', ' ')}): {speeds}"
+        print(f"[{time.strftime('%H:%M:%S')}] Shot ({fs.source.replace('_', ' ')}): {speeds}"
               + (f"; {'; '.join(fs.notes)}" if fs.notes else ""))
         with self.cond:
             self.results = [r for r in self.results if r[0] > t - 60] + [(t, nums, fs)]
             self.cond.notify_all()
         if fs.source == "radar_only":
             try:
-                self.trigger_camera(t)
+                self.trigger_camera(t)      # a shot on screen with the radar's numbers
             except Exception as e:
-                print(f"Speed radar: could not start a camera capture ({type(e).__name__}: {e})")
+                print(f"Speed radar: could not start a shot ({type(e).__name__}: {e})")
         for fn in list(self.listeners):
             try:
                 fn(fs, time.monotonic())
@@ -151,7 +171,6 @@ class SpeedRadar:
         return ("ball", {"ball_mph": nums["ball_speed"]})
 
     def stop(self) -> None:
-        self._stop.set()
         self.fusion.stop()
         try:
             self.radar.close()

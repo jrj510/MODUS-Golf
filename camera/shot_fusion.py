@@ -1,13 +1,14 @@
 """MODUS Golf: decide what counts as a shot from the radar AND the camera.
 
 Both sensors trigger on their own:
-  * the speed radar (camera/ops243.py) reports a shot with a ball speed,
-    club speed and impact time, ~60 ms after impact;
+  * the speed radar (camera/ops_capture.py, rolling buffer) reports a shot
+    with a ball speed, club speed and impact time once its recording has
+    come over the serial line, ~2 s after impact;
   * the camera (shot_capture.py, sh.on_fire) reports when it sees the ball
     leave its spot, ~40-90 ms after impact.
 
-Either one can arrive first, so each waits a short time (WAIT_S) for the other
-and then decides:
+The camera waits up to cam_wait_s (3 s) for the radar's answer; a radar shot
+that arrives with no camera trigger waits radar_wait_s for one. Then:
 
   radar + camera                -> "confirmed" shot (the normal case)
   radar only, ball still there  -> rejected: the radar saw something fast but
@@ -42,7 +43,8 @@ from ops243 import Shot
 
 @dataclass
 class FusionConfig:
-    wait_s: float = 0.25          # how long one sensor waits for the other
+    cam_wait_s: float = 3.0       # a camera trigger waits this long for the radar's answer
+    radar_wait_s: float = 0.25    # a radar shot waits this long for a camera trigger
     cam_after_min_s: float = -0.03  # camera trigger expected this long after impact (sound: ~0)
     cam_after_max_s: float = 0.20  # ...up to this long (camera checks ~4.5 frames)
     cam_delay_est_s: float = 0.06  # impact ~ this long before a camera-only trigger
@@ -105,6 +107,13 @@ class ShotFusion:
             self.camera = (t, source)
             self._match(self.clock())
 
+    def radar_nothing(self, t0: float, t1: float) -> None:
+        """The radar's recording from t0 to t1 (Pi clock) had no ball in it:
+        a camera trigger in that time needn't wait any longer."""
+        with self.lock:
+            if self.camera and t0 - 0.05 <= self.camera[0] <= t1 + 0.25:
+                self._camera_alone()
+
     def poll(self) -> None:
         """Settle anything that has waited long enough. Call often (or start())."""
         with self.lock:
@@ -139,9 +148,9 @@ class ShotFusion:
             else:
                 self._camera_alone()
             return
-        if self.radar and now - self.radar[0] >= cfg.wait_s:
+        if self.radar and now - self.radar[0] >= cfg.radar_wait_s:
             self._radar_alone()
-        elif self.camera and now - self.camera[0] >= cfg.wait_s:
+        elif self.camera and now - self.camera[0] >= cfg.cam_wait_s:
             self._camera_alone()
 
     def _radar_alone(self) -> None:

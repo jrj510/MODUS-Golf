@@ -67,7 +67,7 @@ from shot_capture import (HEIGHT, KEEP_MARKER, STREAM, WIDTH, Shared, View, Zone
                           new_track, prune_shots, save_shot, set_frame_rate, shot_folder,
                           smooth_box, start_camera, update_ready, _ball_diff,
                           ball_still_there, cover_guard_on, describe_check, save_check, shadow_guard_on,
-                          _top_change, zone_place, BallCheck)
+                          _top_change, zone_place)
 from launch_camera import FocalCalibration, camera_launch, fuse_launch, track_flight
 
 DEFAULT_MODEL = "~/MODUS-Golf/models/modus_ball_256.onnx"   # our own ball model (train_ball_model.py)
@@ -305,7 +305,7 @@ async function tick(){
     $('lightbtn').textContent='Low light: '+(lowlight?'on':'off');
     $('lightbtn').classList.toggle('on',lowlight);
     $('camwarn').textContent=(c&&c.state=='limit')?(c.message.split(':')[0]):
-      (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':(s.radar||''));
+      (s.zone===false?'No hitting zone yet: Camera, then drag a box over the mat':'');
     $('cam').innerHTML=lowlight?'Camera<span class="ll">Low light</span>':'Camera';
     fails=0;
   }catch(e){
@@ -742,7 +742,6 @@ class Handler(BaseHTTPRequestHandler):
                                    "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
                                    "light": K.want_light or K.light_mode,
                                    "focus": K.focus, "training": K.training,
-                                   "radar": getattr(K, "radar_note", None),
                                    "club": K.args.club if K.args is not None else None}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1220,37 +1219,14 @@ def _camera_track(cam):
         return None
 
 
-def _ball_in_spot_at_end(cam):
-    """True when the ball is plainly still lying in its spot in the last 3
-    frames of the shot (BallCheck: a ball-sized circle brighter inside than
-    out all the way round; it never passes on an empty spot). Then nothing
-    flew: a waggle, a foot or a flash of light set the trigger off, and any
-    "launch angle" from those frames would be the club's."""
-    try:
-        frames = [f[2] for f in cam["window"][-3:]]
-        if len(frames) < 3:
-            return False
-        bc = BallCheck(cam["box"], frames[0].shape)
-        return all(bc.look(f)[0] is True for f in frames)
-    except Exception as e:
-        print(f"Camera launch: ball check failed ({type(e).__name__}: {e}); not used")
-        return False
-
-
 def _camera_solve(shot, cam, track, o):
     """The camera's launch angle for a shot, with the speed radar's ball speed
     (corrected for the angle, which the camera then refines) when there is one."""
     args = K.args
-    if _ball_in_spot_at_end(cam):
-        why = "the ball is still in its spot at the end of the shot's frames: nothing flew"
-        print(f"Shot {shot}: no camera launch angle ({why})")
-        return {"launch_angle": None, "launch_dir": None, "quality": None, "frames": 0, "why": why}
     focal = K.cam_calib.focal if getattr(K, "cam_calib", None) else None
-    # Without the speed radar's ball speed nothing else says a ball flew: then
-    # the ball's spot has to be seen empty after impact too.
     common = dict(view_scale=cam["scale"], view_origin=cam["origin"], focal_px=focal,
                   height_m=args.cam_height_m, ball_height_m=getattr(args, "iwr_ball_height_m", 0.021),
-                  exposure_s=cam["exposure_s"], need_empty_spot=not (o and o.get("ball_speed")))
+                  exposure_s=cam["exposure_s"])
     try:
         if o and o.get("ball_speed"):
             raw = float(o["ball_speed"])
@@ -1306,13 +1282,10 @@ def add_radar_results(iwr, ops, shot, trigger_time, folder, radar_log, cam=None)
     the camera launch angle (cam), the ball is found in the frames first, and
     the angle is worked out once the speed radar's ball speed is in."""
     track = _camera_track(cam) if cam is not None else None
+    if track is not None and track.get("rest_source") == "frames" and getattr(K, "cam_calib", None):
+        K.cam_calib.add(track["rest"][2], kind="shot")      # the ball's width from its empty spot
     o = ops.result_for(trigger_time, wait_s=12.0) if ops is not None else None
     cam_res = _camera_solve(shot, cam, track, o) if track is not None else None
-    if track is not None and track.get("rest_source") == "frames" and getattr(K, "cam_calib", None) \
-            and cam_res and cam_res.get("quality") in ("good", "fair"):
-        # The ball's width from its empty spot, only from shots where the ball
-        # was clearly found leaving (a false trigger's "empty spot" is not one).
-        K.cam_calib.add(track["rest"][2], kind="shot")
     if cam is not None:
         _save_camera_launch(folder, cam, track, cam_res)
     m = _publish(shot, o, None, final=(iwr is None or o is None), cam=cam_res)
@@ -1459,10 +1432,17 @@ def main():
                    help="read plain speed readings from the OPS243-A. Only for a radar NOT set up in "
                         "rolling-buffer mode; this sends it setup commands")
     p.add_argument("--ops", action="store_true",
-                   help="use the OPS243-A speed radar (camera/ops243.py, our own driver with the AN-029 "
-                        "golf settings): ball speed, club speed. It triggers on its own and together "
+                   help="use the OPS243-A speed radar in rolling-buffer mode (camera/ops_capture.py: our own "
+                        "FFT of its raw I/Q): ball speed, club speed. It triggers on its own and together "
                         "with the camera decides what is a shot (camera/shot_fusion.py)")
-    p.add_argument("--ops-baud", type=int, default=57600, help="OPS243-A serial baud rate")
+    p.add_argument("--ops-split", type=int, default=20,
+                   help="of the radar recording's 32 blocks (4.3 ms each), how many come from before the "
+                        "trigger")
+    p.add_argument("--ops-speed-trigger-mph", type=float, default=40.0,
+                   help="the radar starts a recording by itself when something moves away faster than "
+                        "this (the club coming through). 0 = off (camera pulse / S! only)")
+    p.add_argument("--ops-reset-gpio", type=int, default=23,
+                   help="GPIO wired to OPS J3 pin 4 (/Reset); the radar is reset before it is set up. 0 = don't")
     p.add_argument("--ops-min-ball", type=float, default=40.0,
                    help="slowest ball speed the radar counts as a shot, mph (lower for chips)")
     p.add_argument("--trigger-out-gpio", type=int, default=0,
@@ -1635,9 +1615,6 @@ def main():
             print(f"Speed radar: on ({args.radar_port}); it triggers on its own and with the camera")
         except Exception as e:
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
-            # On screen too: at the simulator bay a whole session ran without
-            # the radar and nothing said so.
-            K.radar_note = "Speed radar not connected: no ball speed. Unplug the box for 5 s and start again"
     bridge = None                       # TI radar: not used for now
     K.ops, K.bridge = ops, bridge       # so the Club button can update the radar
     # Ball speed: the radar's reading as it is for now (no line-of-sight

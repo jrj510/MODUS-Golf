@@ -15,13 +15,14 @@ Sports Applications", Table 6, Golf Recommended API Settings):
     M>10   magnitude threshold   -> detection distance (10 or 15)
     O2     multi-speed           -> top 2 speeds per report (ball and club)
     K+     peak detect           -> focuses the multi-speed reports
+    PA     active power mode     -> stream continuously (not part of AN-029)
 
 How a shot looks in those reports (AN-029 Figure 5): the club climbs to its
 peak just before impact and then falls away, while the ball appears as a
 fast, almost flat line that starts at impact. So:
 
   * ball  = the first run of reports whose top speed holds steady (within a
-            few mph) for several reports in a row, clearly faster than
+            few mph) for 6 reports in a row (~26-30 ms), clearly faster than
             anything before it. Ball speed is the median of the start of
             that run (the ball slows only slightly over the first 15 ms).
   * club  = the highest speed of the *other* track that a neighbouring report
@@ -55,12 +56,14 @@ from typing import Callable, Iterable, Optional
 GOLF_SETTINGS: list[tuple[str, bool]] = [
     ("S=30", True),   # sample rate 30 ksps
     ("S(", False),    # sample size 128
-    ("X=32", False),  # FFT size 4096
+    ("X=32", True),   # FFT size 4096 (needs Enter: without it the radar waits and eats the next commands)
     ("US", False),    # mph
     ("R>10", True),   # ignore anything under 10 mph
     ("M>10", True),   # magnitude threshold (try 15 if it picks up noise)
     ("O2", False),    # top two speeds per report
     ("K+", False),    # peak detect
+    ("PA", False),    # active power mode: start streaming (the radar can be left idle
+                      # (PI) or in its rolling-buffer capture mode by other software)
 ]
 
 _NUMBER = re.compile(r"-?\d+(?:\.\d+)?")
@@ -118,7 +121,9 @@ class DetectorConfig:
     min_ball_mph: float = 40.0      # slowest ball that counts as a shot
     max_ball_mph: float = 209.0     # radar's limit at 30 ksps
     hold_tol_mph: float = 3.0       # how flat the ball line must be
-    hold_reports: int = 4           # reports in a row to call it a ball
+    hold_reports: int = 6           # reports in a row to call it a ball (~26-30 ms): the
+                                    # club can look flat for a few reports at its peak,
+                                    # the ball stays flat much longer
     jump_ratio: float = 1.05        # ball must beat the earlier max by 5%
     ball_avg_s: float = 0.015       # average the ball over its first 15 ms
     club_before_s: float = 0.080    # look for the club up to 80 ms before impact
@@ -325,7 +330,7 @@ class OPS243:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-    def send(self, cmd: str, enter: bool = False, wait: float = 0.15) -> list[str]:
+    def send(self, cmd: str, enter: bool = False, wait: float = 0.4) -> list[str]:
         """Send one API command; return whatever the radar answered."""
         self.ser.write((cmd + ("\r" if enter else "")).encode("ascii"))
         self.ser.flush()
@@ -337,11 +342,18 @@ class OPS243:
 
     def configure(self, settings: Iterable[tuple[str, bool]] = GOLF_SETTINGS,
                   verbose: bool = True) -> None:
+        """Send each setting and print the radar's answer. At 19200 baud an
+        answer can take a few hundred ms, so each command waits 0.4 s."""
         self.ser.reset_input_buffer()
         for cmd, enter in settings:
             replies = self.send(cmd, enter)
             if verbose:
                 print(f"  {cmd:<6} -> {' | '.join(replies) or '(no reply)'}")
+        # Ask what it ended up with (units matter most: m/s is its default).
+        for query in ("U?", "R?"):
+            replies = self.send(query)
+            if verbose:
+                print(f"  {query:<6} -> {' | '.join(replies) or '(no reply)'}")
 
     def start(self, on_report: Callable[[Report, str], None],
               on_other: Optional[Callable[[str], None]] = None) -> None:

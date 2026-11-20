@@ -38,7 +38,9 @@ def test_radar_first_then_camera_is_confirmed():
 def test_camera_first_then_radar_is_confirmed():
     f, clk, shots, _ = make()
     clk.t = 100.05; f.camera_trigger(100.05, "motion")
-    clk.t = 100.07; f.radar_shot(radar(100.0))
+    clk.t = 102.10; f.poll()                             # still waiting on the radar's dump
+    assert shots == []
+    clk.t = 102.20; f.radar_shot(radar(100.0))
     assert [s.source for s in shots] == ["confirmed"]
 
 
@@ -61,7 +63,7 @@ def test_radar_only_when_camera_not_watching_counts():
 def test_camera_only_keeps_a_no_speed_shot():
     f, clk, shots, _ = make()
     clk.t = 100.05; f.camera_trigger(100.05, "motion")
-    clk.t = 100.40; f.poll()
+    clk.t = 103.10; f.poll()
     assert [s.source for s in shots] == ["camera_only"]
     assert shots[0].ball_mph is None
     assert abs(shots[0].t_impact - 99.99) < 1e-6
@@ -70,7 +72,7 @@ def test_camera_only_keeps_a_no_speed_shot():
 def test_camera_only_can_be_dropped():
     f, clk, shots, rejects = make(camera_only="drop")
     clk.t = 100.05; f.camera_trigger(100.05, "motion")
-    clk.t = 100.40; f.poll()
+    clk.t = 103.10; f.poll()
     assert shots == [] and len(rejects) == 1
 
 
@@ -92,3 +94,10 @@ def test_cooldown_blocks_double_count():
     clk.t = 105.06; f.radar_shot(radar(105.0))
     clk.t = 105.08; f.camera_trigger(105.08)
     assert len(shots) == 2
+
+
+def test_radar_nothing_ends_the_wait():
+    f, clk, shots, _ = make()
+    clk.t = 100.05; f.camera_trigger(100.05, "motion")
+    clk.t = 102.00; f.radar_nothing(99.95, 100.09)
+    assert [s.source for s in shots] == ["camera_only"]
