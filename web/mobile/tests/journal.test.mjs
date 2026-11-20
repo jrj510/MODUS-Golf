@@ -68,3 +68,20 @@ test('reopening a confirmed session does not silently downgrade physical records
   assert.equal(reopened[0].record_kind,'real');assert.equal(reopened[0].revision,real.revision);
   assert.throws(() => mergeLocal([example],[{...example,record_kind:'real'}]),/Synthetic/);
 });
+
+test('34-column Pi snapshots persist and diagnostic enrichment updates one local revision',async()=>{
+  const fixture=readFileSync(new URL('../../MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/pi_csv_34_synthetic.csv',import.meta.url),'utf8');
+  const context={deviceId:'pi_test',profileId:'golfer_a',filename:'session_20261119_120000.csv',hashBytes:sha256};
+  const incoming=await normalizeSessionCsv(fixture,context);
+  const port=memory(),journal=new Journal(port);await journal.load();
+  await journal.commit(current=>({...current,shots:mergeLocal(current.shots,incoming)}));
+  assert.deepEqual((await new Journal(port).load()).shots,incoming);
+  const retry=mergeLocal(incoming,await normalizeSessionCsv(fixture,context));
+  assert.equal(retry.length,2);assert.equal(retry[0].revision,1);
+  const enriched=await normalizeSessionCsv(fixture.replace('calibrated, ""cluster""','calibrated, ""updated""'),context);
+  const merged=mergeLocal(retry,enriched);
+  assert.equal(merged.length,2);assert.equal(merged[0].revision,2);
+  assert.equal(merged[0].source.csv_extra.club_speed_how,'calibrated, "updated"');
+  await journal.commit(current=>({...current,shots:merged}));
+  assert.deepEqual((await new Journal(port).load()).shots,merged);
+});

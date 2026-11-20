@@ -1,0 +1,3 @@
+shot,time,club,ball_speed_mph,club_speed_mph,smash,launch_deg,launch_measured,spin_rpm_used,carry_yd,apex_yd,ti_radar,ball_speed_raw_mph,launch_dir_deg,club_speed_hidden_mph,total_yd,landing_angle_deg,spin_check,spin_model_rpm,contact,smash_efficiency,roll_yd,launch_source,cam_launch_deg,cam_dir_deg,cam_quality,cam_frames,ti_launch_deg,ball_speed_model_mph,ball_speed_check_mph,ti_launch_raw_deg,ti_dir_raw_deg,club_speed_check_mph,club_speed_how
+1,12:00:00,driver,143,94,1.52,14,yes,2398,241,31,good,140,0,,259,37.2,ok,2398,solid,0.98,18,camera,14,0,good,8,,143,142,,,95,"calibrated, ""cluster"""
+2,12:00:01,7i,120,,,17,no,7000,165,26,"check, ""held""",119,-2,80,177,42,clamped,7100,unknown,,12,club_default,12.5,-2,poor,3,,120,118.5,,,79.9,rejected

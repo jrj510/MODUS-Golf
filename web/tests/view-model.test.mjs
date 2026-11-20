@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { filterShots, summary, displayMetric, converted, uniqueShots, validateCloudShot, sourceName, historyCsv, shotDate, selectedShot, flightPoints, directionWasApplied } from '../src/domain.ts';
+import {CSV_EXTENDED_COLUMNS,normalizeSessionCsv} from '../MODUS_Golf_Firebase_AI_Starter/app-core/shot.mjs';
 const fixtures = JSON.parse(readFileSync('MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/demo_shots.json', 'utf8'));
 const real = () => ({ ...structuredClone(fixtures[0]), record_kind: 'real', source: { ...fixtures[0].source, kind: 'pi_live' } });
 test('250 records are all included in whole-filter statistics and random shot lookup', () => {
@@ -87,5 +88,29 @@ test('Firestore point maps decode losslessly without changing canonical modeled 
   assert.equal(shot.trajectory[1].forward_yards, 111.98);
   for (const point of [{ forward_yards: 0, height_yards: 0 }, { forward_yards: 0, height_yards: 0, right_yards: Infinity }, { forward_yards: '0', height_yards: 0, right_yards: 0 }]) assert.throws(() => validateCloudShot({ ...shot, trajectory: [point] }), /contract/);
   assert.throws(() => validateCloudShot({ ...shot, source: { ...shot.source, apex_yards: '19' } }), /contract/);
+});
+
+test('extended Pi diagnostics validate and survive mixed-format history export',async()=>{
+  const fixture=readFileSync('MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/pi_csv_34_synthetic.csv','utf8');
+  const shots=await normalizeSessionCsv(fixture,{deviceId:'pi_test',profileId:'golfer_a',filename:'session_20261119_120000.csv'});
+  assert.deepEqual(validateCloudShot(shots[0]),shots[0]);
+  const old=real();old.source.ti_radar='good';
+  const exported=historyCsv([old,...shots]);
+  const header=exported.split('\n')[0].split(',');
+  assert.deepEqual(header.slice(0,34),CSV_EXTENDED_COLUMNS);assert.equal(header.length,46);
+  const legacyRow=exported.split('\n')[1].split(',');
+  assert.equal(legacyRow.length,46);assert.deepEqual(legacyRow.slice(14,34),Array(20).fill(''));
+  assert.match(exported,/"calibrated, ""cluster"""/);
+  assert.match(exported,/"check, ""held"""/);
+  assert.equal(shots[1].club_speed_mph,null);
+});
+
+test('malformed extended provenance cannot enter the journal/cloud view',async()=>{
+  const fixture=readFileSync('MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/pi_csv_34_synthetic.csv','utf8');
+  const [shot]=await normalizeSessionCsv(fixture,{deviceId:'pi_test',profileId:'golfer_a',filename:'session_20261119_120000.csv'});
+  for(const extra of [null,[],{}, {...shot.source.csv_extra,unexpected:'x'}, {...shot.source.csv_extra,cam_frames:8}, {...shot.source.csv_extra,cam_quality:'x'.repeat(1001)}]) {
+    assert.throws(()=>validateCloudShot({...shot,source:{...shot.source,csv_extra:extra}}),/contract/);
+  }
+  assert.throws(()=>validateCloudShot({...shot,source:{...shot.source,csv_format:'unknown'}}),/contract/);
 });
 

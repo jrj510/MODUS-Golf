@@ -13,11 +13,14 @@ export interface Shot {
   quality_flags: string[];
   source: {kind: 'legacy_csv' | 'pi_live' | 'synthetic_demo'; filename?: string;
     local_log_time?: string; timezone?: string | null; row_sha256?: string;
-    ti_radar?: string; ball_speed_raw_mph?: number | null; apex_yards?: number | null};
+    ti_radar?: string; ball_speed_raw_mph?: number | null; apex_yards?: number | null;
+    csv_format?: 'modus_csv_34'; csv_extra?: Record<string, string>};
 }
 export interface MetricSummary {n: number; mean: number | null; min: number | null; max: number | null; sample_sd: number | null}
 export interface ImportContext {deviceId: string; profileId: string; filename: string; timezone?: string | null; confirmedReal?: boolean; hashBytes?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>}
 export const CSV_COLUMNS: readonly string[];
+export const CSV_EXTRA_COLUMNS: readonly string[];
+export const CSV_EXTENDED_COLUMNS: readonly string[];
 export function stableId(prefix: string, parts: string[], hashBytes?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>): Promise<string>;
 export function parseSessionCsv(text: string): Record<string, string>[];
 export function normalizeSessionCsv(text: string, context: ImportContext): Promise<Shot[]>;
