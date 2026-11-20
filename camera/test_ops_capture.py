@@ -173,6 +173,10 @@ def test_real_raw_captures_20261120():
             shot, _ = find_shot(Capture.from_json(json.load(f)))
         if shot is not None:
             hits[os.path.basename(p)[13:19]] = shot
-    assert sorted(hits) == ["150812", "150845", "150932", "151008"]
+    # run 1 (split 20) and run 2 (split 10), same wedge
+    assert sorted(hits) == ["150812", "150845", "150932", "151008",
+                            "152559", "152625", "152634", "152648", "152700", "152712"]
     assert abs(hits["150932"].ball_mph - 50.0) < 1.0
     assert abs(hits["150812"].club_mph - 56.0) < 1.0
+    assert abs(hits["152634"].ball_mph - 57.9) < 1.0
+    assert all(h.ball_reports >= 6 for h in hits.values())

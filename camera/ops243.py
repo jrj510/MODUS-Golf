@@ -120,18 +120,20 @@ def parse_line(line: str, t: float) -> Optional[Report]:
 class DetectorConfig:
     min_ball_mph: float = 40.0      # slowest ball that counts as a shot
     max_ball_mph: float = 209.0     # radar's limit at 30 ksps
-    hold_tol_mph: float = 3.0       # how flat the ball line must be
+    hold_tol_mph: float = 3.0       # a speed this close to the ball's line is the ball
+    step_mph: float = 2.0           # the ball's line changes less than this per report
+    hold_spread_mph: float = 4.5    # ...and less than this over its first hold_reports
+    gap_s: float = 0.012            # a line may skip a missing report or two
     hold_reports: int = 6           # reports in a row to call it a ball (~26-30 ms): the
                                     # club can look flat for a few reports at its peak,
                                     # the ball stays flat much longer
-    jump_ratio: float = 1.05        # ball must beat the earlier max by 5%
     ball_avg_s: float = 0.015       # average the ball over its first 15 ms
     club_before_s: float = 0.080    # look for the club up to 80 ms before impact
     club_after_s: float = 0.040     # ...and 40 ms after (club falls away)
     club_min_mph: float = 20.0
     club_tol_mph: float = 6.0       # a club reading needs a neighbour this close
-    smash_min: float = 1.0
-    smash_max: float = 1.6
+    smash_min: float = 0.7          # radar speeds are along its line of sight: a lofted ball
+    smash_max: float = 1.7          # reads low, so the raw ratio can be under 1
     settle_s: float = 0.060         # wait this long after impact before reporting
     cooldown_s: float = 1.5         # ignore reports for this long after a shot
     history_s: float = 0.5          # how much radar history to keep
@@ -168,61 +170,82 @@ def _supported_peak(values: list[float], tol: float) -> Optional[float]:
     return max(good) if good else None
 
 
+def _runs(reports: list[Report], cfg: DetectorConfig) -> list[tuple[int, list[tuple[int, float]]]]:
+    """Every smooth speed line that could be the ball: (start index, [(index, mph)]).
+
+    Followed report to report, taking the speed closest to the last one, as
+    long as each step is under step_mph (a missing report is skipped). The
+    ball's line is smooth and long; the club's rises and falls."""
+    out = []
+    for i, r in enumerate(reports):
+        for v0 in r.speeds:
+            if v0 < 0.9 * cfg.min_ball_mph:
+                continue
+            path = [(i, v0)]
+            for j in range(i + 1, len(reports)):
+                if reports[j].t - reports[path[-1][0]].t > cfg.gap_s:
+                    break
+                near = [s for s in reports[j].speeds if abs(s - path[-1][1]) <= cfg.step_mph]
+                if near:
+                    path.append((j, min(near, key=lambda s: abs(s - path[-1][1]))))
+            if len(path) < cfg.hold_reports:
+                continue
+            head = [v for _, v in path[:cfg.hold_reports]]
+            level = statistics.median(v for _, v in path)
+            if max(head) - min(head) > cfg.hold_spread_mph:
+                continue                     # changing too fast at its start: a club
+            if not (cfg.min_ball_mph <= level <= cfg.max_ball_mph):
+                continue
+            out.append((i, path))
+    return out
+
+
+def _best_run(reports: list[Report], cfg: DetectorConfig, fastest: bool):
+    runs = _runs(reports, cfg)
+    if not runs:
+        return None
+    if not fastest:
+        return runs[0]                       # the first one (the shot is happening)
+    # The ball: the longest smooth line, faster one on a tie.
+    return max(runs, key=lambda r: (len(r[1]), statistics.median(v for _, v in r[1])))
+
+
 def find_ball(reports: list[Report], cfg: DetectorConfig,
               fastest: bool = False) -> Optional[int]:
-    """Index of the report where the ball first appears, or None.
+    """Index of the report where the ball's line starts, or None.
 
-    With fastest=False, returns the first steady run (used to notice that a
-    shot is happening). With fastest=True, returns the start of the fastest
-    steady run in the window: a slow, steady club near its peak can also look
-    like a flat line, but the ball is always the faster one.
-    """
-    tops = [r.speeds[0] for r in reports]
-    n = cfg.hold_reports
-    found: list[tuple[int, float]] = []
-    for i in range(len(tops) - n + 1):
-        run = tops[i:i + n]
-        level = statistics.median(run)
-        if not (cfg.min_ball_mph <= level <= cfg.max_ball_mph):
-            continue
-        if max(run) - min(run) > 2 * cfg.hold_tol_mph:
-            continue
-        if any(abs(v - level) > cfg.hold_tol_mph for v in run):
-            continue
-        before = [s for r in reports[:i] if r.t >= reports[i].t - cfg.club_before_s
-                  for s in r.speeds]
-        if before and level < cfg.jump_ratio * max(before):
-            continue  # not clearly faster than what came before: still the club
-        if not fastest:
-            return i
-        found.append((i, level))
-    if not found:
-        return None
-    top = max(level for _, level in found)
-    return next(i for i, level in found if level >= top - cfg.hold_tol_mph)
+    The ball is a smooth line lasting at least hold_reports (~26 ms) at
+    min_ball_mph or more. It does NOT have to read faster than the club: the
+    radar only sees speed along its line of sight, so a ball climbing away
+    (and still close to the radar) reads low at first and creeps up as it
+    flies off; a lofted shot can read slower than the club that hit it.
+    fastest=False: the first such line; fastest=True: the best (longest)."""
+    best = _best_run(reports, cfg, fastest)
+    return None if best is None else best[0]
 
 
 def measure_shot(reports: list[Report], i_ball: int, cfg: DetectorConfig) -> Shot:
-    """Ball speed, club speed and smash around a ball found at i_ball."""
+    """Ball speed, club speed and smash around a ball line starting at i_ball."""
+    runs = [p for i, p in _runs(reports, cfg) if i == i_ball]
+    path = max(runs, key=len) if runs else [(i_ball, reports[i_ball].speeds[0])]
     t0 = reports[i_ball].t
-    level = statistics.median(r.speeds[0] for r in reports[i_ball:i_ball + cfg.hold_reports])
+    ball_mph = statistics.median(v for _, v in path)
+    on_line = dict(path)
 
-    def is_ball(v: float) -> bool:
-        return abs(v - level) <= cfg.hold_tol_mph * 2
+    def is_ball(j: int, v: float) -> bool:
+        if j < i_ball:
+            return False                     # before the ball's line starts: no ball yet
+        ref = on_line.get(j, ball_mph)
+        return abs(v - ref) <= cfg.hold_tol_mph
 
-    ball = [r.speeds[0] for r in reports[i_ball:]
-            if r.t <= t0 + cfg.ball_avg_s and is_ball(r.speeds[0])]
-    ball_mph = statistics.median(ball)
-
-    # Club track: per report, the fastest speed that isn't the ball.
+    # Club track: per report, the fastest speed that isn't the ball's line.
     track: list[tuple[float, float]] = []
-    for r in reports:
+    for j, r in enumerate(reports):
         if not (t0 - cfg.club_before_s <= r.t <= t0 + cfg.club_after_s):
             continue
-        others = [s for s in r.speeds
-                  if not is_ball(s) and cfg.club_min_mph <= s < ball_mph]
+        others = [s for s in r.speeds if not is_ball(j, s) and s >= cfg.club_min_mph]
         if others:
-            track.append((r.t, others[0]))
+            track.append((r.t, max(others)))
 
     club_mph = smash = None
     peak = _supported_peak([v for _, v in track], cfg.club_tol_mph)
@@ -232,7 +255,7 @@ def measure_shot(reports: list[Report], i_ball: int, cfg: DetectorConfig) -> Sho
         if not (cfg.smash_min <= smash <= cfg.smash_max):
             club_mph = smash = None  # not a believable club reading
     return Shot(t_impact=t0, ball_mph=ball_mph, club_mph=club_mph, smash=smash,
-                ball_reports=len(ball), club_track=track)
+                ball_reports=len(path), club_track=track)
 
 
 class ShotDetector:

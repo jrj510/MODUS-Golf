@@ -104,8 +104,11 @@ class Capture:
 class ProcessConfig:
     nfft: int = 4096
     min_mph: float = 10.0          # ignore slower (body, clutter, DC)
-    max_peaks: int = 2             # speeds kept per block (club + ball)
+    max_peaks: int = 4             # speeds kept per block (ball, club, and room for the
+                                   # golfer's body etc. without crowding the ball out)
     snr: float = 8.0               # peak must be this many times the block's noise floor
+    rel_min: float = 0.03          # ...and at least this share of the block's strongest peak
+                                   # (keeps a strong target's window sidelobes out)
     separation_mph: float = 8.0    # two peaks closer than this are one target
     outbound_sign: int = 0         # +1/-1: keep only that Doppler sign; 0 = work it out per
                                    # capture (the side with the most energy: club and ball
@@ -157,7 +160,8 @@ def capture_reports(cap: Capture, cfg: Optional[ProcessConfig] = None) -> list[R
         # cut-off, and strong enough above this block's noise floor.
         peak = np.zeros_like(ok)
         peak[1:-1] = (s[1:-1] > s[:-2]) & (s[1:-1] >= s[2:])
-        cand = np.flatnonzero(peak & ok & (s >= cfg.snr * floor))
+        top = s[ok].max() if ok.any() else 0.0
+        cand = np.flatnonzero(peak & ok & (s >= cfg.snr * floor) & (s >= cfg.rel_min * top))
         cand = cand[np.argsort(s[cand])[::-1]]
         kept: list[int] = []
         for k in cand:
