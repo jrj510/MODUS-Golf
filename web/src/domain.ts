@@ -1,4 +1,4 @@
-import { mergeRevision, summarizeShots, CSV_COLUMNS, type Shot } from '../MODUS_Golf_Firebase_AI_Starter/app-core/shot.mjs';
+import { mergeRevision, summarizeShots, CSV_COLUMNS, CSV_EXTRA_COLUMNS, CSV_EXTENDED_COLUMNS, type Shot } from '../MODUS_Golf_Firebase_AI_Starter/app-core/shot.mjs';
 export type { Shot };
 export type Units = 'imperial' | 'metric';
 export type Metric = 'ball_speed_mph' | 'club_speed_mph' | 'smash_factor' | 'vertical_launch_angle_deg' | 'horizontal_launch_angle_deg' | 'carry_yards';
@@ -61,17 +61,19 @@ export function sessionLabel(shots: Shot[], id: string) {
 export function historyCsv(shots: Shot[]) {
   const quote = (value: unknown) => { const text = value == null ? '' : String(value); return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text; };
   // CSV preserves the kiosk contract and its model-vs-measured distinctions.
+  const extended=shots.some(shot=>shot.source.csv_format==='modus_csv_34');
   const rows = shots.map(s => [s.sequence_number, s.source.local_log_time ?? '', s.club,
     s.ball_speed_mph, s.club_speed_mph, s.smash_factor,
     s.vertical_launch_angle_deg ?? s.model_inputs.vertical_launch_angle_deg,
     s.vertical_launch_angle_deg == null ? 'no' : 'yes', s.model_inputs.spin_rpm,
     s.carry_yards, s.source.apex_yards ?? null, s.source.ti_radar ?? '',
     s.source.ball_speed_raw_mph ?? null, s.horizontal_launch_angle_deg,
+    ...(extended?CSV_EXTRA_COLUMNS.map(key=>s.source.csv_extra?.[key] ?? ''):[]),
     s.shot_id, s.session_id, s.device_id, s.profile_id, s.revision, s.record_kind,
     s.processing_state, s.source.kind, s.source.filename ?? '', s.source.timezone ?? '',
     s.timestamp, s.quality_flags.join(';')]);
   const provenance = ['shot_id','session_id','device_id','profile_id','revision','record_kind','processing_state','source_kind','source_filename','source_timezone','timestamp_utc','quality_flags'];
-  return [[...CSV_COLUMNS, ...provenance].join(','), ...rows.map(row => row.map(quote).join(','))].join('\n') + '\n';
+  return [[...(extended?CSV_EXTENDED_COLUMNS:CSV_COLUMNS), ...provenance].join(','), ...rows.map(row => row.map(quote).join(','))].join('\n') + '\n';
 }
 export function validateCloudShot(record: Record<string, unknown>): Shot {
   const fail = () => { throw new Error('A cloud shot does not match the MODUS shot contract. No partial dataset was shown.'); };
@@ -99,6 +101,12 @@ export function validateCloudShot(record: Record<string, unknown>): Shot {
     if (item !== null && (typeof item !== 'number' || !Number.isFinite(item))) fail();
   }
   const source = record.source as Record<string, unknown>;
+  if(source.csv_format!==undefined || source.csv_extra!==undefined) {
+    if(source.csv_format!=='modus_csv_34' || !source.csv_extra || typeof source.csv_extra!=='object' || Array.isArray(source.csv_extra)) fail();
+    const extra=source.csv_extra as Record<string,unknown>;
+    if(Object.keys(extra).length!==CSV_EXTRA_COLUMNS.length || CSV_EXTRA_COLUMNS.some(key=>
+      !Object.hasOwn(extra,key) || typeof extra[key]!=='string' || (extra[key] as string).length>1000)) fail();
+  }
   for (const key of ['filename','local_log_time','ti_radar']) if (source[key] !== undefined && typeof source[key] !== 'string') fail();
   if (source.timezone !== undefined && source.timezone !== null && typeof source.timezone !== 'string') fail();
   for (const key of ['apex_yards','ball_speed_raw_mph']) if (source[key] !== undefined && source[key] !== null && (typeof source[key] !== 'number' || !Number.isFinite(source[key]))) fail();

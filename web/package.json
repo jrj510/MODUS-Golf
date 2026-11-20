@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "test": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/shot.test.mjs tests/view-model.test.mjs",
+    "test": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/*.test.mjs tests/view-model.test.mjs",
     "test:rules": "node --test tests/firestore.test.mjs"
   },
   "dependencies": {

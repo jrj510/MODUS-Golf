@@ -34,7 +34,8 @@
       "horizontal_launch_angle_deg": {"type": ["number", "null"], "minimum": -90, "maximum": 90}
     }},
     "quality_flags": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"type": "string", "maxLength": 100}},
-    "source": {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {
+    "source": {"type": "object", "additionalProperties": false, "required": ["kind"],
+      "dependentRequired": {"csv_format": ["csv_extra"], "csv_extra": ["csv_format"]}, "properties": {
       "kind": {"enum": ["legacy_csv", "pi_live", "synthetic_demo"]},
       "filename": {"type": "string", "pattern": "^session_[0-9]{8}_[0-9]{6}\\.csv$"},
       "local_log_time": {"type": "string", "pattern": "^[0-2][0-9]:[0-5][0-9]:[0-5][0-9]$"},
@@ -42,7 +43,12 @@
       "row_sha256": {"type": "string", "pattern": "^row_[a-f0-9]{64}$"},
       "ti_radar": {"type": "string", "maxLength": 1000},
       "ball_speed_raw_mph": {"type": ["number", "null"], "minimum": 0, "maximum": 250},
-      "apex_yards": {"type": ["number", "null"], "minimum": 0, "maximum": 300}
+      "apex_yards": {"type": ["number", "null"], "minimum": 0, "maximum": 300},
+      "csv_format": {"const": "modus_csv_34"},
+      "csv_extra": {"type": "object", "minProperties": 20, "maxProperties": 20,
+        "description": "Raw current-Pi diagnostic/model/check values. Never promote these strings into accepted measurements solely because they were exported.",
+        "propertyNames": {"enum": ["club_speed_hidden_mph", "total_yd", "landing_angle_deg", "spin_check", "spin_model_rpm", "contact", "smash_efficiency", "roll_yd", "launch_source", "cam_launch_deg", "cam_dir_deg", "cam_quality", "cam_frames", "ti_launch_deg", "ball_speed_model_mph", "ball_speed_check_mph", "ti_launch_raw_deg", "ti_dir_raw_deg", "club_speed_check_mph", "club_speed_how"]},
+        "additionalProperties": {"type": "string", "maxLength": 1000}}
     }}
   }
 }

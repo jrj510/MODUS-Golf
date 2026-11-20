@@ -2,6 +2,14 @@
 export const CSV_COLUMNS = Object.freeze(['shot','time','club','ball_speed_mph',
   'club_speed_mph','smash','launch_deg','launch_measured','spin_rpm_used',
   'carry_yd','apex_yd','ti_radar','ball_speed_raw_mph','launch_dir_deg']);
+// Current Pi export, verified against camera/kiosk.py on 2026-11-19. Keep
+// CSV_COLUMNS as the legacy format so existing exports, fixtures and IDs survive.
+export const CSV_EXTRA_COLUMNS = Object.freeze(['club_speed_hidden_mph','total_yd',
+  'landing_angle_deg','spin_check','spin_model_rpm','contact','smash_efficiency',
+  'roll_yd','launch_source','cam_launch_deg','cam_dir_deg','cam_quality','cam_frames',
+  'ti_launch_deg','ball_speed_model_mph','ball_speed_check_mph','ti_launch_raw_deg',
+  'ti_dir_raw_deg','club_speed_check_mph','club_speed_how']);
+export const CSV_EXTENDED_COLUMNS = Object.freeze([...CSV_COLUMNS,...CSV_EXTRA_COLUMNS]);
 
 function identity(value, label) {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,120}$/.test(value))
@@ -50,8 +58,12 @@ export function parseSessionCsv(text) {
   }
   if(quoted)throw new Error('Unclosed CSV quote');
   const header=rows.shift();
-  if(!header || header.length!==CSV_COLUMNS.length || header.some((x,i)=>x!==CSV_COLUMNS[i]))
-    throw new Error('CSV header does not match the current MODUS kiosk');
+  if(header && new Set(header).size!==header.length)
+    throw new Error('CSV header contains duplicate column names');
+  const supported=header && [CSV_COLUMNS,CSV_EXTENDED_COLUMNS].some(columns=>
+    header.length===columns.length && columns.every(column=>header.includes(column)));
+  if(!supported)
+    throw new Error(`CSV header is unsupported (${header?.length ?? 0} columns); expected the MODUS 14- or 34-column format`);
   if(rows.length>10000)throw new Error('CSV has too many rows');
   return rows.map((values,index)=>{
     if(values.length!==header.length)throw new Error(`CSV row ${index+2} has the wrong column count`);
@@ -86,7 +98,14 @@ export async function normalizeSessionCsv(text, context) {
     if(!['yes','no'].includes(row.launch_measured))throw new Error('Invalid launch_measured flag');
     if(!/^[A-Za-z0-9 -]{1,24}$/.test(row.club))throw new Error('Invalid club label');
     if(row.ti_radar.length>1000)throw new Error('Radar status text exceeds the contract limit');
+    const extended=Object.hasOwn(row,'club_speed_hidden_mph');
+    // Preserve diagnostics as bounded raw strings. Hidden/check/model fields
+    // must never replace accepted measured metrics or become validated spin.
+    if(extended && CSV_EXTRA_COLUMNS.some(key=>row[key].length>1000))
+      throw new Error('CSV diagnostic text exceeds the contract limit');
     return {row,
+      columns:extended?CSV_EXTENDED_COLUMNS:CSV_COLUMNS,
+      extra:extended?Object.fromEntries(CSV_EXTRA_COLUMNS.map(key=>[key,row[key]])):null,
       ball:number(row.ball_speed_mph,'ball speed',0,250),
       club:number(row.club_speed_mph,'club speed',0,200),
       smash:number(row.smash,'smash factor',0,2),
@@ -113,8 +132,9 @@ export async function normalizeSessionCsv(text, context) {
     quality_flags:['legacy_csv','sensor_values_unverified','spin_assumed','flight_direction_assumed',
       'no_impact_timestamp',...(x.row.launch_measured==='no'?['launch_assumed']:[])],
     source:{kind:'legacy_csv',filename,local_log_time:x.row.time,timezone,
-      row_sha256:await id('row',CSV_COLUMNS.map(k=>x.row[k])),
-      ti_radar:x.row.ti_radar,ball_speed_raw_mph:x.raw,apex_yards:x.apex}
+      row_sha256:await id('row',x.columns.map(k=>x.row[k])),
+      ti_radar:x.row.ti_radar,ball_speed_raw_mph:x.raw,apex_yards:x.apex,
+      ...(x.extra?{csv_format:'modus_csv_34',csv_extra:x.extra}:{})}
   })));
 }
 
