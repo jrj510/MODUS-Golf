@@ -18,7 +18,8 @@
 #   camera only          -> shot with no speeds (see RADAR_CONFIRM)
 SPEED_RADAR=on     # off = camera only
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-OPS_SPLIT=20       # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
+OPS_SPLIT=10       # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
+                   # (speed trigger fires ~15-20 ms before impact: most of the recording goes after it)
 OPS_SPEED_TRIGGER=40  # radar records by itself when something moves away faster, mph; 0 = off
 OPS_MIN_BALL=40    # slowest ball the radar counts as a shot, mph (lower for chips; more false triggers)
 RADAR_CONFIRM=off  # on = a camera trigger with no radar shot is NOT a shot (no speedless chips, but
