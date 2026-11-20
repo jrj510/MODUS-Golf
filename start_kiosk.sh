@@ -15,7 +15,7 @@
 #   camera only          -> shot with no speeds (see RADAR_CONFIRM)
 SPEED_RADAR=on     # off = camera only
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-OPS_BAUD=57600     # check against the OPS243 API doc if the radar prints nothing
+OPS_BAUD=0         # 0 = find it at start-up; once known (python3 camera/ops243.py prints it), put it here
 OPS_MIN_BALL=40    # slowest ball the radar counts as a shot, mph (lower for chips; more false triggers)
 RADAR_CONFIRM=off  # on = a camera trigger with no radar shot is NOT a shot (no speedless chips, but
                    # a shadow or the golfer moving can never count either)
