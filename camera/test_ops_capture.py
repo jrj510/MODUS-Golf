@@ -127,3 +127,52 @@ def test_real_dump_from_the_pi_has_no_shot():
     q = 1850 + rng.normal(0, 25, 4096)
     cap = Capture(1209.576, 1209.627, i, q, 0.0, RATE)
     assert find_shot(cap)[0] is None
+
+
+def test_mirror_image_is_dropped():
+    # I/Q imbalance: a weaker copy of the ball at the opposite Doppler sign.
+    mirror = lambda t: 12 * np.exp(-1j * 2 * np.pi * tone_hz(132.0) * t)
+    reps = capture_reports(synth(sign=+1, extra=mirror, club_peak=90.0, amp_club=0.0))
+    late = [r for r in reps if r.t > reps[0].t + 0.08]
+    assert all(len(r.speeds) == 1 for r in late)
+
+
+def test_slow_motion_does_not_leak_in_at_the_cutoff():
+    body = lambda t: 300 * np.exp(1j * 2 * np.pi * tone_hz(6.0) * t)
+    reps = capture_reports(synth(extra=body))
+    assert not any(abs(s - 10.1) < 0.3 for r in reps for s in r.speeds)
+
+
+def test_real_run_20261120():
+    """Block speeds from the first rolling-buffer run on the Pi (net, indoors):
+    4 hits, 5 recordings with no ball (practice swings, someone moving)."""
+    import os
+    from ops243 import DetectorConfig, Report, find_ball, measure_shot
+    path = os.path.join(os.path.dirname(__file__), "test_data", "run1_blocks_20261120.json")
+    with open(path) as f:
+        caps = json.load(f)
+    found = {}
+    for c in caps:
+        reps = [Report(t=ms / 1000.0, speeds=sorted(v, reverse=True)) for ms, v in c["blocks"]]
+        i = find_ball(reps, DetectorConfig(), fastest=True)
+        found[c["time"]] = None if i is None else measure_shot(reps, i, DetectorConfig()).ball_mph
+    hits = {k: v for k, v in found.items() if v is not None}
+    assert sorted(hits) == ["15:08:12", "15:08:45", "15:09:32", "15:10:08"]
+    assert abs(hits["15:09:32"] - 50.0) < 1.0
+
+
+def test_real_raw_captures_20261120():
+    """Raw I/Q from the first rolling-buffer run (56 deg wedge, 3/4 to full
+    swings into a net; the others are practice swings / someone moving)."""
+    import glob
+    import os
+    folder = os.path.join(os.path.dirname(__file__), "test_data", "caps_20261120")
+    hits = {}
+    for p in sorted(glob.glob(os.path.join(folder, "*.json"))):
+        with open(p) as f:
+            shot, _ = find_shot(Capture.from_json(json.load(f)))
+        if shot is not None:
+            hits[os.path.basename(p)[13:19]] = shot
+    assert sorted(hits) == ["150812", "150845", "150932", "151008"]
+    assert abs(hits["150932"].ball_mph - 50.0) < 1.0
+    assert abs(hits["150812"].club_mph - 56.0) < 1.0

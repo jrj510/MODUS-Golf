@@ -1435,7 +1435,7 @@ def main():
                    help="use the OPS243-A speed radar in rolling-buffer mode (camera/ops_capture.py: our own "
                         "FFT of its raw I/Q): ball speed, club speed. It triggers on its own and together "
                         "with the camera decides what is a shot (camera/shot_fusion.py)")
-    p.add_argument("--ops-split", type=int, default=20,
+    p.add_argument("--ops-split", type=int, default=10,
                    help="of the radar recording's 32 blocks (4.3 ms each), how many come from before the "
                         "trigger")
     p.add_argument("--ops-speed-trigger-mph", type=float, default=40.0,

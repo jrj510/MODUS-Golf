@@ -67,7 +67,7 @@ class SpeedRadar:
         self.fusion.start()
         if radar is None:
             trig = getattr(args, "ops_speed_trigger_mph", 40.0)
-            cfg = CaptureConfig(split=getattr(args, "ops_split", 20),
+            cfg = CaptureConfig(split=getattr(args, "ops_split", 10),
                                 speed_trigger_mph=trig if trig and trig > 0 else None)
             print(f"Speed radar: rolling buffer on {args.radar_port} "
                   f"({cfg.split} of 32 blocks before the trigger; speed trigger "

@@ -23,9 +23,9 @@ Triggers (any of them freezes the buffer):
   * S! sent over the serial line (software trigger)
 
 Pre-trigger split (S#n): n of the 32 blocks come from before the trigger.
-Default here 20 (85 ms before, 51 ms after): enough club before the
-trigger and enough ball after it, for the speed trigger and for the
-camera's pulse, which comes ~30-75 ms after impact.
+Default here 10 (43 ms before, 94 ms after). Measured 2026-11-20: the speed
+trigger fires as the club passes 40 mph, ~15-20 ms before impact, so most of
+the recording is wanted after it, where the ball is.
 
 Serial: the radar starts at 19200 baud (its saved setting); a dump is ~41 KB,
 which takes ~21 s at 19200, so we switch it to 230400 (I5) for ~1.8 s.
@@ -107,7 +107,9 @@ class ProcessConfig:
     max_peaks: int = 2             # speeds kept per block (club + ball)
     snr: float = 8.0               # peak must be this many times the block's noise floor
     separation_mph: float = 8.0    # two peaks closer than this are one target
-    outbound_sign: int = 0         # +1/-1 keep only that Doppler sign; 0 = both
+    outbound_sign: int = 0         # +1/-1: keep only that Doppler sign; 0 = work it out per
+                                   # capture (the side with the most energy: club and ball
+                                   # move away; the other side is clutter and mirror images)
 
 
 def block_spectra(cap: Capture, nfft: int = 4096) -> np.ndarray:
@@ -126,27 +128,48 @@ def speed_axis(rate: float, nfft: int = 4096) -> np.ndarray:
     return f * MPS_PER_HZ * MPH_PER_MPS
 
 
+def outbound_sign(spec: np.ndarray, v: np.ndarray, ok: np.ndarray) -> int:
+    """Which Doppler sign is "moving away": the side with more energy above
+    each block's noise floor (club and ball both move away from the radar)."""
+    floor = np.median(spec[:, ok], axis=1, keepdims=True)
+    excess = np.clip(spec - 8 * floor, 0, None)
+    pos = excess[:, ok & (v > 0)].sum()
+    neg = excess[:, ok & (v < 0)].sum()
+    return 1 if pos >= neg else -1
+
+
 def capture_reports(cap: Capture, cfg: Optional[ProcessConfig] = None) -> list[Report]:
     """One Report per block: its time on the Pi clock and its strongest speeds."""
     cfg = cfg or ProcessConfig()
     spec = block_spectra(cap, cfg.nfft)
     v = speed_axis(cap.rate, cfg.nfft)
     ok = np.abs(v) >= cfg.min_mph
-    if cfg.outbound_sign:
-        ok &= np.sign(v) == cfg.outbound_sign
+    sign = cfg.outbound_sign or outbound_sign(spec, v, ok)
+    floors = np.median(spec[:, ok], axis=1)
+    ok &= np.sign(v) == sign
     sep_bins = max(1, int(cfg.separation_mph / abs(v[1] - v[0])))
     reports = []
     for b in range(spec.shape[0]):
-        s = spec[b].copy()
-        floor = np.median(s[ok]) if ok.any() else np.median(s)
-        s[~ok] = 0.0
-        speeds = []
-        for _ in range(cfg.max_peaks):
-            k = int(np.argmax(s))
-            if s[k] < cfg.snr * floor or s[k] <= 0:
+        s = spec[b]
+        floor = floors[b]
+        # Real peaks only: a local maximum (higher than both neighbours), so
+        # slow motion just under min_mph can't leak in as a reading at the
+        # cut-off, and strong enough above this block's noise floor.
+        peak = np.zeros_like(ok)
+        peak[1:-1] = (s[1:-1] > s[:-2]) & (s[1:-1] >= s[2:])
+        cand = np.flatnonzero(peak & ok & (s >= cfg.snr * floor))
+        cand = cand[np.argsort(s[cand])[::-1]]
+        kept: list[int] = []
+        for k in cand:
+            if len(kept) >= cfg.max_peaks:
                 break
-            speeds.append(abs(float(v[k])))
-            s[max(0, k - sep_bins): k + sep_bins + 1] = 0.0
+            # Not the same target again, and not its mirror image (a weaker
+            # copy at the opposite Doppler sign from the radar's I/Q imbalance).
+            if any(abs(k - j) <= sep_bins or abs(abs(v[k]) - abs(v[j])) * (1.0 / abs(v[1] - v[0])) <= sep_bins
+                   for j in kept):
+                continue
+            kept.append(int(k))
+        speeds = [abs(float(v[k])) for k in kept]
         t_radar = cap.sample_time + (b + 0.5) * BLOCK / cap.rate
         if speeds:
             reports.append(Report(t=cap.pi_time(t_radar), speeds=sorted(speeds, reverse=True)))
@@ -190,7 +213,9 @@ def parse_dump(lines: list[str], received: float, rate: float) -> Optional[Captu
 @dataclass
 class CaptureConfig:
     rate_ksps: int = 30
-    split: int = 20                       # blocks from before the trigger (S#n)
+    split: int = 10                       # blocks from before the trigger (S#n): the speed
+                                          # trigger fires ~15-20 ms before impact (club passing
+                                          # 40 mph), so 43 ms before / 94 ms after
     speed_trigger_mph: Optional[float] = 40.0   # radar's own trigger, moving away; None = off
     trigger_magnitude: int = 20           # SMnnn
 
@@ -325,7 +350,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="MODUS OPS243-A rolling-buffer test")
     p.add_argument("--port", default="/dev/ttyAMA0")
     p.add_argument("--reset-gpio", type=int, default=23)
-    p.add_argument("--split", type=int, default=20, help="blocks (of 32) kept from before the trigger")
+    p.add_argument("--split", type=int, default=10, help="blocks (of 32) kept from before the trigger")
     p.add_argument("--speed-trigger-mph", type=float, default=40.0,
                    help="radar triggers itself on anything moving away faster; 0 = off")
     p.add_argument("--min-ball", type=float, default=40.0)
