@@ -43,7 +43,6 @@ import csv
 import json
 import re
 import statistics
-import sys
 import threading
 import time
 from collections import deque
@@ -277,10 +276,50 @@ class ShotDetector:
 # --------------------------------------------------------------------------
 # Serial driver
 # --------------------------------------------------------------------------
+BAUD_RATES = (19200, 57600, 115200, 9600, 230400)   # rates the OPS243 supports, likeliest first
+
+
+def reset_radar(gpio: Optional[int]) -> None:
+    """Pulse the OPS's /Reset pin (J3 pin 4) low, then wait for it to boot."""
+    if not gpio:
+        return
+    import subprocess
+    print(f"Resetting the radar (GPIO{gpio} -> J3 pin 4)...")
+    try:
+        subprocess.run(["pinctrl", "set", str(gpio), "op", "dl"], check=True)
+        time.sleep(0.2)
+        subprocess.run(["pinctrl", "set", str(gpio), "op", "dh"], check=True)
+        time.sleep(2.5)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"  could not reset it ({e}); carrying on")
+
+
+def find_baud(port: str, rates: Iterable[int] = BAUD_RATES) -> Optional[int]:
+    """Ask the radar for its module info ("??") at each baud rate; return the
+    first rate that gets a readable answer, or None."""
+    import serial
+    for baud in rates:
+        try:
+            with serial.Serial(port, baud, timeout=0.3) as ser:
+                ser.reset_input_buffer()
+                ser.write(b"??")
+                time.sleep(0.6)
+                data = ser.read(ser.in_waiting or 1)
+        except serial.SerialException as e:
+            print(f"  {port}: {e}")
+            return None
+        text = data.decode("ascii", "replace")
+        readable = sum(c.isprintable() or c in "\r\n" for c in text)
+        print(f"  {baud:>6} baud: " + (repr(text[:120]) if data else "nothing"))
+        if data and readable >= 0.9 * len(text) and any(c.isalnum() for c in text):
+            return baud
+    return None
+
+
 class OPS243:
     """The radar on a serial port. Reads in a background thread."""
 
-    def __init__(self, port: str = "/dev/ttyAMA0", baud: int = 57600):
+    def __init__(self, port: str = "/dev/ttyAMA0", baud: int = 19200):
         import serial  # pyserial
         self.ser = serial.Serial(port, baud, timeout=0.1)
         self._stop = threading.Event()
@@ -304,7 +343,9 @@ class OPS243:
             if verbose:
                 print(f"  {cmd:<6} -> {' | '.join(replies) or '(no reply)'}")
 
-    def start(self, on_report: Callable[[Report, str], None]) -> None:
+    def start(self, on_report: Callable[[Report, str], None],
+              on_other: Optional[Callable[[str], None]] = None) -> None:
+        """on_report gets every speed report; on_other every other line."""
         def loop() -> None:
             while not self._stop.is_set():
                 raw = self.ser.readline()
@@ -315,6 +356,8 @@ class OPS243:
                 rep = parse_line(line, t)
                 if rep is not None:
                     on_report(rep, line)
+                elif on_other is not None and line:
+                    on_other(line)
         self._thread = threading.Thread(target=loop, daemon=True)
         self._thread.start()
 
@@ -350,7 +393,10 @@ def replay(path: str, cfg: DetectorConfig) -> list[Shot]:
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="MODUS OPS243-A driver")
     p.add_argument("--port", default="/dev/ttyAMA0")
-    p.add_argument("--baud", type=int, default=57600)
+    p.add_argument("--baud", type=int, default=0,
+                   help="serial baud rate; 0 = find it (tries 19200, 57600, 115200, 9600, 230400)")
+    p.add_argument("--reset-gpio", type=int, default=23,
+                   help="GPIO wired to OPS J3 pin 4 (/Reset); reset before starting. 0 = don't")
     p.add_argument("--raw", action="store_true", help="print every report")
     p.add_argument("--log", help="save every report line to this CSV")
     p.add_argument("--replay", help="run detection on a saved CSV instead of the radar")
@@ -364,7 +410,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         replay(a.replay, cfg)
         return
 
-    radar = OPS243(a.port, a.baud)
+    reset_radar(a.reset_gpio)
+    baud = a.baud
+    if not baud:
+        print(f"Looking for the radar on {a.port}:")
+        baud = find_baud(a.port)
+        if baud is None:
+            print("No answer at any baud rate. Check: radar powered (LED on), TX/RX not swapped "
+                  "(J3 6/7 to Pi 8/10), radar's USB cable unplugged (USB turns its UART off), "
+                  "UART enabled on the Pi (raspi-config > Interface > Serial: login shell NO, "
+                  "hardware YES).")
+            return
+        print(f"Radar answers at {baud} baud")
+    radar = OPS243(a.port, baud)
     if not a.no_config:
         print("Sending AN-029 golf settings:")
         radar.configure()
@@ -384,7 +442,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                 print(f"{rep.t:.3f}  {rep.speeds}")
             det.feed(rep)
 
-    radar.start(on_report)
+    def on_other(line: str) -> None:
+        if a.raw:
+            print(f"        (not a speed) {line}")
+
+    radar.start(on_report, on_other)
     print("Listening. Ctrl+C to stop.")
     try:
         while True:
