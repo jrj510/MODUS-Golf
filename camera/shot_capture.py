@@ -122,13 +122,16 @@ class Shared:
         self.ring = None          # RingWatch for the armed ball: the turf round it
         self.ring_ref = None      # that turf as it looked when the ball was armed
 
-    def trigger(self, source, need_armed=True):
+    def trigger(self, source, need_armed=True, t=None):
+        """Start a capture. t: when the shot happened, if it was a moment ago
+        (the speed radar asking for frames of a shot the camera didn't trigger
+        on); the frames from around t are kept. Default: now."""
         with self.lock:
             if self.trigger_time is not None or self.pending is not None:
                 return  # already capturing a shot
             if need_armed and not self.armed:
                 return
-            self.trigger_time = time.monotonic()
+            self.trigger_time = time.monotonic() if t is None else t
             self.trigger_source = source
         if self.on_fire is not None:
             try:

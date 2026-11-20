@@ -1074,9 +1074,9 @@ def _pi5_pin_factory():
 
 
 def _corrected_speed(raw, launch, direction=None, club=None):
-    """The speed radar's reading corrected for its line of sight: (mph, our
-    model's mph before the trim, or None with OpenFlight's correction).
-    Raw back when there is no correction."""
+    """The speed radar's reading corrected for its line of sight: (mph, the
+    model's mph before the trim or None). Raw back when there is no
+    correction (none is loaded for now)."""
     cal = getattr(K, "ops_cal", None)
     if cal is not None:
         model, _ = cal.model(raw, launch, direction, club)
@@ -1099,15 +1099,11 @@ def _publish(shot, o, r, final, cam=None):
         if o:
             if o["ball_speed"] is not None:
                 m["ball_speed"] = round(o["ball_speed"], 1)
-            if o["club_speed"] is not None:            # ours (radar_calibration.club_speed_from_readings)
+            if o["club_speed"] is not None:            # ours (ops243.py: the club track's peak)
                 m["club_speed"] = round(o["club_speed"], 1)
                 m["club_speed_how"] = o.get("club_speed_how")
-            if o.get("club_speed_check") is not None:  # OpenFlight's, only logged as a check
-                m["club_speed_check"] = round(o["club_speed_check"], 1)
-                if final:
-                    ours = "none" if o["club_speed"] is None else f"{o['club_speed']:.1f} mph"
-                    print(f"Shot {shot}: club speed {ours} (MODUS, {o.get('club_speed_how') or 'not read'}); "
-                          f"check: OpenFlight's club speed {m['club_speed_check']} mph")
+            if o.get("source"):                        # confirmed / radar_only (shot_fusion.py)
+                m["shot_source"] = o["source"]
         if r:
             m["iwr_quality"], m["iwr_error"] = r["quality"], r["error"]
             if r["launch_angle"] is not None:
@@ -1153,16 +1149,6 @@ def _publish(shot, o, r, final, cam=None):
                     m["ball_speed_model"] = round(model, 1)
             except Exception as e:
                 print(f"Shot {shot}: ball-speed correction failed ({type(e).__name__}: {e})")
-            check = getattr(K, "speed_check", None)
-            if check is not None and m.get("ball_speed_raw") is not None:
-                try:
-                    m["ball_speed_check"] = round(check(raw, launch), 1)
-                    if final:
-                        print(f"Shot {shot}: ball speed {m['ball_speed']} mph (radar read {raw:.1f}, "
-                              f"launch {launch:g} deg); check: OpenFlight's correction gives "
-                              f"{m['ball_speed_check']} mph ({m['ball_speed'] - m['ball_speed_check']:+.1f})")
-                except Exception as e:
-                    print(f"Shot {shot}: OpenFlight's speed check failed ({type(e).__name__}: {e})")
         if m.get("ball_speed") and m.get("club_speed"):
             smash = m["ball_speed"] / m["club_speed"]
             top = smash_max(club)
@@ -1437,11 +1423,10 @@ def main():
                    help="with --cam-launch, the zoomed picture puts the hitting zone this far down "
                         "(0.5 = middle) so the ball has room to climb in it for more frames")
     p.add_argument("--radar-confirm", choices=("on", "off"), default="off",
-                   help="on: a camera trigger only counts as a shot if the speed radar saw a ball fly away "
-                        "(OpenFlight reports each trigger it drops); with nothing flying away (a shadow, "
-                        "the golfer moving) it is no shot and the ball goes back to Ready, once the radar "
-                        "is ready again. Needs --ops and the camera as the radar's trigger "
-                        "(--trigger-out-gpio). off = as before")
+                   help="on: a camera trigger only counts as a shot if the speed radar saw a ball fly away; "
+                        "with nothing flying away (a shadow, the golfer moving) it is no shot and the ball "
+                        "goes back to Ready. off = a camera trigger with no radar shot still counts, with no "
+                        "speeds (a chip under --ops-min-ball). Needs --ops")
     p.add_argument("--radar-confirm-wait", type=float, default=8.0,
                    help="longest wait, after a camera trigger, for the speed radar's answer; with no "
                         "answer by then the camera decides on its own, as before")
@@ -1474,66 +1459,21 @@ def main():
                    help="read plain speed readings from the OPS243-A. Only for a radar NOT set up in "
                         "rolling-buffer mode; this sends it setup commands")
     p.add_argument("--ops", action="store_true",
-                   help="use the OPS243-A in rolling-buffer mode through OpenFlight's code "
-                        "(ball speed, club speed, spin)")
+                   help="use the OPS243-A speed radar (camera/ops243.py, our own driver with the AN-029 "
+                        "golf settings): ball speed, club speed. It triggers on its own and together "
+                        "with the camera decides what is a shot (camera/shot_fusion.py)")
+    p.add_argument("--ops-baud", type=int, default=57600, help="OPS243-A serial baud rate")
+    p.add_argument("--ops-min-ball", type=float, default=40.0,
+                   help="slowest ball speed the radar counts as a shot, mph (lower for chips)")
     p.add_argument("--trigger-out-gpio", type=int, default=0,
-                   help="camera as the shot trigger: pulse this GPIO the moment the camera triggers. "
-                        "Wire it to OPS J3-3 and to --gate-gpio (in place of the sound detector's GATE). 0 = off")
+                   help="pulse this GPIO the moment the camera triggers (wired to --gate-gpio in place "
+                        "of the sound detector's GATE). Not needed by the speed radar. 0 = off")
     p.add_argument("--radar-pulse-fps", type=float, default=0.0,
-                   help="with the camera as the trigger: send the radar pulse when a camera at this frame "
-                        "rate would have triggered, whatever the camera's own frame rate, so the radars "
-                        "record the same moments around the shot in every mode. 0 = straight away")
-    p.add_argument("--ops-trigger", choices=("sound", "speed"), default="sound",
-                   help="what starts a shot capture: sound = SEN-14262 GATE on OPS J3-3 and GPIO17; "
-                        "speed = the OPS243-A's own speed trigger (no sound detector; ball must be 35+ mph)")
-    p.add_argument("--ops-trigger-mph", type=float, default=60.0,
-                   help="speed trigger: outbound speed that counts as a shot, mph (OpenFlight's default is 20)")
-    p.add_argument("--ops-ksps", type=int, default=30, help="OPS243-A sample rate, thousands per second")
-    p.add_argument("--ops-reset-gpio", type=int, default=0,
-                   help="GPIO wired to OPS J3 pin 4 (/Reset): if the speed radar doesn't answer at start, "
-                        "it is reset through this pin before trying again. 0 = none")
-    p.add_argument("--ops-pre-trigger", type=int, default=None,
-                   help="speed radar (sound trigger): how many of its 32 buffer blocks (~4.3 ms each) come "
-                        "from before the trigger. With the camera as the trigger it fires ~4 frames after "
-                        "the ball leaves, so the club coming in needs more history than OpenFlight's "
-                        "default (made for a sound trigger at impact). Empty = OpenFlight's default")
-    p.add_argument("--ops-power", type=int, default=None, choices=range(0, 8),
-                   help="OPS243-A transmit power, 0 = strongest (OpenFlight uses 3)")
-    p.add_argument("--iwr", action="store_true",
-                   help="use the TI radar for launch angle (its angles come from OpenFlight's TI "
-                        "processing until ours replaces it; start_kiosk.sh: TI_RADAR, off for now)")
-    p.add_argument("--openflight", default="~/openflight", help="where OpenFlight is installed")
-    p.add_argument("--iwr-port", default="/dev/ttyUSB0")
-    p.add_argument("--iwr-config", default="config/iwr6843_l3dump_wide_24f3ms_53bin_iq16.cfg")
-    p.add_argument("--iwr-cal", default="config/iwr6843_calibration_reference.json",
-                   help="TI radar calibration file (inside the OpenFlight folder)")
-    # TI geometry. start_kiosk.sh passes the measured values; these defaults
-    # match it so a hand-started kiosk uses the same numbers.
-    p.add_argument("--iwr-tee-m", type=float, default=1.575,
-                   help="slant distance, TI antenna centre to ball centre, m")
-    p.add_argument("--iwr-net-m", type=float, default=4.6,
-                   help="TI antenna centre to the net, m")
-    p.add_argument("--iwr-tilt-deg", type=float, default=10.0,
-                   help="TI antenna face tilt: degrees it leans back from vertical (boresight up)")
-    p.add_argument("--iwr-radar-height-m", type=float, default=0.076,
-                   help="TI antenna centre height above the ground under the ball, m")
-    p.add_argument("--iwr-ball-height-m", type=float, default=0.021,
-                   help="ball centre height above the same ground, m (0.021 = ball on the ground)")
-    p.add_argument("--iwr-azimuth-offset-deg", type=float, default=0.0,
-                   help="degrees the radars point right of the target line (left = negative)")
-    p.add_argument("--no-speed-correction", action="store_true",
-                   help="show the speed radar's raw ball speed (same as --speed-correction off)")
-    p.add_argument("--speed-correction", default="modus", choices=("modus", "openflight", "off"),
-                   help="ball speed from the speed radar's line-of-sight reading: modus = our own model + "
-                        "this unit's trim (camera/radar_calibration.py; OpenFlight's correction is logged "
-                        "as a check), openflight = OpenFlight's correction, off = the raw reading")
-    p.add_argument("--speed-net", default="off", choices=("on", "off"),
-                   help="on = shots go into a net at --iwr-net-m (inside): the speed radar loses the "
-                        "ball there")
-    p.add_argument("--ops-window-ms", type=float, default=90.0,
-                   help="how much of the ball's flight the speed radar's buffer holds, ms (start_kiosk.sh: "
-                        "~90 ms with the camera trigger)")
-    p.add_argument("--iwr-save-dumps", action="store_true", help="also save the raw TI radar captures")
+                   help="with --trigger-out-gpio: send the pulse when a camera at this frame rate would "
+                        "have triggered, whatever the camera's own frame rate. 0 = straight away")
+    p.add_argument("--ball-height-m", "--iwr-ball-height-m", dest="iwr_ball_height_m", type=float,
+                   default=0.021,
+                   help="ball centre height above the ground, m (0.021 = ball on the ground)")
     p.add_argument("--gate-gpio", type=int, default=17,
                    help="GPIO number the sound sensor's GATE is wired to (17 = pin 11, 26 = pin 37)")
     p.add_argument("--club", default="52",
@@ -1545,7 +1485,7 @@ def main():
     p.add_argument("--no-browser", action="store_true", help="do not open the full-screen browser")
     p.add_argument("--sleep-minutes", type=float, default=0.0,
                    help="go to sleep by itself after this many minutes of Looking for Ball with no ball, "
-                        "no shot and no taps on the screen (camera and TI radar off, screen dark; tap "
+                        "no shot and no taps on the screen (camera off, screen dark; tap "
                         "to wake). 0 = only with the Sleep button")
     p.add_argument("--sleep-screen", choices=("off", "black"), default="off",
                    help="while asleep: off = backlight off (saves the most); black = backlight left on "
@@ -1655,9 +1595,34 @@ def main():
             print("The saved hitting zone is outside this view: drag a new one")
     K.training = count_training(args.out)
 
-    sh = Shared(maxlen=int(args.fps * (args.pre + args.post) * 1.3) + 20)
+    # (+0.35 s: the speed radar can ask for a capture of a shot ~0.3 s after it happened)
+    sh = Shared(maxlen=int(args.fps * (args.pre + args.post + 0.35) * 1.3) + 20)
     cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
     cam_thread.start()
+
+    def radar_ball_present():
+        """For the speed radar, after a radar shot the camera didn't trigger on:
+        True = the camera is Ready and its ball is still on the spot (so it was
+        no shot of ours), False = Ready but the ball is gone, None = the camera
+        isn't watching a ball."""
+        if not sh.armed or sh.ball_ref is None:
+            return None
+        latest = sh.latest
+        d = _ball_diff(sh, latest)
+        if d is None:
+            return None
+        if d <= args.motion_threshold * 0.5:
+            return True
+        if shadow_guard_on(args) and ball_still_there(sh, latest)[0]:
+            return True
+        return False
+
+    def radar_wants_capture(t):
+        """The speed radar saw a shot the camera didn't trigger on: capture the
+        frames from around it (t = when the camera's trigger would have been)."""
+        if K.state == "SLEEPING":
+            return
+        sh.trigger("radar", need_armed=False, t=t)
 
     ops = None
     if args.ops:
@@ -1665,65 +1630,19 @@ def main():
             print("--ops and --ops-speed-mode can't be used together; using --ops")
             radar = None
         try:
-            from iwr_bridge import OPSBridge
-            ops = OPSBridge(args)
+            from speed_radar import SpeedRadar
+            ops = SpeedRadar(args, trigger_camera=radar_wants_capture, ball_present=radar_ball_present)
+            print(f"Speed radar: on ({args.radar_port}); it triggers on its own and with the camera")
         except Exception as e:
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
             # On screen too: at the simulator bay a whole session ran without
             # the radar and nothing said so.
             K.radar_note = "Speed radar not connected: no ball speed. Unplug the box for 5 s and start again"
-    def start_ti():
-        """The TI radar (launch angle), through OpenFlight. Also used on waking up."""
-        try:
-            from iwr_bridge import IWRBridge
-            # OpenFlight's monitor owns the sound trigger pin; each sound trigger is passed on to
-            # the camera so it can capture the shot too.
-            return IWRBridge(args, on_trigger=lambda: sh.trigger("sound"), ops=ops)
-        except Exception as e:
-            print(f"TI radar not available ({type(e).__name__}: {e}); continuing without it")
-            return None
-
-    def stop_ti(b):
-        """Stop the TI radar (going to sleep): unhook it from the speed radar, then
-        stop its firmware and free its port and trigger pin."""
-        if ops is not None:
-            for hooks, fn in ((getattr(ops, "listeners", None), getattr(b, "_on_ops_shot", None)),
-                              (getattr(ops, "trigger_listeners", None), getattr(b, "_software_trigger", None))):
-                if hooks is not None and fn is not None:
-                    while fn in hooks:
-                        hooks.remove(fn)
-        b.stop()
-
-    bridge = start_ti() if args.iwr else None
-    K.ops, K.bridge = ops, bridge       # so the Club button can update both radars
-    # Ball speed: the speed radar reads along its line of sight, low for a
-    # ball climbing away. Corrected with the launch angle (camera / TI radar,
-    # or the club's typical launch until one arrives). Ours by default
-    # (radar_calibration.OPSCalibration: our line-of-sight model + this
-    # unit's trim); OpenFlight's correction is worked out too and logged
-    # next to it as a check, and used instead if ours can't load. The raw
-    # reading is kept in the session log.
+    bridge = None                       # TI radar: not used for now
+    K.ops, K.bridge = ops, bridge       # so the Club button can update the radar
+    # Ball speed: the radar's reading as it is for now (no line-of-sight
+    # correction loaded); the raw reading is kept in the session log.
     K.correct_speed = K.speed_check = K.ops_cal = None
-    speed_mode = "off" if args.no_speed_correction else args.speed_correction
-    if ops is not None and speed_mode != "off":
-        from iwr_bridge import ops_speed_corrector
-        openflight_fix = ops_speed_corrector(args)
-        if speed_mode == "modus":
-            try:
-                from radar_calibration import OPSCalibration
-                K.ops_cal = OPSCalibration.from_args(args)
-                K.speed_check = openflight_fix
-            except Exception as e:
-                print(f"MODUS speed calibration not available ({type(e).__name__}: {e}); "
-                      f"using OpenFlight's correction")
-        if K.ops_cal is None:
-            K.correct_speed = openflight_fix
-        if K.ops_cal is not None or K.correct_speed is not None:
-            src = ("the camera's or TI radar's angle, or the club's typical launch until one arrives"
-                   if (bridge is not None or args.cam_launch == "on") else "the club's typical launch")
-            how = (K.ops_cal.text() + (" (OpenFlight's correction logged as a check)" if K.speed_check else "")
-                   if K.ops_cal is not None else "OpenFlight's cosine correction")
-            print(f"Ball speed: {how}; launch angle from {src}; raw OPS reading kept in the log")
     if args.trigger_out_gpio:
         # The camera replaces the sound detector: when it sees the ball leave
         # (motion trigger) it sends the same 3.3 V pulse the detector's GATE did,
@@ -1766,6 +1685,17 @@ def main():
                          if d > 0 else f"at {args.fps:.0f} fps it goes straight away"))
         except Exception as e:
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
+    if ops is not None:
+        # Every camera trigger goes to the speed radar too, which pairs it with
+        # its own shot (shot_fusion.py). "radar" = a capture the radar asked for.
+        cam_fire = sh.on_fire
+
+        def fire_both(source):
+            if source != "radar":
+                ops.camera_fired(sh.trigger_time or time.monotonic(), source)
+                if cam_fire is not None:
+                    cam_fire(source)
+        sh.on_fire = fire_both
     print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"
                               if shadow_guard_on(args) else "off"))
     K.cam_calib = None
@@ -1792,9 +1722,7 @@ def main():
         if ops is None:
             why = "no speed radar"
         elif not getattr(ops, "reports_no_ball", False):
-            why = "this OpenFlight copy doesn't report triggers with nothing flying away"
-        elif sh.on_fire is None:
-            why = "the camera isn't the speed radar's trigger (--trigger-out-gpio)"
+            why = "this speed radar doesn't report triggers with nothing flying away"
         else:
             why, radar_confirm = None, True
         print("Radar check: " + (f"off ({why})" if why else
@@ -1898,9 +1826,8 @@ def main():
     view_settle_until = 0.0     # frames from before a zoom change are still arriving
     focus_best, focus_where = None, None
 
-    # Sleep: camera and TI radar off, screen dark, until the screen is tapped.
-    # The speed radar is left running in its rolling-buffer mode (OpenFlight:
-    # changing its mode at runtime can break its trigger until it is power-cycled).
+    # Sleep: camera off, screen dark, until the screen is tapped. The speed
+    # radar keeps running (it can't ask the camera for a capture while asleep).
     sleep_after = args.sleep_minutes * 60.0
     asleep_since = 0.0
 
@@ -1921,7 +1848,7 @@ def main():
         return c
 
     def fall_asleep(reason):
-        nonlocal bridge, asleep_since, ball, drawn
+        nonlocal asleep_since, ball, drawn
         K.sleep_request = False
         K.wake_request = False
         K.state = "SLEEPING"
@@ -1940,19 +1867,12 @@ def main():
                 cam.stop()
             except Exception as e:
                 print(f"Could not stop the camera ({type(e).__name__}: {e})")
-        ti = "off" if bridge is not None else "not running"
-        if bridge is not None:
-            try:
-                stop_ti(bridge)
-            except Exception as e:
-                print(f"TI radar stop: {type(e).__name__}: {e}")
-            bridge = K.bridge = None
         print(f"[{time.strftime('%H:%M:%S')}] Asleep ({reason}): camera "
-              f"{'off' if camera_off else 'still running (did not stop)'}, TI radar {ti}, screen "
+              f"{'off' if camera_off else 'still running (did not stop)'}, screen "
               f"{'backlight off' if dark else 'black'}. Tap the screen to wake.")
 
     def wake_up():
-        nonlocal bridge, cam_thread, zone, view_settle_until
+        nonlocal cam_thread, zone, view_settle_until
         K.wake_request = False
         K.state = "WAKING"
         K.backlight.on()
@@ -1973,8 +1893,6 @@ def main():
             sh.running = True
             cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
             cam_thread.start()
-        if args.iwr and bridge is None:
-            bridge = K.bridge = start_ti()        # set up again exactly as at start-up
         if zone is not None:
             # As at start-up: a fresh picture of the empty zone (the box may
             # have been carried somewhere else), taken once things are still.
@@ -1983,8 +1901,7 @@ def main():
         K.reset_track = True
         K.touch()
         K.state = "SEARCHING"
-        print(f"[{time.strftime('%H:%M:%S')}] Awake in {time.monotonic() - t0:.1f} s: camera on, "
-              f"TI radar {'on' if bridge is not None else 'off'}")
+        print(f"[{time.strftime('%H:%M:%S')}] Awake in {time.monotonic() - t0:.1f} s: camera on")
 
     if sleep_after > 0:
         print(f"Sleep: by itself after {args.sleep_minutes:g} min with no ball, no shot and no taps "
@@ -2059,20 +1976,17 @@ def main():
                 if ae is not None:
                     ae.next_check = max(view_settle_until, time.monotonic())  # re-meter on the (new) zone
 
-            # A trigger fired. The radars were pulsed at once (their recordings
-            # are short), but whether it was a shot is decided here: a club
+            # A trigger fired (the camera's own, or a capture the speed radar
+            # asked for). Whether it was a shot is decided here: a club
             # tapped down behind the ball covers its spot exactly like a shot
             # does. If the ball's spot looks like the ball again within
             # --verify-seconds, it was no shot: back to Ready with nothing
             # counted. The radar numbers take longer than this to arrive anyway,
             # so a real shot loses nothing by the wait.
             # With the radar check (--radar-confirm) the speed radar has the last
-            # word: it recorded the moment of the trigger, and OpenFlight says
-            # whether anything flew away. Nothing flew away = no shot, however
-            # different the ball's spot looks (a shadow, the golfer moving).
-            # Ready comes back only once the radar has finished reading out its
-            # recording (it can't record a shot until then), so Ready always
-            # means the camera AND the radar are ready.
+            # word: it says whether a ball flew away around the trigger. Nothing
+            # flew away = no shot, however different the ball's spot looks (a
+            # shadow, the golfer moving).
             if sh.pending is not None and verify is None and not args.swing_test:
                 tt = sh.pending[0]
                 first = ops.outcome(tt) if radar_confirm else ("unknown", None)
