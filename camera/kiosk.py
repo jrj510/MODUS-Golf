@@ -1036,6 +1036,28 @@ def _mph_text(v):
     return f"{v:.0f} mph" if isinstance(v, (int, float)) else "speed unknown"
 
 
+# The camera's trigger is decided this many frames after the ball has left, on
+# average: PatchWatch triggers 4 frames after the first frame with the ball
+# gone, and that frame comes on average half a frame after the ball left.
+TRIGGER_FRAMES = 4.5
+
+
+def radar_pulse_delay(pulse_fps, camera_fps, requested_fps=None):
+    """Seconds to hold the radar pulse after the camera's trigger, so it goes
+    out when a pulse_fps camera would have triggered (TRIGGER_FRAMES of its
+    frames after the ball left). A faster camera decides sooner; the speed
+    radar's 136 ms recording (and the TI radar's capture) is then lined up
+    with the shot exactly as at pulse_fps. camera_fps is the measured rate
+    (requested_fps until it is known). 0 when pulse_fps is off or the camera
+    is no faster."""
+    if not pulse_fps or pulse_fps <= 0:
+        return 0.0
+    fps = camera_fps if camera_fps and camera_fps > 1.0 else (requested_fps or 0.0)
+    if fps <= pulse_fps:
+        return 0.0
+    return TRIGGER_FRAMES * (1.0 / pulse_fps - 1.0 / fps)
+
+
 def _pi5_pin_factory():
     """gpiozero can't pick its pin factory by itself on a Pi 5 (its lgpio
     factory looks for the GPIO chip with a missing import and gives up), so
@@ -1430,6 +1452,10 @@ def main():
     p.add_argument("--trigger-out-gpio", type=int, default=0,
                    help="camera as the shot trigger: pulse this GPIO the moment the camera triggers. "
                         "Wire it to OPS J3-3 and to --gate-gpio (in place of the sound detector's GATE). 0 = off")
+    p.add_argument("--radar-pulse-fps", type=float, default=0.0,
+                   help="with the camera as the trigger: send the radar pulse when a camera at this frame "
+                        "rate would have triggered, whatever the camera's own frame rate, so the radars "
+                        "record the same moments around the shot in every mode. 0 = straight away")
     p.add_argument("--ops-trigger", choices=("sound", "speed"), default="sound",
                    help="what starts a shot capture: sound = SEN-14262 GATE on OPS J3-3 and GPIO17; "
                         "speed = the OPS243-A's own speed trigger (no sound detector; ball must be 35+ mph)")
@@ -1676,17 +1702,35 @@ def main():
             from gpiozero import DigitalOutputDevice    # (plain OutputDevice has no blink())
             trig_out = DigitalOutputDevice(args.trigger_out_gpio, active_high=True, initial_value=False)
 
+            def send(t):
+                trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
+                if ops is not None:
+                    # So the radar's verdict can be matched to this trigger.
+                    ops.pulsed(t)
+
             def fire(source):
                 if source != "sound":        # "sound" = our own pulse coming back on --gate-gpio
+                    t = sh.trigger_time or time.monotonic()
+                    # Held back (on a timer: the camera keeps grabbing frames)
+                    # so the radars record the same moments as at --radar-pulse-fps.
+                    wait = radar_pulse_delay(args.radar_pulse_fps, sh.camera_fps, args.fps)
                     print(f"[{time.strftime('%H:%M:%S')}] Camera trigger ({source}): "
-                          f"pulse on GPIO{args.trigger_out_gpio} to both radars")
-                    trig_out.blink(on_time=0.05, off_time=0.05, n=1, background=True)
-                    if ops is not None:
-                        # So the radar's verdict can be matched to this trigger.
-                        ops.pulsed(sh.trigger_time or time.monotonic())
+                          f"pulse on GPIO{args.trigger_out_gpio} to both radars"
+                          + (f" in {1000 * wait:.0f} ms (when a {args.radar_pulse_fps:.0f} fps camera would)"
+                             if wait > 0 else ""))
+                    if wait > 0:
+                        threading.Timer(wait, send, args=(t,)).start()
+                    else:
+                        send(t)
             sh.on_fire = fire
             print(f"Camera is the shot trigger: pulses GPIO{args.trigger_out_gpio} "
                   f"(wired to OPS J3-3 and GPIO{args.gate_gpio})")
+            if args.radar_pulse_fps:
+                d = radar_pulse_delay(args.radar_pulse_fps, 0.0, args.fps)
+                print(f"Radar pulse timing: as a {args.radar_pulse_fps:.0f} fps camera's trigger "
+                      f"({1000 * TRIGGER_FRAMES / args.radar_pulse_fps:.0f} ms after the ball leaves); "
+                      + (f"at {args.fps:.0f} fps the pulse is held about {1000 * d:.0f} ms"
+                         if d > 0 else f"at {args.fps:.0f} fps it goes straight away"))
         except Exception as e:
             print(f"Trigger output not available ({type(e).__name__}: {e}); radars get no trigger")
     print("Shadow guard: " + ("on (a shadow or change of light on the ball is not taken for a shot)"

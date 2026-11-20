@@ -28,7 +28,7 @@ MOTION_THRESHOLD=12 # camera trigger: how much the ball's spot must change (0-25
 # Ready while a shadow sits on the ball. Pictures of each decision go to
 # shots/shadow_checks/ (newest 40 of each kind). off = exactly as before.
 OUTSIDE_SHADOW_GUARD=on
-INSIDE_SHADOW_GUARD=off
+INSIDE_SHADOW_GUARD=on    # same checks in both modes
 # Radar check: the camera's trigger pulses the speed radar, and OpenFlight says
 # whether anything flew away. on = a camera trigger only counts as a shot if
 # the speed radar saw a ball leave; a shadow or the golfer moving (nothing
@@ -37,7 +37,7 @@ INSIDE_SHADOW_GUARD=off
 # radar can't see (a chip under 15 mph) is then not counted either: it had no
 # numbers anyway. off = the camera decides on its own, as before.
 OUTSIDE_RADAR_CONFIRM=on
-INSIDE_RADAR_CONFIRM=off
+INSIDE_RADAR_CONFIRM=on   # same checks in both modes
 # Cover guard: setting the club down behind the ball hides it from the camera,
 # which looked like the ball leaving (Checking at address, then Looking for
 # Ball). on = the camera tells the club at address from the ball leaving (the
@@ -61,15 +61,21 @@ OPS_TRIGGER=sound  # sound = the OPS waits for a pulse on J3-3 (from the camera 
                    # speed = the OPS triggers itself (picked up noise here, so not used)
 TRIGGER_OUT_GPIO=21 # camera trigger: GPIO21 (pin 40) pulses OPS J3-3 and GPIO20 (pin 38) when the
                    # camera sees the ball leave. 0 = off (only if the sound detector is wired again)
-# Speed radar history. With the camera as the trigger (TRIGGER_OUT_GPIO), the
-# pulse reaches the OPS ~4 camera frames after the ball leaves, because the
-# camera checks the ball is really gone first. That is ~90 ms after impact at
-# 60 fps, ~40 ms at 144 fps. OpenFlight's default buffer (made for a sound
-# trigger at impact) then no longer holds the club coming in: no club speed.
-# These say how many of the OPS buffer's 32 blocks (~4.3 ms each, 136 ms in all)
-# come from before the trigger. Only used with the camera trigger.
-OUTSIDE_OPS_PRE_TRIGGER=30   # 128 ms before the trigger: club + ~90 ms of ball at 60 fps
-INSIDE_OPS_PRE_TRIGGER=20    # 85 ms before + 51 ms after: club + ~90 ms of ball at 144 fps
+# Radar timing. With the camera as the trigger (TRIGGER_OUT_GPIO), the camera
+# checks the ball is really gone before it pulses the radars: ~4.5 camera
+# frames after the ball leaves, ~75 ms at 60 fps but only ~31 ms at 144 fps.
+# RADAR_PULSE_FPS makes both modes pulse the radars when a camera at that
+# frame rate would (60 = Outside's timing, which works): at 144 fps the pulse
+# is held back ~44 ms, so the radars record exactly the same moments around the
+# shot in both modes, while the camera keeps its 144 fps for the launch angle.
+# 0 = pulse straight away (the old way; then Inside needs fewer blocks, 20).
+RADAR_PULSE_FPS=60
+# Speed radar history: how many of the OPS buffer's 32 blocks (~4.3 ms each,
+# 136 ms in all) come from before the pulse. OpenFlight's default (made for a
+# sound trigger at impact) would no longer hold the club coming in. Only used
+# with the camera trigger. Same in both modes, as the pulse timing is.
+OUTSIDE_OPS_PRE_TRIGGER=30   # 128 ms before the pulse + 8.5 ms after: the club coming in + the ball's first ~80 ms
+INSIDE_OPS_PRE_TRIGGER=30
 OPS_TRIGGER_MPH=60 # speed trigger only fires at this outbound speed or faster (OpenFlight default 20 mph);
                    # lower it for chips, raise it if things that aren't shots still start a measurement
 OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time the kiosk starts. Empty = off
@@ -238,8 +244,8 @@ while true; do
     fi
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     reset_ops
-    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off}, cover guard ${COVER:-off}, camera launch ${CAMLAUNCH:-off}, ball speed ${SPEED_CORRECTION:-modus} (net ${SPEEDNET:-off}), TI radar ${TI_RADAR:-off} (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py',$IWRARG'--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--cover-guard','${COVER:-off}','--cam-launch','${CAMLAUNCH:-off}','--cam-height-m','$CAM_HEIGHT_M','--cam-ball-m','$CAM_BALL_M','--speed-correction','${SPEED_CORRECTION:-modus}','--speed-net','${SPEEDNET:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, radar check ${CONFIRM:-off}, cover guard ${COVER:-off}, radar pulse as at ${RADAR_PULSE_FPS:-0} fps (OPS history $OPS_PRE blocks), camera launch ${CAMLAUNCH:-off}, ball speed ${SPEED_CORRECTION:-modus} (net ${SPEEDNET:-off}), TI radar ${TI_RADAR:-off} (log: $LOG)"
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py',$IWRARG'--ops',$DETECT,'--no-browser','--iwr-tee-m','$TEE_M','--iwr-net-m','$NET_M','--iwr-tilt-deg','$TILT_DEG','--iwr-radar-height-m','$RADAR_H','--iwr-ball-height-m','$BALL_H','--iwr-azimuth-offset-deg','$AZIMUTH_DEG',$DUMPS$MODELARG$OPSPREARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--ops-trigger','$OPS_TRIGGER','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--radar-pulse-fps','${RADAR_PULSE_FPS:-0}','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${CONFIRM:-off}','--cover-guard','${COVER:-off}','--cam-launch','${CAMLAUNCH:-off}','--cam-height-m','$CAM_HEIGHT_M','--cam-ball-m','$CAM_BALL_M','--speed-correction','${SPEED_CORRECTION:-modus}','--speed-net','${SPEEDNET:-off}','--ops-trigger-mph','$OPS_TRIGGER_MPH','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"
