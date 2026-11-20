@@ -58,6 +58,44 @@ OPENFLIGHT_CLUBS = {
 }
 
 
+def _reset_ops(gpio, low_s=0.3, boot_s=2.5):
+    """Reset the OPS243-A through its /Reset pin (J3 pin 4), as start_kiosk.sh
+    does before each start: low for a moment, then high, and wait for it to
+    start up again (about 2 s)."""
+    import subprocess
+    try:
+        subprocess.run(["pinctrl", "set", str(gpio), "op", "dl"], check=True, timeout=5)
+        time.sleep(low_s)
+        subprocess.run(["pinctrl", "set", str(gpio), "op", "dh"], check=True, timeout=5)
+        time.sleep(boot_s)
+    except Exception as e:
+        print(f"Speed radar: reset through GPIO{gpio} failed ({type(e).__name__}: {e})")
+
+
+def _drain_port(port, bauds=(230400, 19200), quiet_s=0.5, max_s=6.0):
+    """Read and throw away whatever the radar is still sending, at each rate it
+    may be talking at, until it has been quiet for quiet_s (at most max_s
+    each). Yields (baud, bytes read)."""
+    try:
+        import serial
+    except ImportError:
+        return
+    for baud in bauds:
+        got = 0
+        try:
+            with serial.Serial(port, baud, timeout=0.05) as s:
+                end = time.monotonic() + max_s
+                quiet_until = time.monotonic() + quiet_s
+                while time.monotonic() < end and time.monotonic() < quiet_until:
+                    data = s.read(4096)
+                    if data:
+                        got += len(data)
+                        quiet_until = time.monotonic() + quiet_s
+        except Exception as e:
+            print(f"Speed radar: couldn't read {port} at {baud} baud ({type(e).__name__}: {e})")
+        yield baud, got
+
+
 def _openflight_root(args):
     root = os.path.expanduser(args.openflight)
     src = os.path.join(root, "src")
@@ -428,8 +466,7 @@ class OPSBridge:
             self.monitor = RollingBufferMonitor(port=args.radar_port, trigger_type=self.trigger_type,
                                                 sample_rate_ksps=args.ops_ksps)
         segs = getattr(getattr(self.monitor, "trigger", None), "pre_trigger_segments", None)
-        if not self.monitor.connect():
-            raise RuntimeError(f"could not connect on {args.radar_port}")
+        self._connect(args)
         if self.trigger_type == "speed":
             # OpenFlight's 20 mph default fires on anything moving away from the
             # radar (people, the net, a fan), so a shot started the moment a
@@ -465,6 +502,50 @@ class OPSBridge:
                   f"from before the trigger" if isinstance(segs, int) and self.trigger_type == "sound" else "")
         print(f"Speed radar ready on {args.radar_port} (rolling-buffer mode, "
               f"{self.trigger_type} trigger, {club_text}{window})")
+
+    CONNECT_TRIES = 3
+
+    def _connect(self, args):
+        """Connect to the OPS243-A, trying again when it doesn't answer.
+
+        At the simulator bay (Nov 2026) only the first start after power-up
+        found the radar: every later start (after a mode switch or the Menu)
+        got no reply at any baud rate, and the whole session ran without ball
+        speed. OpenFlight asks the radar for its firmware version at each
+        rate in turn, for a fraction of a second each; a radar still sending
+        a recording (2 s at 230400 baud), or one left in a state where it
+        doesn't answer, fails all of them. So before trying again: close the
+        port, let whatever it is still sending finish (read until it is
+        quiet), and on the last try reset it through its /Reset pin
+        (--ops-reset-gpio) as at power-up."""
+        last = None
+        for attempt in range(self.CONNECT_TRIES):
+            try:
+                if self.monitor.connect():
+                    if attempt:
+                        print(f"Speed radar: answered on try {attempt + 1}")
+                    return
+                last = RuntimeError(f"could not connect on {args.radar_port}")
+            except Exception as e:          # ConnectionError: no reply at any baud
+                last = e
+            if attempt == self.CONNECT_TRIES - 1:
+                break
+            reset = attempt == self.CONNECT_TRIES - 2 and getattr(args, "ops_reset_gpio", 0)
+            print(f"Speed radar: no answer (try {attempt + 1} of {self.CONNECT_TRIES}); "
+                  + ("resetting it through GPIO%d, " % reset if reset else "")
+                  + "waiting for it to go quiet and trying again")
+            radar = getattr(self.monitor, "radar", None)
+            try:
+                if radar is not None:
+                    radar.disconnect()
+            except Exception:
+                pass
+            if reset:
+                _reset_ops(reset)
+            for baud, got in _drain_port(args.radar_port):
+                if got:
+                    print(f"Speed radar: it was still sending ({got} bytes read at {baud} baud before it went quiet)")
+        raise last
 
     def _keep_readings(self):
         """Have OpenFlight's processor hand us each recording's FFT readings

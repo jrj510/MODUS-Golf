@@ -19,12 +19,20 @@ How it works
 2. The flight (track_flight). In the frames after impact the ball is the
    small blob that moves away from where it sat: up, shrinking, along a
    nearly straight line in the picture. The frames just before the ball's
-   spot first changes (their median) are the background. Only changes of the
-   ball's own polarity count: a white ball is brighter than the net behind
-   it, while the club head and the ball's now-empty spot are darker. Blobs
-   too big (the club head), too thin (the shaft) or in the wrong place are
-   dropped; the ball is the chain of blobs that keeps moving away from its
-   spot and getting smaller.
+   spot first changes (their median) are the background; a change that lasts
+   one frame only is a flash of light (a simulator's), not impact. Only
+   changes of the ball's own polarity count: a white ball is brighter than
+   the net behind it (in front of a bright projector screen its lit top
+   still is, its shaded underside darker), while the club head and the
+   ball's now-empty spot are darker. Blobs too big (the club head), too thin
+   (the shaft), part of something long or big that changed with them (a
+   shine on the club's shaft or head) or in the wrong place are dropped. The
+   ball is the longest chain of blobs that keeps moving away from its spot
+   and up the picture, all in one direction from the spot, along a nearly
+   straight line, getting no bigger. All chains are compared, not the
+   nearest blob taken each time: just after impact the club's shine sits
+   right next to the spot, and following it gave launch angles near 0 or
+   below (the simulator bay, Nov 2026).
 
 3. The angle (solve_launch). The ball leaves its spot at time t0 with speed v
    at launch angle theta and direction phi, and falls under gravity. For any
@@ -32,7 +40,12 @@ How it works
    how big. A least-squares fit (Levenberg-Marquardt) finds the values that
    match the frames, with the speed radar's ball speed as a prior on v when
    there is one. Its spread gives the uncertainty, used to judge the result
-   and, with the TI radar, to weight the two (fuse_launch).
+   and, with the TI radar, to weight the two (fuse_launch). A result that
+   can't be the ball is rated poor and never used: below the ground, a speed
+   no golf ball has (when the radar's speed isn't there to set it), or a
+   single sighting. No angle at all when the ball is too small in the
+   picture to follow (the wide view), or, when nothing else says a ball flew,
+   when its spot is never seen empty.
 
 Conventions: world origin at the camera; x forward (horizontal, towards the
 ball), y left, z up. Launch direction is reported right-positive, like the
@@ -46,6 +59,9 @@ import cv2
 import numpy as np
 
 BALL_D = 0.04267            # golf ball diameter, m (USGA minimum)
+MIN_BALL_PX = 16            # ball at rest narrower than this in the picture: too small to follow (zoom in)
+MIN_ANGLE = -3.0            # launch angles below this (deg) are the club, not the ball
+SPEED_RANGE = (8.0, 95.0)   # ball speeds a golf shot can have (m/s; 18-212 mph)
 G = 9.81
 SENSOR_W, SENSOR_H = 1280, 800
 
@@ -202,6 +218,67 @@ def _rest_measure(bg, frames, first, rest_box, sign, thr):
     return u, top + 0.5 * wd, wd
 
 
+def _best_chain(frames_cands, cxr, cyr, d_rest):
+    """The ball's path through the frames: the longest chain of blobs that
+    keeps moving away from its spot, upwards in the picture (every ball
+    rises towards the horizon, whatever its launch angle), getting no bigger,
+    along a nearly straight line with steps that change only gradually. Not
+    simply the nearest blob each time: just after impact the club head's
+    shine sits right next to the spot, and a chain that starts on it would
+    follow the club (a launch angle near 0, or below). One frame may be
+    missed. frames_cands: for each frame in turn, its blobs, each (time, u,
+    v, d, ...) (an iterator, so frames past the end of every chain are never
+    looked at). Returns the chain's blobs, in order."""
+    r = lambda c: math.hypot(c[1] - cxr, c[2] - cyr)
+    chains, done = [], []                        # each a list of (frame index, blob)
+    for fi, cands in enumerate(frames_cands):
+        grown = []
+        for ch in chains:
+            li, last = ch[-1]
+            if fi - li > 2:
+                continue
+            for c in cands:
+                if r(c) <= r(last) + 0.3 * d_rest or c[2] > last[2] + 0.3 * d_rest:
+                    continue                     # not moving away, or moving down
+                if c[3] > 1.3 * last[3] + 2:
+                    continue                     # growing
+                first = ch[0][1]
+                if r(first) > 0.8 * d_rest and r(c) > 0.8 * d_rest:
+                    # The ball flies out from its spot along one line: seen
+                    # from the spot, every sighting is in the same direction.
+                    a1 = math.atan2(first[2] - cyr, first[1] - cxr)
+                    a2 = math.atan2(c[2] - cyr, c[1] - cxr)
+                    if abs((a2 - a1 + math.pi) % (2 * math.pi) - math.pi) > math.radians(30):
+                        continue
+                step = math.hypot(c[1] - last[1], c[2] - last[2]) / (fi - li)
+                if len(ch) >= 2:
+                    pi, prev = ch[-2]
+                    du, dv = (last[1] - prev[1]) / (li - pi), (last[2] - prev[2]) / (li - pi)
+                    pu, pv = last[1] + du * (fi - li), last[2] + dv * (fi - li)
+                    if math.hypot(c[1] - pu, c[2] - pv) >= max(2.5 * d_rest, 0.8 * math.hypot(du, dv) * (fi - li)):
+                        continue                 # off the line, or a jump in speed
+                    if step > 1.8 * math.hypot(du, dv) + d_rest:
+                        continue
+                grown.append(ch + [(fi, c)])
+        # A new chain: the ball's first sighting, close above its spot, in the
+        # first frames after its spot changed (the club arriving changes it a
+        # few frames before the ball goes).
+        if fi <= 8:
+            for c in cands:
+                if r(c) <= 8 * d_rest and c[2] < cyr + 0.3 * d_rest:
+                    grown.append([(fi, c)])
+        keep = [ch for ch in chains if fi - ch[-1][0] <= 2]
+        done += [ch for ch in chains if fi - ch[-1][0] > 2]
+        chains = sorted(keep + grown, key=lambda ch: (-len(ch), -r(ch[-1][1])))[:300]
+        if fi >= 8 and not chains:
+            break                                # no chain can grow, and none can start now
+    chains = [ch for ch in chains + done if ch]
+    if not chains:
+        return []
+    best = max(chains, key=lambda ch: (len(ch), r(ch[-1][1]) - r(ch[0][1])))
+    return [c for fi, c in best]
+
+
 def track_flight(frames, times, rest_box, scale=2, origin=(0, 0), max_frames=10, impact=None):
     """Find the ball in the frames after impact.
 
@@ -227,9 +304,12 @@ def track_flight(frames, times, rest_box, scale=2, origin=(0, 0), max_frames=10,
     if ref.size == 0:
         return {"why": "ball box outside the picture", "obs": []}
     if impact is None:
-        for i in range(1, n):
-            p = frames[i][pa[1]:pb[1], pa[0]:pb[0]].astype(np.float32)
-            if float(np.mean(np.abs(p - ref))) > 12.0:
+        # ... and still doesn't the frame after: a one-frame change is a flash
+        # of light (a simulator's or a strobe's), not the ball leaving.
+        changed = [float(np.mean(np.abs(f[pa[1]:pb[1], pa[0]:pb[0]].astype(np.float32) - ref))) > 12.0
+                   for f in frames]
+        for i in range(1, n - 1):
+            if changed[i] and changed[i + 1]:
                 impact = i
                 break
     if impact is None or impact < 3:
@@ -247,13 +327,21 @@ def track_flight(frames, times, rest_box, scale=2, origin=(0, 0), max_frames=10,
                            bg[max(0, y0):y1, max(0, x0 - bw // 2):max(0, x0)].ravel(),
                            bg[max(0, y0):y1, x1:x1 + bw // 2].ravel()])
     sign = 1.0 if (inner.size == 0 or ring.size == 0 or float(np.mean(inner)) >= float(np.median(ring))) else -1.0
-    obs, last = [], None
-    misses = 0
-    for i in range(impact, min(n, impact + max_frames + 3)):
+    def blobs():
+        """Every blob of the ball's size and shape, frame by frame after impact."""
+        for i in range(impact, min(n, impact + max_frames + 3)):
+            yield _blobs(i)
+
+    def _blobs(i):
         diff = cv2.GaussianBlur(sign * (frames[i].astype(np.float32) - bg), (3, 3), 0)
         diff[int(min(H, cyr + 0.6 * bh)):, :] = 0                 # nothing below the ball's spot
         mask = (diff > thr).astype(np.uint8)
         k, lab, st, cen = cv2.connectedComponentsWithStats(mask, 8)
+        # Everything that changed, either way: a shine on the club's shaft
+        # or head is ball-sized, but it is part of something long or big
+        # that changed too (the shaft is darker than a bright screen behind
+        # it, its shine brighter).
+        labb = None
         cands = []
         for j in range(1, k):
             x, y, w, h, area = st[j]
@@ -264,41 +352,31 @@ def track_flight(frames, times, rest_box, scale=2, origin=(0, 0), max_frames=10,
                 continue
             if max(w, h) > 3.0 * max(1, min(w, h)):              # shaft, an edge
                 continue
-            mres = _measure_blob(diff, lab, j, (x, y, w, h), thr)
-            if mres is None:
-                continue
-            cands.append(mres)
-        pick = None
-        if cands:
-            if last is None:
-                # First sighting: closest to the spot, a little above it
-                pick = min(cands, key=lambda c: math.hypot(c[0] - cxr, c[1] - (cyr - 0.5 * d_rest)))
-                if math.hypot(pick[0] - cxr, pick[1] - cyr) > 12 * d_rest:
-                    pick = None
-            else:
-                lu, lv, ld = last[1], last[2], last[3]
-                r_last = math.hypot(lu - cxr, lv - cyr)
-                ok = [c for c in cands if math.hypot(c[0] - cxr, c[1] - cyr) > r_last - 0.3 * d_rest
-                      and c[2] <= 1.3 * ld + 2]
-                if len(obs) >= 2:
-                    # Along the line so far, the step about as far as the last
-                    (au, av), (bu, bv) = (obs[-2][1], obs[-2][2]), (obs[-1][1], obs[-1][2])
-                    pu, pv = 2 * bu - au, 2 * bv - av
-                    ok = [c for c in ok if math.hypot(c[0] - pu, c[1] - pv) < max(2.5 * d_rest,
-                                                                                0.8 * math.hypot(bu - au, bv - av))]
-                    if ok:
-                        pick = min(ok, key=lambda c: math.hypot(c[0] - pu, c[1] - pv))
-                elif ok:
-                    pick = min(ok, key=lambda c: math.hypot(c[0] - lu, c[1] - lv))
-        if pick is None:
-            misses += 1
-            if obs and misses >= 2:
-                break
-            continue
-        misses = 0
-        last = (times[i], pick[0], pick[1], pick[2], pick[4], pick[5])
-        obs.append(last)
-        if pick[1] < 2 or pick[0] < 2 or pick[0] > W - 3:
+            if labb is None:
+                both = (cv2.GaussianBlur(np.abs(frames[i].astype(np.float32) - bg), (3, 3), 0) > thr).astype(np.uint8)
+                both[int(min(H, cyr + 0.6 * bh)):, :] = 0
+                _, labb, stb, _ = cv2.connectedComponentsWithStats(both, 8)
+            jb = labb[int(cen[j][1]), int(cen[j][0])]
+            if jb:
+                xb, yb, wb, hb, ab = stb[jb]
+                if ab > 2.5 * area + 0.8 * d_rest ** 2 and (max(wb, hb) > 2.0 * d_rest
+                                                          or ab > 2.0 * d_rest ** 2):
+                    continue                                     # part of the club
+            # Rough centre and size from the blob's own pixels, enough to
+            # find the path; the ball is measured properly once it is found.
+            cands.append((times[i], float(cen[j][0]), float(cen[j][1]), d_eq, i, j, (x, y, w, h)))
+        return cands
+
+    obs = []
+    for t_i, _, _, _, i, j, box in _best_chain(blobs(), cxr, cyr, d_rest):
+        diff = cv2.GaussianBlur(sign * (frames[i].astype(np.float32) - bg), (3, 3), 0)
+        diff[int(min(H, cyr + 0.6 * bh)):, :] = 0
+        _, lab, _, _ = cv2.connectedComponentsWithStats((diff > thr).astype(np.uint8), 8)   # as in _blobs
+        mres = _measure_blob(diff, lab, j, box, thr)
+        if mres is None:
+            break                                                # cut off by the picture's edge
+        obs.append((t_i, mres[0], mres[1], mres[2], mres[4], mres[5]))
+        if mres[1] < 2 or mres[0] < 2 or mres[0] > W - 3:
             break                                                # leaving the picture
     sx, sy = origin
     to_s = lambda u, v: (u * scale + sx, v * scale + sy)
@@ -422,10 +500,21 @@ def solve_launch(grid, track, speed_prior=None, speed_sigma=None, px_sigma=1.0):
     })
     sa = res["sigma_angle"]
     res["quality"] = ("good" if len(obs) >= 3 and sa <= 1.0 else
-                      "fair" if sa <= 2.5 else "poor")
+                      "fair" if sa <= 2.5 and len(obs) >= 2 else "poor")
     if not (-10.0 <= res["launch_angle"] <= 70.0):
         res["quality"] = "poor"
         res["why"] = "angle out of any club's range"
+    elif res["launch_angle"] < MIN_ANGLE:
+        # A ball can't leave the ground going down: whatever was followed
+        # was not the ball (usually the club head after impact).
+        res["quality"] = "poor"
+        res["why"] = f"angle {res['launch_angle']} deg is below the ground: not the ball"
+    if speed_prior is None and not (SPEED_RANGE[0] <= res["speed_mps"] <= SPEED_RANGE[1]):
+        # Without the radar's speed the ball's shrinking sets the speed: one
+        # no golf ball can have means the chain wasn't the ball.
+        res["quality"] = "poor"
+        res["why"] = (f"speed {res['speed_mps']:.0f} m/s is impossible for a golf ball "
+                      f"({SPEED_RANGE[0]:.0f}-{SPEED_RANGE[1]:.0f} m/s): not the ball")
     return res
 
 
@@ -515,9 +604,11 @@ class FocalCalibration:
 
 def camera_launch(frames, times, rest_box, view_scale, view_origin, focal_px, height_m,
                   ball_height_m=0.021, speed_mps=None, speed_sigma=None, azimuth_deg=0.0,
-                  exposure_s=0.0, track=None):
+                  exposure_s=0.0, track=None, need_empty_spot=False):
     """Everything for one shot: track the ball (or use a track already made),
-    place the grid, fit the angle."""
+    place the grid, fit the angle. need_empty_spot: give no angle unless the
+    ball's spot is seen empty after impact (for when nothing else, such as
+    the speed radar's ball speed, says a ball flew)."""
     if track is None:
         track = track_flight(frames, times, rest_box, view_scale, view_origin)
     track["exposure_s"] = exposure_s
@@ -528,6 +619,18 @@ def camera_launch(frames, times, rest_box, view_scale, view_origin, focal_px, he
         return out
     if "rest" not in track:
         out.update(launch_angle=None, launch_dir=None, quality=None, why=track.get("why"))
+        return out
+    d_view = track["rest"][2] / float(view_scale or 1)
+    if d_view < MIN_BALL_PX:
+        out.update(launch_angle=None, launch_dir=None, quality=None,
+                   why=f"the ball is {d_view:.0f} px across in this view, too small to follow "
+                       f"(needs {MIN_BALL_PX}): zoom in on the hitting zone")
+        return out
+    if need_empty_spot and track.get("rest_source") != "frames":
+        # Nothing else says a ball flew (no radar ball speed), and the ball's
+        # spot never looked empty after impact: most likely no shot at all.
+        out.update(launch_angle=None, launch_dir=None, quality=None,
+                   why="the ball's spot never looked empty after impact (the ball may not have left)")
         return out
     u0, v0, d0 = track["rest"]
     grid = CameraGrid(focal_px, height_m, ball_height_m).setup(u0, v0, d0)
