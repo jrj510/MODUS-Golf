@@ -7,15 +7,19 @@
 # Change the settings below if the setup changes.
 # Logs go to ~/MODUS-Golf/logs/, shot logs to ~/MODUS-Golf/logs/sessions/
 
-# Speed radar (OPS243-A), on our own driver (camera/ops243.py, AN-029 golf
-# settings). It triggers on its own and the camera does too; together they
-# decide what is a shot (camera/shot_fusion.py):
+# Speed radar (OPS243-A) in rolling-buffer mode: it records raw I/Q nonstop;
+# on a trigger we read the recording (~2 s at 230400 baud, set automatically)
+# and work out ball and club speed with our own FFT (camera/ops_capture.py).
+# The radar triggers itself (OPS_SPEED_TRIGGER) and the camera's pulse on
+# J3 pin 3 triggers it too; together they decide what is a shot
+# (camera/shot_fusion.py):
 #   both fire            -> shot with the radar's speeds
 #   radar only           -> shot, unless the camera still sees the ball sitting there
 #   camera only          -> shot with no speeds (see RADAR_CONFIRM)
 SPEED_RADAR=on     # off = camera only
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-OPS_BAUD=0         # 0 = find it at start-up; once known (python3 camera/ops243.py prints it), put it here
+OPS_SPLIT=20       # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
+OPS_SPEED_TRIGGER=40  # radar records by itself when something moves away faster, mph; 0 = off
 OPS_MIN_BALL=40    # slowest ball the radar counts as a shot, mph (lower for chips; more false triggers)
 RADAR_CONFIRM=off  # on = a camera trigger with no radar shot is NOT a shot (no speedless chips, but
                    # a shadow or the golfer moving can never count either)
@@ -192,7 +196,7 @@ while true; do
     DETECT="'--trigger','motion,sound','--blob'"
     OPSARG=""
     if [ "$SPEED_RADAR" = "on" ]; then
-        OPSARG="'--ops','--ops-baud','$OPS_BAUD','--ops-min-ball','$OPS_MIN_BALL',"
+        OPSARG="'--ops','--ops-split','$OPS_SPLIT','--ops-speed-trigger-mph','$OPS_SPEED_TRIGGER','--ops-min-ball','$OPS_MIN_BALL','--ops-reset-gpio','0',"
     fi
     MODELARG="'--model','$MODEL',"
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
