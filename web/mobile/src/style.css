@@ -1,5 +1,7 @@
-.mobile-workspace{margin-left:0;padding-bottom:calc(90px + env(safe-area-inset-bottom));min-height:100svh}.mobile-workspace main{max-width:1000px;padding:26px max(18px,env(safe-area-inset-left)) 0}.phone-header{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-left)) 18px;background:#10161e;border-bottom:1px solid #2b3949}.phone-header a{text-decoration:none;color:#eef3f7;font-size:25px;font-weight:800;letter-spacing:.025em}.phone-header b{color:#2ecc71}.phone-header>span{font-size:11px;color:#a6b5c5}.mobile-workspace .bottom-nav{display:grid}.mobile-workspace .primary-metrics{margin-bottom:12px}.mobile-workspace .checkbox{margin:18px 0}.mobile-workspace .panel>.button-row{margin-top:17px}.mobile-workspace form button{margin-top:8px}.mobile-workspace .bottom-nav{position:fixed;bottom:0;left:0;right:0;z-index:40;grid-template-columns:repeat(4,1fr);border-top:1px solid #2b3949;padding:7px max(8px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom));background:#10161e}.mobile-workspace .bottom-nav button{flex-direction:column;gap:4px;border:0;color:#9aabbc;background:transparent;min-height:55px;padding:9px 0;font-size:11px}.mobile-workspace .bottom-nav button.active{color:#74e5a4;background:#1c382c}.mobile-workspace .panel{overflow-wrap:anywhere}
+.mobile-workspace{margin-left:0;padding-bottom:calc(90px + env(safe-area-inset-bottom));min-height:100svh}.mobile-workspace main{max-width:1000px;padding:26px max(18px,env(safe-area-inset-left)) 0}.phone-header{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-left)) 18px;background:#10161e;border-bottom:1px solid #2b3949}.phone-header a{text-decoration:none;color:#eef3f7;font-size:25px;font-weight:800;letter-spacing:.025em}.phone-header b{color:#2ecc71}.phone-header>span{font-size:11px;color:#a6b5c5}.mobile-workspace .bottom-nav{display:grid}.mobile-workspace .primary-metrics{margin-bottom:12px}.mobile-workspace .checkbox{margin:18px 0}.mobile-workspace .panel>.button-row{margin-top:17px}.mobile-workspace form button{margin-top:8px}.mobile-workspace .bottom-nav{position:fixed;bottom:0;left:0;right:0;z-index:40;grid-template-columns:repeat(5,minmax(0,1fr));border-top:1px solid #2b3949;padding:7px max(8px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom));background:#10161e}.mobile-workspace .bottom-nav button{flex-direction:column;gap:4px;border:0;color:#9aabbc;background:transparent;min-height:55px;padding:9px 0;font-size:11px}.mobile-workspace .bottom-nav button.active{color:#74e5a4;background:#1c382c}.mobile-workspace .panel{overflow-wrap:anywhere}
 @media(max-width:600px){.phone-header{align-items:flex-start;gap:12px}.phone-header>span{font-size:9px;max-width:115px;text-align:right}.mobile-workspace main{padding-top:22px}.mobile-workspace .page-heading h1{font-size:30px}}
+
+.mobile-workspace textarea{font:inherit;color:inherit;background:#121a24;border:1px solid #344253;border-radius:8px;padding:10px;width:100%;resize:vertical}.mobile-workspace details summary{cursor:pointer;font-weight:700;padding-block:8px}.mobile-workspace .panel li{margin-bottom:8px}
 
 .ball-readiness { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:16px; margin-bottom:16px; background:#16212a; border:1px solid #394b58; border-radius:12px }
 .ball-readiness span { display:block; font-size:.85rem; color:#afbfcd }
@@ -10,3 +12,12 @@
 .ball-readiness [data-state="Recording"] { color:#d4a6ff }
 .readiness-actions { display:flex; flex-wrap:wrap; gap:8px }
 .readiness-actions button { min-height:44px }
+
+.trend-focus {border-left:3px solid #74e5a4}
+.trend-reading {font-size:1.35rem;font-weight:700}
+.trend-reading small {font-size:.9rem;font-weight:500}
+
+.mobile-workspace .session-averages {min-width:0;width:100%;table-layout:fixed}
+.session-averages th:first-child {width:30%}
+.session-averages th,.session-averages td {padding:9px 4px;text-align:left}
+.session-averages small {display:block;font-weight:400}

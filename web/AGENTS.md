@@ -14,4 +14,4 @@ Local practice and previously saved shots must open without internet or Firebase
 
 Use a MacBook with the standard Capacitor CLI, Xcode and Swift Package Manager workflow. This supersedes the earlier Windows/xtool requirement. Read `mobile/MAC_BUILD_CHECKLIST.md` and `MODUS_Golf_GitHub_Update_ZIP4_2026-11-02.md`. On the Mac, run `npm ci`, `npm run ios:prepare` and `npm run ios:open` from `mobile/`, then finish resource membership, linker flags and signing in Xcode.
 
-Native compile/sign/install and physical-device validation remain pending. Automatic upload of locally copied shots still needs pairing, a phone-side queue and trusted ingestion. Preserve existing private Firestore rules. The older Pi-side queue/worker handoff is historical background, not the selected implementation plan.
+The existing Mac host has built on simulator and device. The owner verified physical Google sign-in and persistence. The phone queues confirmed, account-linked sessions for authenticated ingestion. Preserve the private Firestore rules. Verify capture, display control and upload with a physical monitor before release.

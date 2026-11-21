@@ -1,4 +1,9 @@
 {
+  "functions": [{
+    "source": "MODUS_Golf_Firebase_AI_Starter",
+    "codebase": "modus-ingestion",
+    "ignore": ["node_modules", ".git", "firebase-debug*.log", "reference/**", "prompts/**", "**/*.md", "SOURCE_MANIFEST.json", "**/*.test.mjs"]
+  }],
   "hosting": {
     "site": "modus-golf-ea469",
     "public": "dist",
@@ -19,6 +24,7 @@
     "rules": "MODUS_Golf_Firebase_AI_Starter/firebase/firestore.rules"
   },
   "emulators": {
+    "functions": { "port": 5001 },
     "firestore": {
       "port": 8080
     },

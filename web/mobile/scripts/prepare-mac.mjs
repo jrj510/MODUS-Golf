@@ -25,6 +25,7 @@ function command(executable, args, capture = false) {
 function sourceCheck() {
   assert(Number(process.versions.node.split('.')[0]) >= 24, 'Install Node 24 LTS before preparing this source.');
   const metadata = JSON.parse(read('firebase/apple-app.json'));
+  assert(read('src/firebase-project.ts').includes(`firebaseProjectId = '${expected.PROJECT_ID}'`), 'The upload/account project must match the native Firebase configuration.');
   const plist = read('firebase/GoogleService-Info.plist');
   for (const [key, value] of Object.entries(expected)) {
     assert(metadata[key] === value, `Firebase ${key} does not match the registered MODUS app.`);
@@ -61,6 +62,7 @@ try {
     assert(Number(/Xcode\s+(\d+)/.exec(xcode)?.[1] ?? 0) >= 26, 'Install/select Xcode 26 or newer and finish its first-run components.');
     command('xcrun', ['--sdk', 'iphoneos', '--show-sdk-path'], true);
     console.log(swift.trim(), '\n', xcode.trim());
+    command(process.execPath, [join(root, 'scripts/patch-auth.mjs')]);
     const cli = join(root, 'node_modules/@capacitor/cli/bin/capacitor');
     assert(existsSync(cli), 'Run npm ci in mobile/ first.');
     const ios = join(root, 'ios');

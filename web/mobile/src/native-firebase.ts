@@ -1,7 +1,25 @@
 import { Capacitor } from '@capacitor/core';
 import { FirebaseAuthentication } from '@capacitor-firebase/authentication';
 import { FieldValue, FirebaseFirestore } from '@capacitor-firebase/firestore';
-import { uniqueShots, validateCloudShot, type Shot } from '../../src/domain';
+import type { Shot } from '../../src/domain';
+import { firebaseProjectId } from './firebase-project';
+import { decodeHistoryPage, historyPageSize } from './cloud-history';
+import { authDiagnostics, authFailure, type AuthStage } from './auth-diagnostics';
+
+function authLog(details:Record<string,unknown>) {
+  // Explicit allowlisted diagnostics only; never log plugin results or errors.
+  if (import.meta.env.DEV || Capacitor.isNativePlatform()) console.info('[MODUS Auth]',JSON.stringify(details));
+}
+async function authenticate<T extends {user:unknown;additionalUserInfo?:{isNewUser?:boolean} | null}>(stage:AuthStage,work:() => Promise<T>) {
+  try {
+    const result=await work();
+    authLog({stage:'firebase-authenticated',authenticated:!!result.user,isNewUser:result.additionalUserInfo?.isNewUser ?? null,profileInitialization:'separate-user-action'});
+    return result;
+  } catch(error) {
+    authLog(authDiagnostics(error,stage));
+    throw authFailure(error,stage);
+  }
+}
 
 export type AccountUser = {uid:string;email:string | null};
 export type Profile = {id:string;display_name:string};
@@ -16,11 +34,23 @@ export async function observeAccount(next: (user:AccountUser | null) => void) {
   const {user}=await FirebaseAuthentication.getCurrentUser();if (!observed) next(user);
   return () => {void listener.remove();};
 }
+export async function accountToken(uid: string, forceRefresh: boolean) {
+  await owner(uid);
+  const {token}=await FirebaseAuthentication.getIdToken({forceRefresh});
+  await owner(uid);
+  const encoded=token.split('.')[1].replaceAll('-','+').replaceAll('_','/');
+  const claims=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded),char => char.charCodeAt(0))));
+  if (claims.sub !== uid) throw new Error('The signed-in account changed.');
+  if (claims.aud !== firebaseProjectId || claims.iss !== `https://securetoken.google.com/${firebaseProjectId}`) {
+    throw new Error('Sign out and sign in again to connect to the current MODUS account service.');
+  }
+  return token;
+}
 export async function signInEmail(email:string,password:string,create=false) {
   nativeOnly();
-  return create ? FirebaseAuthentication.createUserWithEmailAndPassword({email,password}) : FirebaseAuthentication.signInWithEmailAndPassword({email,password});
+  return authenticate(create ? 'email-registration' : 'email-sign-in',() => create ? FirebaseAuthentication.createUserWithEmailAndPassword({email,password}) : FirebaseAuthentication.signInWithEmailAndPassword({email,password}));
 }
-export async function signInGoogle() {nativeOnly();return FirebaseAuthentication.signInWithGoogle();}
+export async function signInGoogle() {nativeOnly();return authenticate('google-sign-in',() => FirebaseAuthentication.signInWithGoogle());}
 export async function signOut() {nativeOnly();await FirebaseAuthentication.signOut();}
 export async function resetPassword(email:string) {nativeOnly();await FirebaseAuthentication.sendPasswordResetEmail({email});}
 export async function createProfile(uid:string,name:string) {
@@ -28,17 +58,22 @@ export async function createProfile(uid:string,name:string) {
   if (!display_name || display_name.length > 80) throw new Error('Use a golfer name between 1 and 80 characters.');
   return FirebaseFirestore.addDocument({reference:`users/${uid}/profiles`,data:{display_name,created_at:FieldValue.serverTimestamp(),updated_at:FieldValue.serverTimestamp()}});
 }
-export async function observeHistory(uid:string,shots:(items:Shot[],cached:boolean) => void,profiles:(items:Profile[]) => void,failure:(error:Error) => void) {
+export async function observeHistory(uid:string,shots:(items:Shot[],cached:boolean,skipped:number,nextCursor:string | null) => void,profiles:(items:Profile[]) => void,failure:(error:Error) => void,after?:string) {
   await owner(uid);await firestoreReady();let active=true;
   const ids: string[]=[];
+  const reference=`users/${uid}/shots`;
+  if (after && (!after.startsWith(reference+'/') || after.slice(reference.length+1).includes('/'))) throw new Error('Invalid cloud history cursor. Refresh history.');
   try {
-    ids.push(await FirebaseFirestore.addCollectionSnapshotListener({reference:`users/${uid}/shots`,includeMetadataChanges:true},(event,error) => {
+    // Firestore's default document-ID order is stable and indexed. It includes
+    // historical records that do not have a server ingestion timestamp.
+    ids.push(await FirebaseFirestore.addCollectionSnapshotListener({reference,includeMetadataChanges:true,
+      queryConstraints:[{type:'limit',limit:historyPageSize+1},...(after ? [{type:'startAfter' as const,reference:after}] : [])]
+    },(event,error) => {
       if (!active) return;
       if (error) return failure(new Error('Cloud history could not be loaded. Local shots remain available.'));
-      // The plugin exposes document metadata but not an empty query's source.
-      // Treat an empty snapshot conservatively rather than claim server proof.
-      try {if (event) shots(uniqueShots(event.snapshots.map(item => validateCloudShot({...item.data,id:item.id}))),event.snapshots.length === 0 || event.snapshots.some(item => item.metadata.fromCache));}
-      catch (error) {failure(error instanceof Error ? error : new Error('Invalid cloud shot contract.'));}
+      if (!event) return;
+      const page=decodeHistoryPage(event.snapshots);
+      shots(page.items,page.cached,page.skipped,page.nextCursor);
     }));
     ids.push(await FirebaseFirestore.addCollectionSnapshotListener({reference:`users/${uid}/profiles`},(event,error) => {
       if (!active) return;

@@ -2,6 +2,10 @@
 
 Updated 2026-11-02: use Capacitor CLI, Xcode and Swift Package Manager on the MacBook. This is the selected route for the existing app. Shared development can remain on Windows; the MacBook performs the native build, signing and installation. The installed app does not depend on a running MacBook.
 
+The native host is already configured and builds in the iPhone 18 Pro simulator. Reuse it. Resource membership, linker flags and signing are already present; the steps below also document recovery on another Mac. The corrected owner account `lbrowningsgc@gmail.com` was verified on 2026-11-03. Its project ID is the original `modus-golf-ea469`; all original registrations are reused.
+
+On 2026-11-03 the signed Debug app also built, installed and launched on the physical iPhone 16 Pro. The owner confirmed Google sign-in for the previously failing new account before the diagnostic update. See [Google sign-in investigation](GOOGLE_SIGNIN_INVESTIGATION.md) for remaining physical checks. `npm ci`, `npm run ios:prepare` and `npm run ios:sync` apply the version-checked native auth diagnostic patch; use these scripts when rebuilding. Generic bridge logging is disabled to avoid exposing OAuth results.
+
 ## Before starting
 
 1. Transfer and extract **`MODUS_Golf_Mac_Ready_2026-11-02.zip`**. Preserve its parent folders; `mobile/src` imports the shared parent `src` and contract files. For a GitHub checkout the equivalent folder is `web/mobile/`.
@@ -58,7 +62,9 @@ The SPM configuration in `capacitor.config.ts` includes the Google provider trai
 - Verify local-network denial/retry, Pi unavailable, empty CSV, partial download, missing metrics, zero launch angles and duplicate refreshes.
 - Check all screens at the actual phone's size, including portrait, landscape, keyboard open, safe areas and larger text. The final browser viewport check on Windows was interrupted by a tool authorization-review timeout.
 - Confirm real CSV paths remain unavailable rather than being invented. Synthetic fixture flight views may display their supplied paths.
-- Record that **local-to-cloud upload is still pending backend pairing/ingestion implementation**. Do not count a successful Firestore history read as proof that new phone-captured records uploaded.
+- For a sync-enabled build, link a confirmed monitor session to a test golfer in Account. Reopen while offline, then restore internet and verify the same shot in Firebase history after the phone records a matching receipt. See the Cloud history section in README.md.
+
+Production builds now load `VITE_ENABLE_CLOUD_SYNC=true` from `.env.production`. The service is deployed to the original project and has passed live service checks. The app must be open, signed in, and have an explicitly linked physical session to upload.
 
 For later shared-source changes, rerun `npm run ios:prepare`, reopen Xcode and build/run again. The resource memberships and signing selections remain in the native project. Keep that project in source control if you want to preserve the one-time Xcode setup. The installed app is independent of the Mac while in use.
 
