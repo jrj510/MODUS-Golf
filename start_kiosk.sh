@@ -21,7 +21,8 @@ OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8
 OPS_SPLIT=10       # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
                    # (speed trigger fires ~15-20 ms before impact: most of the recording goes after it)
 OPS_SPEED_TRIGGER=40  # radar records by itself when something moves away faster, mph; 0 = off
-OPS_MIN_BALL=40    # slowest ball the radar counts as a shot, mph (lower for chips; more false triggers)
+OPS_MIN_BALL=30    # slowest ball the radar counts as a shot, mph (radar view, before any angle
+                   # correction; 30 caught a heeled wedge with no false shots, 25 gave false ones)
 RADAR_CONFIRM=off  # on = a camera trigger with no radar shot is NOT a shot (no speedless chips, but
                    # a shadow or the golfer moving can never count either)
 OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time the kiosk starts. Empty = off
