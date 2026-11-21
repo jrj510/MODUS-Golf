@@ -55,7 +55,9 @@ TRIGGER_OUT_GPIO=21 # camera trigger: GPIO21 (pin 40) pulses OPS J3-3 and GPIO20
 # makes both modes pulse when a camera at that frame rate would (60 = Outside's
 # timing), so the pulse lands at the same moment in both modes.
 # 0 = pulse straight away.
-RADAR_PULSE_FPS=60
+RADAR_PULSE_FPS=0  # 0 = pulse at once. The radar keeps only 43 ms from before a pulse
+                   # (OPS_SPLIT=10); held back to 60 fps timing (~55 ms) a driver
+                   # indoors was already in the net (2026-11-21: no ball in those recordings)
 
 # Power. The moment after a shot is the heaviest load (whatever the camera
 # saves); on a battery pack that spike can shut the Pi off. These keep it down:
