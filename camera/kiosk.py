@@ -259,6 +259,7 @@ async function tick(){
   try{
     const s=await (await fetch('/state')).json();
     sleepUI.view(s.state);
+    followDisplay(s);
     if(s.state=='SLEEPING'){
       next=1000;                       // nothing changes while asleep
       if(view!='main')show('main');    // (closes the live camera stream)
@@ -336,6 +337,22 @@ SLEEP_SNIPPET = b"""<style>
 </style>
 <div id="sleepov"><b id="sleept">Asleep</b><span id="sleeps">Tap anywhere to wake</span></div>
 <script>
+// Only the Pi's own Chromium window consumes a one-time phone command.
+let handledDisplay = '';
+async function followDisplay(s){
+  const req = s.display && s.display.request;
+  if(!req || handledDisplay === req.id || !['localhost','127.0.0.1','[::1]'].includes(location.hostname))return;
+  if(!['main','camera','range'].includes(req.screen))return;
+  handledDisplay = req.id;
+  const onRange = ['/range','/range.html'].includes(location.pathname);
+  if(req.screen === 'range' && !onRange){location.assign('/range');return;}
+  if(req.screen !== 'range' && onRange){location.assign('/');return;}
+  if(!onRange)show(req.screen);
+  // Acknowledge only after arriving on the requested page. If the reply is
+  // lost, the phone times out; subsequent manual touches remain in control.
+  try{await fetch('/display/applied/'+req.id,{method:'POST',headers:{'X-MODUS-Display':'1'}});}
+  catch(e){}
+}
 const sleepUI=(()=>{
   const ov=document.getElementById('sleepov');
   let going=false,state='';
@@ -371,7 +388,7 @@ const sleepUI=(()=>{
   async function poll(){             // pages without their own /state loop (Range)
     let next=1000;
     try{const s=await (await fetch('/state',{cache:'no-store'})).json();
-        view(s.state);if(s.state!='SLEEPING')next=500;}catch(e){}
+        view(s.state);followDisplay(s);if(s.state!='SLEEPING')next=500;}catch(e){}
     setTimeout(poll,next);
   }
   return {view,sleep,poll};
@@ -514,6 +531,9 @@ def zone_around(x, y, size=TAP_ZONE):
 class Kiosk:
     def __init__(self):
         self.lock = threading.Lock()
+        self.display_request = None
+        self.display_until = 0.0
+        self.display_applied = None
         self.state = "STARTING"
         self.shot = 0
         self.rev = 0           # goes up whenever the numbers on screen change
@@ -542,6 +562,25 @@ class Kiosk:
         self.wake_request = False     # the dark screen was tapped
         self.last_active = time.monotonic()   # last ball, shot or tap (for the automatic sleep)
         self.backlight = Backlight()
+
+    def display_status(self):
+        with self.lock:
+            if time.monotonic() >= self.display_until:
+                self.display_request = None
+            return {"version": 1, "request": self.display_request, "applied": self.display_applied}
+
+    def request_display(self, screen):
+        with self.lock:
+            receipt = "d" + str(time.monotonic_ns())
+            self.display_request = {"id": receipt, "screen": screen}
+            self.display_until = time.monotonic() + 8
+            return receipt
+
+    def acknowledge_display(self, receipt):
+        with self.lock:
+            if self.display_request and self.display_request["id"] == receipt and time.monotonic() < self.display_until:
+                self.display_applied = receipt
+                self.display_request = None
 
     def touch(self):
         """Something happened on the screen: put off the automatic sleep."""
@@ -736,7 +775,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/state":
                 body = json.dumps({"state": K.state, "shot": K.shot, "rev": K.rev,
-                                   "metrics": K.metrics, "video": K.video,
+                                   "metrics": K.metrics, "video": K.video, "display": K.display_status(),
                                    "camera": getattr(K, "camera", None),
                                    "zone": bool(K.args is not None and K.args.search_area),
                                    "view": {"zoomed": K.view.zoomed, "can_zoom": K.can_zoom},
@@ -822,6 +861,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         action = self.path.split("?")[0].strip("/")
+        if action.startswith("display/"):
+            if self.headers.get("X-MODUS-Display") != "1":
+                self.send_error(403)
+                return
+            if action in ("display/main", "display/camera", "display/range"):
+                if K.state not in ("READY", "SEARCHING", "BALL", "WAIT", "SWINGTEST"):
+                    self.send_error(409)
+                    return
+                K.touch()
+                body = K.request_display(action.split("/")[1]).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif action.startswith("display/applied/") and self.client_address[0] in ("127.0.0.1", "::1"):
+                K.acknowledge_display(action.rsplit("/", 1)[-1])
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.send_error(404)
+            return
         if action == "sleep":
             K.ask_sleep()
         elif action == "wake":

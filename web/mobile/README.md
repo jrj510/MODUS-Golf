@@ -87,3 +87,9 @@ This app polls only while foregrounded and connected. iOS background execution i
 The local profile/device IDs are provisional single-monitor test context, not verified Firebase ownership. Do not automatically assign all stored shots to whichever account signs in next. Pairing must explicitly resolve capture ownership before the ingest backend accepts them.
 
 Local journal backup export is available in Connection. Deleting the app can delete its local files. The two-generation journal is a capstone-scale implementation; field-test large trajectory datasets and consider transactional SQLite for a larger release.
+
+## Monitor remote
+
+Join MODUS Wi-Fi, start a local connection in the app, and select **Enable phone controls**. The remote starts off each time you enter the Connection screen, reconnect, or return from the background. The physical touchscreen stays active. Club, low light, camera zoom on supported hardware, sleep, and wake use the existing kiosk commands.
+
+The **Show on monitor screen** buttons require a running kiosk with the display-control change in `camera/kiosk.py`. Updating the GitHub checkout alone does not update a running monitor. The Dashboard, Camera, and Range buttons send one-time page requests. The phone confirms each change when the monitor browser acknowledges it. Normal touchscreen navigation can continue immediately.

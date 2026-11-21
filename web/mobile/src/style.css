@@ -1,2 +1,12 @@
 .mobile-workspace{margin-left:0;padding-bottom:calc(90px + env(safe-area-inset-bottom));min-height:100svh}.mobile-workspace main{max-width:1000px;padding:26px max(18px,env(safe-area-inset-left)) 0}.phone-header{display:flex;justify-content:space-between;align-items:center;gap:18px;padding:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-left)) 18px;background:#10161e;border-bottom:1px solid #2b3949}.phone-header a{text-decoration:none;color:#eef3f7;font-size:25px;font-weight:800;letter-spacing:.025em}.phone-header b{color:#2ecc71}.phone-header>span{font-size:11px;color:#a6b5c5}.mobile-workspace .bottom-nav{display:grid}.mobile-workspace .primary-metrics{margin-bottom:12px}.mobile-workspace .checkbox{margin:18px 0}.mobile-workspace .panel>.button-row{margin-top:17px}.mobile-workspace form button{margin-top:8px}.mobile-workspace .bottom-nav{position:fixed;bottom:0;left:0;right:0;z-index:40;grid-template-columns:repeat(4,1fr);border-top:1px solid #2b3949;padding:7px max(8px,env(safe-area-inset-left)) max(7px,env(safe-area-inset-bottom));background:#10161e}.mobile-workspace .bottom-nav button{flex-direction:column;gap:4px;border:0;color:#9aabbc;background:transparent;min-height:55px;padding:9px 0;font-size:11px}.mobile-workspace .bottom-nav button.active{color:#74e5a4;background:#1c382c}.mobile-workspace .panel{overflow-wrap:anywhere}
 @media(max-width:600px){.phone-header{align-items:flex-start;gap:12px}.phone-header>span{font-size:9px;max-width:115px;text-align:right}.mobile-workspace main{padding-top:22px}.mobile-workspace .page-heading h1{font-size:30px}}
+
+.ball-readiness { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; padding:16px; margin-bottom:16px; background:#16212a; border:1px solid #394b58; border-radius:12px }
+.ball-readiness span { display:block; font-size:.85rem; color:#afbfcd }
+.ball-readiness strong { display:block; margin-top:4px; font-size:1.35rem }
+.ball-readiness strong::before { content:''; display:inline-block; width:.62em; height:.62em; border-radius:50%; background:currentColor; margin-right:.5em }
+.ball-readiness [data-state="Ready"] { color:#74e5a4 }
+.ball-readiness [data-state="Looking for Ball"], .ball-readiness [data-state="Get Set"] { color:#f3c15b }
+.ball-readiness [data-state="Recording"] { color:#d4a6ff }
+.readiness-actions { display:flex; flex-wrap:wrap; gap:8px }
+.readiness-actions button { min-height:44px }

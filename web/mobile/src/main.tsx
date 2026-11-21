@@ -7,6 +7,7 @@ import { Bag } from '../../src/bag';
 import { clubName, filterShots, historyCsv, selectedShot, displayMetric, type Shot, type Units } from '../../src/domain';
 import fixtures from '../../MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/demo_shots.json';
 import history from '../../MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/pi_history.json';
+import { BallReadiness } from './BallReadiness';
 import { Journal, mergeLocal, type LocalState } from './journal';
 import { storagePort } from './storage';
 import { piOrigin, readPi } from './pi';
@@ -87,6 +88,11 @@ function MobileApp() {
   const clubs=[...new Set(base.map(item => item.club))];
   const awaiting=local?.shots.filter(item => item.record_kind === 'real').length ?? 0;
   async function action(work:() => Promise<unknown>) {setBusy(true);setError('');setNotice('');try {await work();}catch(failure){setError(errorText(failure));}finally{setBusy(false);}}
+  async function connectMonitor(address:string) {
+    const origin=piOrigin(address);
+    const saved=await journal.commit(current => ({...current,piOrigin:origin}));
+    setLocal(saved);localRef.current=saved;setPiAddress(origin);setSource('pi');setConnected(true);
+  }
   async function addSynthetic() {
     await action(async () => {
       const saved=await journal.commit(current => {
@@ -101,6 +107,11 @@ function MobileApp() {
   }
   return <div className="workspace mobile-workspace"><header className="phone-header"><a href="#" onClick={() => setTab('practice')}>MODUS <b>Golf</b></a><span>{native ? 'Installed app · local practice' : 'Browser preview · local storage'}</span></header>
     <main><div className="page-heading"><div><p className="eyebrow">MODUS GOLF / {source === 'cloud' ? 'FIREBASE HISTORY' : 'ON THIS DEVICE'}</p><h1>{tab === 'sessions' ? 'History' : tab === 'bag' ? 'My Bag' : tab[0].toUpperCase()+tab.slice(1)}</h1><p>{source === 'cloud' ? cached ? 'Cached cloud records may be available offline.' : 'Firebase records received.' : 'Open practice and saved shots without internet.'}</p></div></div>
+    {(tab === 'connection' || (tab === 'practice' && source === 'pi')) && <BallReadiness
+      origin={local?.piOrigin ?? piAddress} connected={connected} foreground={capture}
+      onPractice={tab === 'practice'} canConnect={native && !!local && !busy}
+      connect={() => local && void action(() => connectMonitor(local.piOrigin))}
+      settings={() => setTab('connection')}/>}
     {!native && <div className="source-banner"><strong>Browser preview</strong><span>This previews the iPhone UI and browser storage. Native Google sign-in and direct Pi transport require the installed iOS build.</span></div>}
     {error && <div className="error" role="alert">{error}<button className="text" onClick={() => setError('')}>Dismiss</button></div>}{notice && <div className="source-banner neutral" role="status">{notice}</div>}
     {!local && <p role="status">{error ? 'Local storage needs attention. Records have not been replaced with an empty dataset.' : 'Opening saved local practice…'}</p>}
@@ -115,8 +126,8 @@ function MobileApp() {
     {tab === 'bag' && <Bag shots={filtered} profileId={activeProfile || 'phone_local_golfer'} demo={source === 'demo'} units={units}/>}
     {tab === 'connection' && <><section className="panel"><h2>Connect to your monitor</h2><p>The MODUS hotspot needs no internet. Wi-Fi is only needed while copying new Pi measurements; saved shots stay available afterward.</p><label>Pi address<input type="url" value={piAddress} disabled={connected} onChange={event => setPiAddress(event.target.value)}/></label><label className="checkbox"><input type="checkbox" checked={confirmed} onChange={event => setConfirmed(event.target.checked)}/>I confirm this session contains physical shots, not the Pi's test-shot generator.</label><div className="button-row"><button className="primary" disabled={!native || !local || busy} onClick={() => void action(async () => {
       if (connected) {setConnected(false);setPiStatus('Disconnected · local history retained');return;}
-      const origin=piOrigin(piAddress);const saved=await journal.commit(current => ({...current,piOrigin:origin}));setLocal(saved);localRef.current=saved;setSource('pi');setConnected(true);
-    })}>{connected ? 'Disconnect Pi' : 'Start local connection'}</button></div><p role="status">{piStatus}</p><small>Reads only the existing /session.csv endpoint, at most once every five seconds in the foreground. No app hosting or new processing service runs on the Pi.</small></section>
+      await connectMonitor(piAddress);
+    })}>{connected ? 'Disconnect Pi' : 'Start local connection'}</button></div><p role="status">{piStatus}</p><small>Shot capture reads the current CSV in the foreground. Enable phone controls above to change monitor settings.</small></section>
       <section className="panel"><h2>Saved locally</h2><p>{local?.shots.length ?? 0} total records · {awaiting} confirmed physical records awaiting cloud pairing.</p><p>No upload acknowledgement exists yet. Pairing and the authenticated ingest service remain required before these records can reach Firebase.</p><button disabled={!local} onClick={() => download('modus-phone-local-backup.json',JSON.stringify({requires_owner_binding:true,local},null,2))}>Export local JSON backup</button><label>Display units<select value={units} onChange={event => setUnits(event.target.value as Units)}><option value="imperial">Imperial · mph / yards</option><option value="metric">Metric · km/h / meters</option></select></label></section></>}
     {tab === 'account' && <><section className="panel"><h2>{user ? 'Firebase account' : 'Sign in when online'}</h2><p>Offline practice works without signing in. New account creation and Google sign-in require internet.</p>{user ? <><p>{user.email}</p><button disabled={busy} onClick={() => void action(signOut)}>Sign out</button><button onClick={() => {setSource('cloud');setTab('sessions');}}>View my cloud history</button></> : <AccountForm busy={busy} run={action}/>}</section>{user && <section className="panel"><h2>Golfer profiles</h2><ul>{profiles.map(item => <li key={item.id}>{item.display_name}</li>)}</ul><form onSubmit={event => {event.preventDefault();const name=String(new FormData(event.currentTarget).get('name'));void action(() => createProfile(user.uid,name));}}><label>New golfer name<input name="name" maxLength={80} required/></label><button disabled={busy}>Add golfer</button></form><small>History filters do not change the ownership of local captures. Pairing is a separate action.</small></section>}</>}
     <footer className="workspace-footer"><span>MODUS GOLF · IPHONE APP SOURCE</span><span>{source === 'cloud' ? 'Firebase Authentication + Firestore' : 'Local persistence · cloud upload pending integration'}</span></footer></main>
