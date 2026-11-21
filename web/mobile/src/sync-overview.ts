@@ -29,6 +29,7 @@ export function syncOverview(local:LocalState,uid:string) {
 
 export function rejectionMessage(code:string) {
   const messages:Record<string,string>={
+    upload_too_large:'This shot exceeds the upload size limit and remains saved on your phone.',
     invalid_shot:'The cloud could not validate these measurements.',
     revision_conflict:'A different measurement already uses the same shot revision.',
     stale_revision:'The cloud already has a newer version of these measurements.',

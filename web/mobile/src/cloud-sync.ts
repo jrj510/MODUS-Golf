@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { accountToken } from './native-firebase';
 import type { Journal, LocalState } from './journal';
-import { acceptReceipt, belongsToAccount, pendingShots, type Outcome } from './sync-queue';
+import { belongsToAccount, pendingShots, payloadDigest } from './sync-queue';
+import { sendShotBatch } from './upload-batch';
 import { firebaseProjectId } from './firebase-project';
 
 const deployment = `https://us-central1-${firebaseProjectId}.cloudfunctions.net/ingestLegacyShots`;
@@ -41,11 +42,10 @@ export function useCloudSync(
       }
       const first=candidates[0];
       const binding=sync.bindings[first.session_id];
-      const batch=candidates.filter(shot => shot.session_id === first.session_id).slice(0,20);
-      const body=JSON.stringify({version:1,installationId:sync.installationId,profileId:binding.profileId,shots:batch});
+      const sessionShots=candidates.filter(shot => shot.session_id === first.session_id);
       try {
         setStatus('Uploading saved shots…');
-        const send=async (refresh: boolean) => {
+        const send=async (body: string, refresh: boolean) => {
           const token=await accountToken(binding.uid,refresh);
           if (!active()) throw new Error('Upload paused.');
           return fetch(deployment,{
@@ -53,17 +53,11 @@ export function useCloudSync(
             signal:AbortSignal.any([controller.signal,AbortSignal.timeout(25_000)])
           });
         };
-        let response=await send(false);
-        if (response.status === 401 && active()) response=await send(true);
-        if (!response.ok) throw new Error('Cloud did not confirm the upload.');
-        const result=await response.json();
-        if (result.version !== 1 || !Array.isArray(result.receipts) || result.receipts.length !== batch.length) throw new Error('Invalid cloud receipt.');
-        const outcomes=new Map<string,Outcome>();
-        for (const [index,shot] of batch.entries()) {
-          const receipt=acceptReceipt(shot,result.receipts[index]);
-          if (receipt) outcomes.set(shot.shot_id,receipt);
-        }
-        if (!outcomes.size || !active()) throw new Error('Cloud did not confirm the upload.');
+        const {shots:batch,outcomes}=await sendShotBatch(sessionShots,sync.installationId,binding.profileId,async body => {
+          const response=await send(body,false);
+          return response.status === 401 && active() ? send(body,true) : response;
+        });
+        if (!active()) return;
         let applied=false;
         const saved=await journal.commit(current => {
           if (!active() || !current.sync || current.sync.installationId !== sync.installationId) return current;
@@ -71,7 +65,7 @@ export function useCloudSync(
           for (const shot of current.shots) {
             const receipt=outcomes.get(shot.shot_id);
             const currentBinding=current.sync.bindings[shot.session_id];
-            if (!receipt || receipt.revision !== shot.revision || !belongsToAccount(currentBinding,uid) ||
+            if (!receipt || receipt.revision !== shot.revision || receipt.digest !== payloadDigest(shot) || !belongsToAccount(currentBinding,uid) ||
                 currentBinding?.profileId !== binding.profileId) continue;
             next[shot.shot_id]=receipt;
             applied=true;

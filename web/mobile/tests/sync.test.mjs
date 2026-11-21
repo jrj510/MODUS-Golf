@@ -5,11 +5,61 @@ import { Journal } from '../src/journal.ts';
 import { acceptReceipt, bindSession, belongsToAccount, payloadDigest, pendingShots } from '../src/sync-queue.ts';
 import { firebaseProjectId, legacyBindingsProjectId } from '../src/firebase-project.ts';
 import { syncOverview } from '../src/sync-overview.ts';
+import { sendShotBatch } from '../src/upload-batch.ts';
 import { normalizeSessionCsv } from '../../MODUS_Golf_Firebase_AI_Starter/app-core/shot.mjs';
 
 const filename='session_20261022_192000.csv';
 const csv=readFileSync(new URL('../../MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/'+filename,import.meta.url),'utf8');
 const [shot,other]=await normalizeSessionCsv(csv,{filename,deviceId:'modus_pi_local',profileId:'phone_local_golfer',confirmedReal:true});
+
+function confirmBatch(body) {
+  const receipts=JSON.parse(body).shots.map(item => ({
+    status:'accepted', code:'write', shotId:item.shot_id, revision:item.revision, digest:payloadDigest(item),
+    cloudShotId:'shot_'+'a'.repeat(64), cloudSessionId:'session_'+'b'.repeat(64)
+  }));
+  return Response.json({version:1,receipts});
+}
+
+test('larger extended sessions drain in byte-limited batches with exact receipts', async () => {
+  const csv34=readFileSync(new URL('../../MODUS_Golf_Firebase_AI_Starter/contracts/fixtures/pi_csv_34_synthetic.csv',import.meta.url),'utf8');
+  const [sample]=await normalizeSessionCsv(csv34,{filename,deviceId:'pi',profileId:'golfer',confirmedReal:true});
+  const diagnostics=Object.fromEntries(Object.keys(sample.source.csv_extra).map(key => [key,'球'.repeat(160)]));
+  const remaining=Array.from({length:21},(_,index) => ({
+    ...sample, shot_id:'shot_'+index, source:{...sample.source,csv_extra:diagnostics}
+  }));
+  const uploaded=[];
+  while (remaining.length) {
+    const {shots,outcomes}=await sendShotBatch(remaining,'installation','golfer',async body => {
+      assert.ok(Buffer.byteLength(body,'utf8')<=96_000);
+      assert.ok(JSON.parse(body).shots.length<=20);
+      return confirmBatch(body);
+    });
+    assert.deepEqual([...outcomes.keys()],shots.map(item => item.shot_id));
+    assert.ok([...outcomes.values()].every(result => result.status==='accepted'));
+    uploaded.push(...shots);
+    remaining.splice(0,shots.length);
+  }
+  assert.equal(new Set(uploaded.map(item => item.shot_id)).size,21);
+});
+
+test('a server size rejection splits the batch and isolates a single oversized shot', async () => {
+  const attempts=[];
+  const smaller=await sendShotBatch([shot,other],'installation','golfer',async body => {
+    attempts.push(JSON.parse(body).shots.length);
+    return attempts.length===1 ? new Response(null,{status:413}) : confirmBatch(body);
+  });
+  assert.deepEqual(attempts,[2,1]);
+  assert.equal(smaller.outcomes.get(shot.shot_id).status,'accepted');
+  const rejected=await sendShotBatch([shot],'installation','golfer',async () => new Response(null,{status:413}));
+  const local=bindSession({shots:[shot,other]},shot.session_id,{uid:'owner',profileId:'golfer'});
+  local.sync.outcomes[shot.shot_id]=rejected.outcomes.get(shot.shot_id);
+  assert.equal(syncOverview(local,'owner').attention.get('upload_too_large'),1);
+  assert.deepEqual(pendingShots(local,'owner'),[other]);
+  const oversized={...shot,source:{...shot.source,ti_radar:'x'.repeat(96_000)}};
+  const blocked=await sendShotBatch([oversized],'installation','golfer',async () => assert.fail('oversized request sent'));
+  assert.equal(blocked.outcomes.get(shot.shot_id).code,'upload_too_large');
+  await assert.rejects(sendShotBatch([shot],'installation','golfer',async () => new Response(null,{status:503})));
+});
 
 test('linked outbox survives reopening and remains private to the intended account',async () => {
   const slots=new Map();
