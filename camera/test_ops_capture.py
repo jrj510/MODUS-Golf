@@ -174,7 +174,8 @@ def test_real_raw_captures_20261120():
         if shot is not None:
             hits[os.path.basename(p)[13:19]] = shot
     # run 1 (split 20) and run 2 (split 10), same wedge
-    assert sorted(hits) == ["150812", "150845", "150932", "151008",
+    # 152550 is a heeled wedge (radar read it 29-41 mph)
+    assert sorted(hits) == ["150812", "150845", "150932", "151008", "152550",
                             "152559", "152625", "152634", "152648", "152700", "152712"]
     assert abs(hits["150932"].ball_mph - 50.0) < 1.0
     assert abs(hits["150812"].club_mph - 56.0) < 1.0

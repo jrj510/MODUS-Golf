@@ -281,7 +281,11 @@ class RollingBufferRadar:
             if not self.busy:
                 self.ser.write(b"S!")
 
-    def start(self, on_capture: Callable[[Capture], None]) -> None:
+    def start(self, on_capture: Callable[[Capture], None],
+              on_notice: Optional[Callable[[float], None]] = None) -> None:
+        """on_capture(Capture) for every recording; on_notice(Pi time) the
+        moment the radar says its speed trigger fired, ~2 s before that
+        recording has come over (so the camera can still keep its frames)."""
         rate = self.cfg.rate_ksps * 1000.0
 
         def loop() -> None:
@@ -303,7 +307,12 @@ class RollingBufferRadar:
                         self.busy = True
                     continue
                 if first is None:
-                    if line and self.verbose:
+                    if "trigger_velocity_detected" in line and on_notice is not None:
+                        try:
+                            on_notice(time.monotonic())
+                        except Exception as e:
+                            print(f"Trigger notice handler error: {type(e).__name__}: {e}")
+                    elif line and self.verbose:
                         print(f"  radar: {line[:120]}")
                     continue
                 lines.append(line)
@@ -357,7 +366,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--split", type=int, default=10, help="blocks (of 32) kept from before the trigger")
     p.add_argument("--speed-trigger-mph", type=float, default=40.0,
                    help="radar triggers itself on anything moving away faster; 0 = off")
-    p.add_argument("--min-ball", type=float, default=40.0)
+    p.add_argument("--min-ball", type=float, default=30.0)
     p.add_argument("--blocks", action="store_true", help="print every block's speeds")
     p.add_argument("--save", help="folder to save each capture to (JSON)")
     p.add_argument("--replay", help="process a saved capture instead of the radar")

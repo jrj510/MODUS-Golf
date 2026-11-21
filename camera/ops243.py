@@ -118,7 +118,8 @@ def parse_line(line: str, t: float) -> Optional[Report]:
 # --------------------------------------------------------------------------
 @dataclass
 class DetectorConfig:
-    min_ball_mph: float = 40.0      # slowest ball that counts as a shot
+    min_ball_mph: float = 30.0      # slowest ball that counts as a shot (radar's view: a
+                                    # heeled wedge on 2026-11-20 read 29-41 mph)
     max_ball_mph: float = 209.0     # radar's limit at 30 ksps
     hold_tol_mph: float = 3.0       # a speed this close to the ball's line is the ball
     step_mph: float = 2.0           # the ball's line changes less than this per report

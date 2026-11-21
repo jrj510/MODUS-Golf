@@ -10,6 +10,13 @@ with our own FFT) and decides shots together with the camera
     camera_fired(t, source)          -> tell it the camera triggered at t
     stop()
 
+When the radar's own speed trigger fires it says so at once
+({"trigger_velocity_detected": ...}), ~2 s before its recording has come
+over. If the camera is Ready, that notice starts a camera capture right away
+(start_capture), so the shot keeps its frames of the ball leaving (launch
+angle, replay) even when the camera's own trigger misses it. Its numbers are
+then filed under that capture's time.
+
 What starts a radar recording:
   * the radar's own speed trigger (something moving away faster than
     --ops-speed-trigger-mph: the club coming through), so it needs nothing else
@@ -49,14 +56,17 @@ class SpeedRadar:
     def __init__(self, args,
                  trigger_camera: Callable[[float], None],
                  ball_present: Callable[[], Optional[bool]] = lambda: None,
-                 radar: Optional[RollingBufferRadar] = None):
+                 radar: Optional[RollingBufferRadar] = None,
+                 start_capture: Optional[Callable[[float], bool]] = None):
         self.trigger_camera = trigger_camera
+        self.start_capture = start_capture    # (t) -> True if a camera capture started at t
+        self.notice_t: Optional[float] = None  # Pi time of the last capture a notice started
         self.cond = threading.Condition()
         self.results: list[tuple[float, Optional[dict], FusedShot]] = []  # (trigger time, numbers, shot)
         self.listeners: list[Callable] = []
         self.trigger_listeners: list[Callable] = []
         self.hw_pulse = bool(getattr(args, "trigger_out_gpio", 0))
-        self.dcfg = DetectorConfig(min_ball_mph=getattr(args, "ops_min_ball", 40.0))
+        self.dcfg = DetectorConfig(min_ball_mph=getattr(args, "ops_min_ball", 30.0))
         self.last_capture: Optional[Capture] = None
         # Camera-only shots are always passed on; with --radar-confirm on the
         # kiosk turns them down itself (outcome() answers "none").
@@ -76,9 +86,34 @@ class SpeedRadar:
                                        reset_gpio=getattr(args, "ops_reset_gpio", 23))
             radar.setup()
         self.radar = radar
-        self.radar.start(self._on_capture)
+        self.radar.start(self._on_capture, self._on_notice)
 
     # ---- radar side -------------------------------------------------------
+    def _on_notice(self, t: float) -> None:
+        """The radar's speed trigger fired (club or ball moving away fast)."""
+        if self.start_capture is None:
+            return
+        try:
+            started = bool(self.start_capture(t))
+        except Exception as e:
+            print(f"Speed radar: could not start a capture ({type(e).__name__}: {e})")
+            started = False
+        if started:
+            self.notice_t = t
+            print(f"[{time.strftime('%H:%M:%S')}] Speed radar triggered: camera capture started")
+
+    def _notice_for(self, t0: float, t1: float) -> Optional[float]:
+        """The capture a notice started for a recording from t0 to t1 (Pi clock)."""
+        n = self.notice_t
+        if n is not None and t0 - 0.05 <= n <= t1 + 0.3:
+            return n
+        return None
+
+    def _file(self, t: float, nums: Optional[dict], fs: FusedShot) -> None:
+        with self.cond:
+            self.results = [r for r in self.results if r[0] > t - 60] + [(t, nums, fs)]
+            self.cond.notify_all()
+
     def _on_capture(self, cap: Capture) -> None:
         self.last_capture = cap
         took = time.monotonic() - cap.received
@@ -90,6 +125,11 @@ class SpeedRadar:
             fastest = max((r.speeds[0] for r in reports), default=0.0)
             print(f"[{stamp}] Speed radar: recording read ({took:.1f} s), no ball in it"
                   + (f" (fastest {fastest:.0f} mph)" if fastest else ""))
+            n = self._notice_for(t0, t1)
+            if n is not None:          # the capture it started: no radar numbers for it
+                self.notice_t = None
+                self._file(n, None, FusedShot("camera_only", n, camera_t=n, camera_source="radar",
+                                              notes=["radar recording had no ball"]))
             self.fusion.radar_nothing(t0, t1)
             return
         print(f"[{stamp}] Speed radar: recording read ({took:.1f} s): ball {shot.ball_mph:.1f} mph"
@@ -115,16 +155,19 @@ class SpeedRadar:
                     "club_speed_how": "rolling buffer, club peak" if fs.club_mph is not None else None,
                     "smash": fs.smash, "source": fs.source}
         t = fs.camera_t
+        notice = None
         if fs.source == "radar_only":
-            t = fs.t_impact + self.fusion.cfg.cam_delay_est_s   # where a camera trigger would be
+            notice = self._notice_for(fs.t_impact - 0.25, fs.t_impact)
+            if notice is not None:      # the camera is already capturing this shot
+                t, self.notice_t = notice, None
+            else:
+                t = fs.t_impact + self.fusion.cfg.cam_delay_est_s   # where a camera trigger would be
         speeds = (f"ball {fs.ball_mph:.1f} mph" + (f", club {fs.club_mph:.1f} mph" if fs.club_mph else "")
                   if fs.ball_mph is not None else "no speeds")
         print(f"[{time.strftime('%H:%M:%S')}] Shot ({fs.source.replace('_', ' ')}): {speeds}"
               + (f"; {'; '.join(fs.notes)}" if fs.notes else ""))
-        with self.cond:
-            self.results = [r for r in self.results if r[0] > t - 60] + [(t, nums, fs)]
-            self.cond.notify_all()
-        if fs.source == "radar_only":
+        self._file(t, nums, fs)
+        if fs.source == "radar_only" and notice is None:
             try:
                 self.trigger_camera(t)      # a shot on screen with the radar's numbers
             except Exception as e:

@@ -1504,7 +1504,7 @@ def main():
                         "this (the club coming through). 0 = off (camera pulse / S! only)")
     p.add_argument("--ops-reset-gpio", type=int, default=23,
                    help="GPIO wired to OPS J3 pin 4 (/Reset); the radar is reset before it is set up. 0 = don't")
-    p.add_argument("--ops-min-ball", type=float, default=40.0,
+    p.add_argument("--ops-min-ball", type=float, default=30.0,
                    help="slowest ball speed the radar counts as a shot, mph (lower for chips)")
     p.add_argument("--trigger-out-gpio", type=int, default=0,
                    help="pulse this GPIO the moment the camera triggers (wired to --gate-gpio in place "
@@ -1665,6 +1665,17 @@ def main():
             return
         sh.trigger("radar", need_armed=False, t=t)
 
+    def radar_notice_capture(t):
+        """The radar's speed trigger just fired: if the camera is Ready, start
+        a capture now, while the frames of the ball leaving are still kept.
+        (A practice swing is then turned down by the usual ball-still-there
+        check.) True if a capture started."""
+        if K.state == "SLEEPING":
+            return False
+        sh.trigger("radar", need_armed=True, t=t)
+        with sh.lock:
+            return sh.trigger_time == t
+
     ops = None
     if args.ops:
         if args.ops_speed_mode:
@@ -1672,7 +1683,8 @@ def main():
             radar = None
         try:
             from speed_radar import SpeedRadar
-            ops = SpeedRadar(args, trigger_camera=radar_wants_capture, ball_present=radar_ball_present)
+            ops = SpeedRadar(args, trigger_camera=radar_wants_capture, ball_present=radar_ball_present,
+                             start_capture=radar_notice_capture)
             print(f"Speed radar: on ({args.radar_port}); it triggers on its own and with the camera")
         except Exception as e:
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")

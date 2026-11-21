@@ -13,8 +13,9 @@ class FakeRadar:
     def __init__(self):
         self.triggers = 0
 
-    def start(self, cb):
+    def start(self, cb, on_notice=None):
         self.cb = cb
+        self.on_notice = on_notice
 
     def trigger(self):
         self.triggers += 1
@@ -29,11 +30,21 @@ class FakeRadar:
         self.cb(cap)
 
 
-def make(ball_present=None, pulse=21):
+def make(ball_present=None, pulse=21, camera_ready=None):
+    """camera_ready: None = no notice hook; True/False = the camera is/isn't
+    Ready when the radar's trigger notice arrives (started captures go in .started)."""
     fake, asked = FakeRadar(), []
     args = SimpleNamespace(radar_port="x", radar_confirm="off", trigger_out_gpio=pulse)
-    sr = SpeedRadar(args, trigger_camera=asked.append,
-                    ball_present=lambda: ball_present, radar=fake)
+    started = []
+
+    def start_capture(t):
+        if camera_ready:
+            started.append(t)
+            return True
+        return False
+    sr = SpeedRadar(args, trigger_camera=asked.append, ball_present=lambda: ball_present,
+                    radar=fake, start_capture=None if camera_ready is None else start_capture)
+    sr.started = started
     return sr, fake, asked
 
 
@@ -94,4 +105,37 @@ def test_with_pulse_wire_no_serial_trigger():
     sr, fake, _ = make(pulse=21)
     sr.camera_fired(time.monotonic(), "motion")
     assert fake.triggers == 0
+    sr.stop()
+
+
+def test_trigger_notice_starts_a_capture_and_gets_the_numbers():
+    sr, fake, asked = make(ball_present=None, camera_ready=True)
+    impact = time.monotonic() - 2.0
+    notice = impact - 0.02                    # speed trigger: club passing 40 mph
+    fake.on_notice(notice)
+    assert sr.started == [notice]
+    fake.deliver(impact)                      # ~2 s later the recording arrives
+    o = sr.result_for(notice, wait_s=1.0)     # the kiosk asks for its capture's numbers
+    assert o is not None and abs(o["ball_speed"] - 132) < 2
+    assert asked == []                        # no second, frameless capture
+    sr.stop()
+
+
+def test_trigger_notice_with_no_ball_answers_none():
+    sr, fake, asked = make(camera_ready=True)
+    impact = time.monotonic() - 2.0
+    fake.on_notice(impact - 0.02)
+    fake.deliver(impact, amp_ball=0.0, amp_club=0.0)
+    assert sr.result_for(impact - 0.02, wait_s=0.5) is None
+    assert sr.outcome(impact - 0.02)[0] == "none"
+    sr.stop()
+
+
+def test_trigger_notice_when_camera_not_ready_falls_back():
+    sr, fake, asked = make(ball_present=None, camera_ready=False)
+    impact = time.monotonic() - 2.0
+    fake.on_notice(impact - 0.02)
+    fake.deliver(impact)
+    time.sleep(0.5)
+    assert len(asked) == 1                    # the old radar-only shot, as before
     sr.stop()
