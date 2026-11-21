@@ -60,7 +60,12 @@ class SpeedRadar:
                  start_capture: Optional[Callable[[float], bool]] = None):
         self.trigger_camera = trigger_camera
         self.start_capture = start_capture    # (t) -> True if a camera capture started at t
-        self.notice_t: Optional[float] = None  # Pi time of the last capture a notice started
+        self.notice_t: Optional[float] = None  # the trigger time of the capture a notice started
+        self.notice_arrived: Optional[float] = None
+        # How late the radar's trigger message arrives after its trigger, s.
+        # Measured on every recording (2026-11-21: some captures started after
+        # impact); starts at a cautious guess.
+        self.notice_delay = 0.10
         self.cond = threading.Condition()
         self.results: list[tuple[float, Optional[dict], FusedShot]] = []  # (trigger time, numbers, shot)
         self.listeners: list[Callable] = []
@@ -89,18 +94,27 @@ class SpeedRadar:
         self.radar.start(self._on_capture, self._on_notice)
 
     # ---- radar side -------------------------------------------------------
-    def _on_notice(self, t: float) -> None:
+    def capture_time_for_notice(self, arrived: float) -> float:
+        """Where to put a capture's trigger time for a notice that arrived at
+        `arrived`: like a camera trigger, ~50 ms after the radar's trigger
+        (which fires ~15-20 ms before impact), so the camera keeps impact and
+        the ball's first frames of flight."""
+        return arrived - self.notice_delay + 0.05
+
+    def _on_notice(self, arrived: float) -> None:
         """The radar's speed trigger fired (club or ball moving away fast)."""
         if self.start_capture is None:
             return
+        t = self.capture_time_for_notice(arrived)
         try:
             started = bool(self.start_capture(t))
         except Exception as e:
             print(f"Speed radar: could not start a capture ({type(e).__name__}: {e})")
             started = False
         if started:
-            self.notice_t = t
-            print(f"[{time.strftime('%H:%M:%S')}] Speed radar triggered: camera capture started")
+            self.notice_t, self.notice_arrived = t, arrived
+            print(f"[{time.strftime('%H:%M:%S')}] Speed radar triggered: camera capture started "
+                  f"({1000 * (t - arrived):+.0f} ms from the notice)")
 
     def _notice_for(self, t0: float, t1: float) -> Optional[float]:
         """The capture a notice started for a recording from t0 to t1 (Pi clock)."""
@@ -114,8 +128,20 @@ class SpeedRadar:
             self.results = [r for r in self.results if r[0] > t - 60] + [(t, nums, fs)]
             self.cond.notify_all()
 
+    def _learn_delay(self, cap: Capture) -> None:
+        """How late the notice came after the radar's own trigger, this time."""
+        if self.notice_arrived is None:
+            return
+        d = self.notice_arrived - cap.pi_time(cap.trigger_time)
+        self.notice_arrived = None
+        if -0.05 <= d <= 0.5:
+            self.notice_delay = 0.5 * self.notice_delay + 0.5 * d
+            print(f"Speed radar: its trigger message came {1000 * d:.0f} ms after the trigger "
+                  f"(now using {1000 * self.notice_delay:.0f} ms)")
+
     def _on_capture(self, cap: Capture) -> None:
         self.last_capture = cap
+        self._learn_delay(cap)
         took = time.monotonic() - cap.received
         shot, reports = find_shot(cap, dcfg=DetectorConfig(min_ball_mph=self.dcfg.min_ball_mph))
         t0 = cap.pi_time(cap.sample_time)
@@ -157,9 +183,13 @@ class SpeedRadar:
         t = fs.camera_t
         notice = None
         if fs.source == "radar_only":
-            notice = self._notice_for(fs.t_impact - 0.25, fs.t_impact)
+            notice = self._notice_for(fs.t_impact - 0.25, fs.t_impact + 0.1)
             if notice is not None:      # the camera is already capturing this shot
                 t, self.notice_t = notice, None
+                fs.source, fs.camera_t, fs.camera_source = "radar_trigger", notice, "radar"
+                fs.notes = ["radar triggered the camera"]
+                if nums is not None:
+                    nums["source"] = fs.source
             else:
                 t = fs.t_impact + self.fusion.cfg.cam_delay_est_s   # where a camera trigger would be
         speeds = (f"ball {fs.ball_mph:.1f} mph" + (f", club {fs.club_mph:.1f} mph" if fs.club_mph else "")

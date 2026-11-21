@@ -111,12 +111,14 @@ def test_with_pulse_wire_no_serial_trigger():
 def test_trigger_notice_starts_a_capture_and_gets_the_numbers():
     sr, fake, asked = make(ball_present=None, camera_ready=True)
     impact = time.monotonic() - 2.0
-    notice = impact - 0.02                    # speed trigger: club passing 40 mph
-    fake.on_notice(notice)
-    assert sr.started == [notice]
+    fake.on_notice(impact + 0.05)             # the radar's message, a bit after its trigger
+    assert len(sr.started) == 1
+    cap_t = sr.started[0]                     # placed earlier than the message
+    assert cap_t < impact + 0.05
     fake.deliver(impact)                      # ~2 s later the recording arrives
-    o = sr.result_for(notice, wait_s=1.0)     # the kiosk asks for its capture's numbers
+    o = sr.result_for(cap_t, wait_s=1.0)      # the kiosk asks for its capture's numbers
     assert o is not None and abs(o["ball_speed"] - 132) < 2
+    assert o["source"] == "radar_trigger"
     assert asked == []                        # no second, frameless capture
     sr.stop()
 
@@ -125,9 +127,10 @@ def test_trigger_notice_with_no_ball_answers_none():
     sr, fake, asked = make(camera_ready=True)
     impact = time.monotonic() - 2.0
     fake.on_notice(impact - 0.02)
+    cap_t = sr.started[0]
     fake.deliver(impact, amp_ball=0.0, amp_club=0.0)
-    assert sr.result_for(impact - 0.02, wait_s=0.5) is None
-    assert sr.outcome(impact - 0.02)[0] == "none"
+    assert sr.result_for(cap_t, wait_s=0.5) is None
+    assert sr.outcome(cap_t)[0] == "none"
     sr.stop()
 
 
@@ -138,4 +141,20 @@ def test_trigger_notice_when_camera_not_ready_falls_back():
     fake.deliver(impact)
     time.sleep(0.5)
     assert len(asked) == 1                    # the old radar-only shot, as before
+    sr.stop()
+
+
+def test_notice_delay_is_learned():
+    sr, fake, asked = make(camera_ready=True)
+    for k in range(4):
+        impact = time.monotonic() - 2.0
+        # the radar's own trigger is 20 ms before impact (synth: impact 60 ms in,
+        # trigger 85 ms in, so here: trigger = impact + 25 ms); message 200 ms late
+        trig = impact + 0.025
+        fake.on_notice(trig + 0.200)
+        fake.deliver(impact)
+    assert abs(sr.notice_delay - 0.200) < 0.02
+    # the next capture is placed ~50 ms after the radar's trigger, not after the message
+    fake.on_notice(trig + 0.200)
+    assert abs(sr.started[-1] - (trig + 0.05)) < 0.02
     sr.stop()
