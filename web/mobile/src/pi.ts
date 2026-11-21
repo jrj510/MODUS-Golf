@@ -19,7 +19,7 @@ export function selectMonitor(state: LocalState, address: string): LocalState {
   return {...state,piOrigin:origin,deviceId:id,monitors:{...monitors,[origin]:id}};
 }
 export async function readPi(state: LocalState, confirmedFilename: string | null) {
-  if (!Capacitor.isNativePlatform()) throw new Error('Direct Pi connection runs in the installed iPhone app. Use the computer test server for browser testing.');
+  if (!Capacitor.isNativePlatform()) throw new Error('To connect to your launch monitor, open the installed MODUS Golf iPhone app and join MODUS Wi-Fi.');
   const response=await CapacitorHttp.get({url:piOrigin(state.piOrigin)+'/session.csv',connectTimeout:3000,readTimeout:3000,disableRedirects:true});
   if (response.status !== 200 || typeof response.data !== 'string') throw new Error('Pi CSV was not received. Stay connected to MODUS Wi-Fi; internet is not required.');
   const disposition=Object.entries(response.headers).find(([key]) => key.toLowerCase() === 'content-disposition')?.[1] ?? '';

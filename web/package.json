@@ -8,6 +8,7 @@
     "build": "npm run build --prefix mobile",
     "test": "npm run test:shared && npm test --prefix mobile",
     "test:rules": "node --test tests/firestore.test.mjs",
+    "test:firebase": "npx --yes firebase-tools@15.37.0 emulators:exec --config firebase.emulator-test.json --project demo-modus-golf --only auth,firestore \"node --test tests/auth.test.mjs tests/firestore.test.mjs\"",
     "postinstall": "npm ci --prefix mobile",
     "test:shared": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/*.test.mjs tests/view-model.test.mjs"
   },

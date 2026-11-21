@@ -51,11 +51,11 @@
   .phone-header, .mobile-workspace .bottom-nav { background: var(--chrome); border-color: var(--line); }
   .phone-header a, h1, h2, h3, strong, summary, .more-metrics summary { color: var(--ink); }
   .phone-header b, .eyebrow, .local-link { color: var(--green); }
-  p, label, small, th, .phone-header > span, .workspace-footer, .provenance dt,
+  p, label, small, th, .phone-header > span, .workspace-footer,
   .metric-card > span, .metric-card p, .shot-chips button > span, .more-metrics summary span,
   .secondary-metrics > div > span, .ball-readiness span, .flight-caption > span,
   .flight-plots h3 small, .flight-readout > span { color: var(--muted); }
-  .panel, .metric-card, .more-metrics, .ball-readiness, .shot-detail { background: var(--surface); border-color: var(--line); }
+  .panel, .metric-card, .more-metrics, .ball-readiness { background: var(--surface); border-color: var(--line); }
   th, td, .secondary-metrics > div { border-color: var(--line); }
   button, input, select, .mobile-workspace textarea, .filters select, .filters input,
   .shot-chips button, .plot-tabs button { background: var(--control); color: var(--ink); border-color: var(--control-line); }
@@ -77,9 +77,8 @@
   .error, .error button { background: var(--error-bg); color: var(--error-text); border-color: var(--error-text); }
   .flight-plots > div { background: var(--tint); border-color: var(--tint-line); }
   .flight-plots .side-plot { background: var(--control); border-color: var(--line); }
-  .flight-plots svg text, .trend text { fill: var(--muted); }
-  .plot-grid, .target-line, .older-flight, .trend path { stroke: var(--muted); }
-  .selected-flight, .trend polyline { stroke: var(--gold); }
+  .flight-plots svg text { fill: var(--muted); }
+  .plot-grid, .target-line, .older-flight { stroke: var(--muted); }
+  .selected-flight { stroke: var(--gold); }
   .landing-marker { fill: var(--gold); stroke: var(--surface); }
-  .trend circle { fill: var(--green); }
 }

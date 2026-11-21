@@ -31,17 +31,6 @@ export function MoreMetrics({ shot, units }: { shot?: Shot; units: Units }) {
     <div><span>Apex</span><strong>{number(shot?.source.apex_yards == null ? null : shot.source.apex_yards * (units === 'metric' ? .9144 : 1))} <small>{unitFor('carry_yards',units)}</small></strong><p>Estimated · supplied model result</p></div>
   </div></details>;
 }
-export function CarryTrend({ shots, units }: { shots: Shot[]; units: Units }) {
-  const values = shots.filter(s => s.processing_state === 'final' && s.carry_yards !== null);
-  if (values.length < 2) return <p className="chart-empty">At least two modeled carry values are needed to show a trend.</p>;
-  const carries = values.map(s => s.carry_yards! * (units === 'metric' ? .9144 : 1));
-  const min = Math.max(0, Math.min(...carries) - 10), max = Math.max(...carries) + 10;
-  const points = carries.map((n, i) => `${30 + i / Math.max(1, carries.length - 1) * 650},${145 - (n - min) / (max - min) * 110}`);
-  return <><svg className="trend" viewBox="0 0 720 185" role="img" aria-label={`Modeled carry across ${carries.length} shots, in ${units === 'metric' ? 'meters' : 'yards'}`}>
-    {[35,90,145].map((y, i) => <g key={y}><path d={`M30 ${y}H690`} stroke="#dbe3d6" strokeDasharray="4 5"/><text x="32" y={y-6}>{(max - i * (max-min)/2).toFixed(0)}</text></g>)}
-    <polyline points={points.join(' ')} fill="none" stroke="#b48c39" strokeWidth="3"/>{points.length < 80 && points.map((p,i) => <circle key={i} cx={p.split(',')[0]} cy={p.split(',')[1]} r="4" fill="#173f33"/>)}
-    <text x="30" y="175">FIRST SHOT</text><text x="610" y="175">LATEST</text></svg><small>Shot order · Modeled carry · App-rendered history, not a flight path</small></>;
-}
 export function Trajectory({ shot, shots = [], units = 'imperial' }: { shot?: Shot; shots?: Shot[]; units?: Units }) {
   const [view, setView] = useState<'range' | 'side'>('range');
   const points = flightPoints(shot);
@@ -71,12 +60,6 @@ export function Trajectory({ shot, shots = [], units = 'imperial' }: { shot?: Sh
       {[1,2,3,4].map(i => <text key={i} x={45+i*400/4} y="250" textAnchor="middle">{(forward*i/4*factor).toFixed(0)} {distanceUnit}</text>)}</svg>
       <div className="flight-readout"><strong>{displayMetric(shot.carry_yards,'carry_yards',units)} <small>{distanceUnit} carry · modeled</small></strong><span>{shot.quality_flags.includes('launch_assumed') ? 'Launch assumed' : 'Reported launch'} · spin {shot.spin_rpm == null ? 'assumed' : 'experimental'}</span></div></div></div>
     <small>Yellow: selected shot. Muted: same-session, same-club paths. Modeled flight is not an observed camera track; launch direction alone does not establish draw/fade or measured dispersion.</small></div>;
-}
-export function ShotDetail({ shot, units, onClose }: { shot: Shot; units: Units; onClose: () => void }) {
-  return <section className="panel shot-detail" aria-label="Shot details"><div className="panel-heading"><div><p className="eyebrow">{sourceName(shot)}</p><h2>Shot {shot.sequence_number} · {clubName(shot.club)}</h2></div><button onClick={onClose}>Close details</button></div>
-    <p>{shotTime(shot)} · Revision {shot.revision} · {shot.processing_state}</p><MetricCards shot={shot} units={units}/>
-    <MoreMetrics shot={shot} units={units}/><Trajectory shot={shot} units={units}/><details><summary>Provenance & quality</summary><dl className="provenance"><dt>Device</dt><dd>{shot.device_id}</dd><dt>Golfer profile</dt><dd>{shot.profile_id}</dd><dt>Record kind</dt><dd>{shot.record_kind}</dd><dt>Source file</dt><dd>{shot.source.filename ?? 'Not supplied'}</dd><dt>Pi timezone</dt><dd>{shot.source.timezone ?? 'Not supplied; UTC is not inferred'}</dd><dt>Spin</dt><dd>Experimental; excluded from normal statistics. Model input: {shot.model_inputs.spin_rpm ?? 'unavailable'} rpm.</dd><dt>Quality flags</dt><dd>{shot.quality_flags.join(', ') || 'None supplied'}</dd><dt>Stable shot ID</dt><dd>{shot.shot_id}</dd></dl></details>
-  </section>;
 }
 export function ShotList({ shots, units, onSelect, totalCount = shots.length, selectedId }: { shots: Shot[]; units: Units; onSelect: (shot: Shot) => void; totalCount?: number; selectedId?: string | null }) {
   const [page, setPage] = useState(1);

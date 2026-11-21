@@ -30,6 +30,8 @@ npm run build
 
 Use `npm run dev` in that directory for a local mobile UI preview. The installed iPhone app provides the native monitor connection and Google sign-in. The browser preview is a development tool.
 
+From `web/`, run `npm run test:firebase` with Java 21 or newer on your PATH. It starts the Auth and Firestore emulators for `demo-modus-golf`, runs sign-in and access-rule tests, and shuts both emulators down. To test cloud upload and replay as well, follow the [ingestion test instructions](MODUS_Golf_Firebase_AI_Starter/firebase/README.md).
+
 ## Work on the monitor connection
 
 The iPhone polls the kiosk’s readiness at `/state` and copies shots from `/session.csv`. The Pi runs its existing capture and touchscreen software. To check a change on hardware, start practice on the monitor, join MODUS Wi-Fi on the phone, and open **Monitor** in the app. [Monitor controls and cloud history](mobile/README.md)
