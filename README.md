@@ -1,3 +1,9 @@
+# MODUS Golf
+
+Build and run the iPhone app with the [mobile build guide](web/README.md).
+
+## Monitor development setup
+
 install the same packages in terminal with:
 
 Step 1 copy the following in separate commands into a terminal:

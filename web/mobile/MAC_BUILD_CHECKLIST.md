@@ -8,7 +8,7 @@ On 2026-11-03 the signed Debug app also built, installed and launched on the phy
 
 ## Before starting
 
-1. Transfer and extract **`MODUS_Golf_Mac_Ready_2026-11-02.zip`**. Preserve its parent folders; `mobile/src` imports the shared parent `src` and contract files. For a GitHub checkout the equivalent folder is `web/mobile/`.
+1. Clone the repository and open its `web/` directory. Keep `mobile/`, `src/` and `MODUS_Golf_Firebase_AI_Starter/` together. On the configured build Mac, you can use the existing source folder containing those same directories.
 2. Use a Mac that supports **Xcode 26 or newer**, as required by Capacitor 8. Install a compatible Xcode and **Node 24 LTS** for this tested source package. Accept Apple's Xcode license directly if prompted. Open Xcode once to finish installing its components.
    On **macOS Sequoia 15.6.1**, use **Xcode 26.3**, which Apple lists as compatible with Sequoia 15.6+. Download that version from [Apple Developer downloads](https://developer.apple.com/download/all/?q=Xcode%2026.3) if the App Store offers a newer incompatible version. A macOS 27 upgrade is not required for this toolchain. See [Apple's compatibility table](https://developer.apple.com/xcode/system-requirements).
 3. Confirm `swift --version`, `xcodebuild -version` and `node --version` work. If an AI performs native project/package changes, use the installed Firebase/Xcode skills and their toolchain/project checks. Do not text-edit `.pbxproj` files or use Ruby project-editing scripts.
@@ -16,7 +16,7 @@ On 2026-11-03 the signed Debug app also built, installed and launched on the phy
 
 ## Prepare the Capacitor app
 
-From the extracted source folder:
+From the checkout’s `web/` directory or the existing Mac source folder, run the following commands.
 
 ```bash
 cd mobile

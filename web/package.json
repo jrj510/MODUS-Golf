@@ -4,24 +4,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
-    "test": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/*.test.mjs tests/view-model.test.mjs",
-    "test:rules": "node --test tests/firestore.test.mjs"
-  },
-  "dependencies": {
-    "firebase": "latest",
-    "react": "latest",
-    "react-dom": "latest"
+    "dev": "npm run dev --prefix mobile",
+    "build": "npm run build --prefix mobile",
+    "test": "npm run test:shared && npm test --prefix mobile",
+    "test:rules": "node --test tests/firestore.test.mjs",
+    "postinstall": "npm ci --prefix mobile",
+    "test:shared": "node --test MODUS_Golf_Firebase_AI_Starter/app-core/*.test.mjs tests/view-model.test.mjs"
   },
   "devDependencies": {
-    "@firebase/rules-unit-testing": "latest",
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
-    "typescript": "latest",
-    "vite": "latest"
+    "@firebase/rules-unit-testing": "6.0.0",
+    "firebase": "13.1.0"
   },
   "overrides": {
     "@grpc/grpc-js": "^1.13.6"
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
