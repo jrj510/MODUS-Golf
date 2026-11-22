@@ -29,8 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SETTINGS = os.path.expanduser("~/MODUS-Golf/shots/launcher.json")
 MODES = ("outside", "inside")
-CLUBS = ["driver", "3w", "hybrid", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
-CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "5i": "5 Iron",
+CLUBS = ["driver", "3w", "hybrid", "3i", "4i", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
+CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "3i": "3 Iron", "4i": "4 Iron", "5i": "5 Iron",
               "6i": "6 Iron", "7i": "7 Iron", "8i": "8 Iron", "9i": "9 Iron", "pw": "PW",
               "52": "52°", "56": "56°", "60": "60°"}
 

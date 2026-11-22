@@ -72,8 +72,8 @@ from launch_camera import FocalCalibration, camera_launch, fuse_launch, track_fl
 
 DEFAULT_MODEL = "~/MODUS-Golf/models/modus_ball_256.onnx"   # our own ball model (train_ball_model.py)
 # Clubs for the Club button (same list and names as the start menu, launcher.py).
-CLUBS = ["driver", "3w", "hybrid", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
-CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "5i": "5 Iron",
+CLUBS = ["driver", "3w", "hybrid", "3i", "4i", "5i", "6i", "7i", "8i", "9i", "pw", "52", "56", "60"]
+CLUB_LABEL = {"driver": "Driver", "3w": "3 Wood", "hybrid": "Hybrid", "3i": "3 Iron", "4i": "4 Iron", "5i": "5 Iron",
               "6i": "6 Iron", "7i": "7 Iron", "8i": "8 Iron", "9i": "9 Iron", "pw": "PW",
               "52": "52\u00b0", "56": "56\u00b0", "60": "60\u00b0"}
 MENU_SETTINGS = os.path.expanduser("~/MODUS-Golf/shots/launcher.json")   # shared with launcher.py
@@ -1047,7 +1047,7 @@ SESSION_COLUMNS = ["shot", "time", "club", "ball_speed_mph", "club_speed_mph", "
 # are not shown. A little above the real limits, for measurement noise. Low
 # smash is kept: mishits are real.
 SMASH_MAX = {"driver": 1.52, "3w": 1.52, "5w": 1.52,
-             "hybrid": 1.50, "4i": 1.50, "5i": 1.50,
+             "hybrid": 1.50, "3i": 1.50, "4i": 1.50, "5i": 1.50,
              "6i": 1.45, "7i": 1.45, "8i": 1.45, "9i": 1.45,
              "pw": 1.35, "gw": 1.35, "sw": 1.35, "lw": 1.35}
 SMASH_MIN = 0.8
@@ -1512,6 +1512,8 @@ def main():
     p.add_argument("--radar-pulse-fps", type=float, default=0.0,
                    help="with --trigger-out-gpio: send the pulse when a camera at this frame rate would "
                         "have triggered, whatever the camera's own frame rate. 0 = straight away")
+    p.add_argument("--speed-correction", choices=("on", "off"), default="off",
+                   help="on = correct the speed radar's ball speed for its line of sight (radar_calibration.py)")
     p.add_argument("--ball-height-m", "--iwr-ball-height-m", dest="iwr_ball_height_m", type=float,
                    default=0.021,
                    help="ball centre height above the ground, m (0.021 = ball on the ground)")
@@ -1690,9 +1692,21 @@ def main():
             print(f"Speed radar not available ({type(e).__name__}: {e}); continuing without it")
     bridge = None                       # TI radar: not used for now
     K.ops, K.bridge = ops, bridge       # so the Club button can update the radar
-    # Ball speed: the radar's reading as it is for now (no line-of-sight
-    # correction loaded); the raw reading is kept in the session log.
+    # Ball speed: the radar reads the ball's speed along its line of sight,
+    # which is low for a ball climbing away (2-4.5% on all 11 TrackMan shots of
+    # 21 Nov 2026). --speed-correction on applies our line-of-sight model
+    # (radar_calibration.OPSCalibration: the radar's height, tilt and distance
+    # from the ball, the measured launch or the club's typical one), which
+    # brought those shots to 0.9% (mean). The raw reading stays in the session log.
     K.correct_speed = K.speed_check = K.ops_cal = None
+    if ops is not None and getattr(args, "speed_correction", "off") == "on":
+        try:
+            import radar_calibration as rc
+            K.ops_cal = rc.OPSCalibration(rc.SpeedRadarSetup(ball_height_m=float(args.iwr_ball_height_m)),
+                                          os.path.join(args.out, rc.OPS_FILE))
+            print("Ball speed: line-of-sight correction on (" + K.ops_cal.setup.text() + ")")
+        except Exception as e:
+            print(f"Ball speed: line-of-sight correction not available ({type(e).__name__}: {e}); raw reading shown")
     if args.trigger_out_gpio:
         # The camera replaces the sound detector: when it sees the ball leave
         # (motion trigger) it sends the same 3.3 V pulse the detector's GATE did,

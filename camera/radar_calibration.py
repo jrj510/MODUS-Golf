@@ -69,7 +69,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from ballflight import AIR, CD0, CDK, CLK, CLMAX, G, MASS, RADIUS, club_defaults
+from ballflight import AIR, G, MASS, RADIUS, club_defaults, coefficients
 
 MPH = 0.44704                  # m/s per mph
 WAVELENGTH_M = 299792458.0 / 24.125e9   # the OPS243-A radar wave (24.125 GHz): 12.43 mm
@@ -182,7 +182,7 @@ def radial_reading(speed_mps, launch_deg, direction_deg=0.0, spin_rpm=3000.0, se
         sp = math.sqrt(ux * ux + uy * uy + uz * uz)
         if physics:
             spin_factor = RADIUS * w / sp
-            cd, cl = CD0 + CDK * spin_factor, min(CLMAX, CLK * spin_factor)
+            cd, cl = coefficients(spin_factor)
             k = 0.5 * AIR * area * sp / MASS
             ax, ay, az_ = -k * cd * ux, -k * cd * uy - G, -k * cd * uz
             # Lift from backspin: at right angles to the flight, upward.
