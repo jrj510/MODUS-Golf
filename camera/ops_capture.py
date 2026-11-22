@@ -66,6 +66,10 @@ BLOCK = 128
 N_BLOCKS = N_SAMPLES // BLOCK
 FAST_BAUD = 230400
 FAST_BAUD_CMD = b"I5"              # tested on our OPS243-A rev D6, fw 1.3.2
+DUMP_LAG_S = 0.75                  # the radar waits this long after its last sample before it
+                                   # sends the trigger message and the recording (2026-11-22:
+                                   # camera triggers came 0.73-0.76 s before the radar's impact
+                                   # time worked out without it). Refined from matched shots.
 
 
 # --------------------------------------------------------------------------
@@ -77,7 +81,8 @@ class Capture:
     trigger_time: float            # radar clock, s: the trigger
     i: np.ndarray
     q: np.ndarray
-    received: float                # Pi clock (monotonic) when the dump started arriving
+    received: float                # Pi clock (monotonic) of the last sample (the dump starts
+                                   # arriving the radar's dump lag after that)
     rate: float                    # samples per second
 
     @property
@@ -251,6 +256,7 @@ class RollingBufferRadar:
             raise RuntimeError(f"OPS243 didn't answer at {FAST_BAUD} baud after {FAST_BAUD_CMD!r}")
         self.lock = threading.Lock()
         self.busy = False                   # a dump is coming in: radar isn't recording
+        self.dump_lag = DUMP_LAG_S
         self._new_trigger: Optional[float] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -321,7 +327,7 @@ class RollingBufferRadar:
             while not self._stop.is_set():
                 raw = self.ser.readline()
                 if not raw:
-                    if lines and first and time.monotonic() - first > 5.0:
+                    if lines and first and time.monotonic() - first > 5.0 + self.dump_lag:
                         lines, first = [], None        # half a dump: drop it
                         with self.lock:
                             self.busy = False
@@ -329,7 +335,9 @@ class RollingBufferRadar:
                     continue
                 line = raw.decode("ascii", "replace").strip()
                 if '"sample_time"' in line:
-                    lines, first = [line], time.monotonic()
+                    # When its last sample was taken (on the Pi clock): the
+                    # recording starts to arrive dump_lag after that.
+                    lines, first = [line], time.monotonic() - self.dump_lag
                     with self.lock:
                         self.busy = True
                     continue

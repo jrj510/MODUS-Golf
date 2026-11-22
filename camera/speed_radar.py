@@ -87,7 +87,7 @@ class SpeedRadar:
         # How late the radar's trigger message arrives after its trigger, s.
         # Measured on every recording (2026-11-21: some captures started after
         # impact); starts at a cautious guess.
-        self.notice_delay = 0.10
+        self.notice_delay = 0.75     # it comes with the recording, ~0.75 s after the trigger
         self.cond = threading.Condition()
         self.results: list[tuple[float, Optional[dict], FusedShot]] = []  # (trigger time, numbers, shot)
         self.listeners: list[Callable] = []
@@ -153,13 +153,26 @@ class SpeedRadar:
             self.results = [r for r in self.results if r[0] > t - 60] + [(t, nums, fs)]
             self.cond.notify_all()
 
+    CAMERA_AFTER_IMPACT_S = 0.04   # the camera triggers ~4.5 frames after the ball leaves
+
+    def _learn_lag(self, gap: float) -> None:
+        """A matched shot: the camera triggered `gap` s after the radar's impact
+        time. It should be ~40 ms; the rest is error in the radar's dump lag."""
+        lag = getattr(self.radar, "dump_lag", None)
+        if lag is None:
+            return
+        new = min(2.0, max(0.0, lag - 0.5 * (gap - self.CAMERA_AFTER_IMPACT_S)))
+        self.radar.dump_lag = new
+        print(f"Speed radar: dump lag {1000 * new:.0f} ms (camera came {1000 * gap:+.0f} ms "
+              f"from the radar's impact time)")
+
     def _learn_delay(self, cap: Capture) -> None:
         """How late the notice came after the radar's own trigger, this time."""
         if self.notice_arrived is None:
             return
         d = self.notice_arrived - cap.pi_time(cap.trigger_time)
         self.notice_arrived = None
-        if -0.05 <= d <= 0.5:
+        if -0.05 <= d <= 2.0:
             self.notice_delay = 0.5 * self.notice_delay + 0.5 * d
             print(f"Speed radar: its trigger message came {1000 * d:.0f} ms after the trigger "
                   f"(now using {1000 * self.notice_delay:.0f} ms)")
@@ -219,6 +232,8 @@ class SpeedRadar:
                     "smash": fs.smash, "source": fs.source}
         t = fs.camera_t
         notice = None
+        if fs.source == "confirmed" and fs.camera_t is not None:
+            self._learn_lag(fs.camera_t - fs.t_impact)
         if fs.source == "radar_only":
             notice = self._notice_for(fs.t_impact - 0.25, fs.t_impact + 0.1)
             if notice is not None:      # the camera is already capturing this shot

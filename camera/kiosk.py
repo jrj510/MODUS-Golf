@@ -1651,8 +1651,9 @@ def main():
             print("The saved hitting zone is outside this view: drag a new one")
     K.training = count_training(args.out)
 
-    # (+0.35 s: the speed radar can ask for a capture of a shot ~0.3 s after it happened)
-    sh = Shared(maxlen=int(args.fps * (args.pre + args.post + 0.35) * 1.3) + 20)
+    # (+1.1 s: the speed radar's trigger message only comes ~0.75 s after its
+    # trigger, and it can ask for a capture of a shot that long ago)
+    sh = Shared(maxlen=int(args.fps * (args.pre + args.post + 1.1) * 1.3) + 20)
     cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
     cam_thread.start()
 
