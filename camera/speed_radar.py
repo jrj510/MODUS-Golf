@@ -46,6 +46,28 @@ from ops243 import DetectorConfig
 from ops_capture import Capture, CaptureConfig, RollingBufferRadar, find_shot
 from shot_fusion import FusedShot, FusionConfig, ShotFusion
 
+# The radar's own trigger speed (moving away, mph) for each club. It fires as
+# the club comes through, so it has to be close to the club's speed AT impact
+# (as the radar sees it), or it fires too early: 40 mph was right for a wedge
+# (radar saw the club at 46-56 mph) but fired far too early with a 3-iron
+# (club ~100 mph) on 2026-11-21, so its recordings ended before impact.
+CLUB_TRIGGER_MPH = {
+    "driver": 75, "3w": 75, "5w": 72, "hybrid": 65, "3i": 65, "4i": 62,
+    "5i": 60, "6i": 58, "7i": 55, "8i": 52, "9i": 50, "pw": 48,
+    "52": 42, "56": 40, "60": 40, "gw": 42, "sw": 40, "lw": 40,
+}
+
+
+def trigger_mph_for(club: Optional[str], setting="auto") -> Optional[float]:
+    """The speed trigger to use: a number from the setting, or by club ('auto')."""
+    try:
+        v = float(setting)
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        pass
+    return float(CLUB_TRIGGER_MPH.get(str(club or "").lower(), 55))
+
+
 MATCH_S = 0.02   # a stored result belongs to a trigger time within this
 NEAR_S = 0.5     # ...or, failing that, the radar shot nearest it within this
 
@@ -71,6 +93,9 @@ class SpeedRadar:
         self.listeners: list[Callable] = []
         self.trigger_listeners: list[Callable] = []
         self.hw_pulse = bool(getattr(args, "trigger_out_gpio", 0))
+        # off (default): the camera never triggers the radar; each triggers on
+        # its own and the shots are paired afterwards.
+        self.camera_triggers = getattr(args, "radar_from_camera", "off") == "on"
         self.dcfg = DetectorConfig(min_ball_mph=getattr(args, "ops_min_ball", 30.0))
         self.last_capture: Optional[Capture] = None
         # Camera-only shots are always passed on; with --radar-confirm on the
@@ -80,10 +105,10 @@ class SpeedRadar:
                                  on_reject=lambda why: print(f"[{time.strftime('%H:%M:%S')}] "
                                                              f"Speed radar: not a shot ({why})"))
         self.fusion.start()
+        self.trigger_setting = getattr(args, "ops_speed_trigger_mph", "auto")
         if radar is None:
-            trig = getattr(args, "ops_speed_trigger_mph", 40.0)
-            cfg = CaptureConfig(split=getattr(args, "ops_split", 10),
-                                speed_trigger_mph=trig if trig and trig > 0 else None)
+            trig = trigger_mph_for(getattr(args, "club", None), self.trigger_setting)
+            cfg = CaptureConfig(split=getattr(args, "ops_split", 4), speed_trigger_mph=trig)
             print(f"Speed radar: rolling buffer on {args.radar_port} "
                   f"({cfg.split} of 32 blocks before the trigger; speed trigger "
                   + (f"{cfg.speed_trigger_mph:g} mph" if cfg.speed_trigger_mph else "off") + ")")
@@ -162,12 +187,20 @@ class SpeedRadar:
               + (f", club {shot.club_mph:.1f} mph" if shot.club_mph else ""))
         self.fusion.radar_shot(shot)
 
+    def set_club(self, club: str) -> None:
+        """The Club button: move the radar's trigger speed to suit the club."""
+        mph = trigger_mph_for(club, self.trigger_setting)
+        if hasattr(self.radar, "set_speed_trigger"):
+            self.radar.set_speed_trigger(mph)
+            print(f"Speed radar: trigger speed {mph:g} mph for {club}" if mph else
+                  "Speed radar: own trigger off")
+
     # ---- camera side ------------------------------------------------------
     def camera_fired(self, t: float, source: str) -> None:
         if source == "radar":       # our own request coming back
             return
         self.fusion.camera_trigger(t, source)
-        if not self.hw_pulse:
+        if self.camera_triggers and not self.hw_pulse:
             self.radar.trigger()    # no pulse wire: trigger it over the serial line
 
     def pulsed(self, t: float) -> None:

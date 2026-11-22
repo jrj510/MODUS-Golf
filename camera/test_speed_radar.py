@@ -20,6 +20,9 @@ class FakeRadar:
     def trigger(self):
         self.triggers += 1
 
+    def set_speed_trigger(self, mph):
+        self.speed_trigger = mph
+
     def close(self):
         pass
 
@@ -30,11 +33,12 @@ class FakeRadar:
         self.cb(cap)
 
 
-def make(ball_present=None, pulse=21, camera_ready=None):
+def make(ball_present=None, pulse=21, camera_ready=None, from_camera="off"):
     """camera_ready: None = no notice hook; True/False = the camera is/isn't
     Ready when the radar's trigger notice arrives (started captures go in .started)."""
     fake, asked = FakeRadar(), []
-    args = SimpleNamespace(radar_port="x", radar_confirm="off", trigger_out_gpio=pulse)
+    args = SimpleNamespace(radar_port="x", radar_confirm="off", trigger_out_gpio=pulse,
+                           radar_from_camera=from_camera)
     started = []
 
     def start_capture(t):
@@ -92,8 +96,15 @@ def test_camera_trigger_with_empty_recording_is_decided_at_once():
     sr.stop()
 
 
-def test_without_pulse_wire_camera_triggers_radar_over_serial():
+def test_camera_and_radar_independent_by_default():
     sr, fake, _ = make(pulse=0)
+    sr.camera_fired(time.monotonic(), "motion")
+    assert fake.triggers == 0                           # the camera never triggers the radar
+    sr.stop()
+
+
+def test_without_pulse_wire_camera_triggers_radar_over_serial():
+    sr, fake, _ = make(pulse=0, from_camera="on")
     sr.camera_fired(time.monotonic(), "motion")
     assert fake.triggers == 1
     sr.camera_fired(time.monotonic(), "radar")         # our own request: not passed back
@@ -157,4 +168,16 @@ def test_notice_delay_is_learned():
     # the next capture is placed ~50 ms after the radar's trigger, not after the message
     fake.on_notice(trig + 0.200)
     assert abs(sr.started[-1] - (trig + 0.05)) < 0.02
+    sr.stop()
+
+
+def test_trigger_speed_follows_the_club():
+    from speed_radar import trigger_mph_for
+    assert trigger_mph_for("driver") == 75 and trigger_mph_for("56") == 40
+    assert trigger_mph_for("3i") == 65 and trigger_mph_for("7i") == 55
+    assert trigger_mph_for("7i", "48") == 48           # a fixed number wins
+    assert trigger_mph_for("7i", "0") is None          # off
+    sr, fake, _ = make()
+    sr.set_club("driver")
+    assert fake.speed_trigger == 75
     sr.stop()

@@ -966,6 +966,10 @@ def add_blob_args(p):
                    help="how much the ball must differ from the mat around it, percent of its brightness")
     p.add_argument("--blob-min-radius", type=float, default=3.0, help="smallest ball radius, pixels")
     p.add_argument("--blob-max-radius", type=float, default=25.0, help="largest ball radius, pixels")
+    p.add_argument("--min-ball-px", type=float, default=0.0,
+                   help="never take a new ball narrower than this (pixels across, in the view): a ball "
+                        "lying farther away (by the net, downrange) is not the one being hit. 0 = off "
+                        "(kiosk: the launch tracker's minimum when --cam-launch is on)")
     p.add_argument("--search-area", default=None,
                    help="only look for the ball inside x0,y0,x1,y1 (pixels): the mat")
 
@@ -1205,6 +1209,11 @@ def detect_ball(model, gray, args, trk, zone=None):
     use_blob = getattr(args, "blob", False)
     in_zone = (zone is not None and zone.active and getattr(args, "search_area", None)
                and 0 < getattr(args, "tile", 0) < WIDTH)
+    min_px = float(getattr(args, "min_ball_px", 0) or 0)
+
+    def big(box):
+        """Wide enough to be the ball being hit (see --min-ball-px)."""
+        return not min_px or ((box[2] - box[0]) + (box[3] - box[1])) / 2.0 >= min_px
 
     if trk.get("hint") is not None:
         box = _ball_at_hint(model, gray, args, trk)
@@ -1212,20 +1221,22 @@ def detect_ball(model, gray, args, trk, zone=None):
             return box
 
     placed = zone.placed if (in_zone and not following) else []
+    placed = [p for p in placed if big(p[0])]
     if model is None:
         cands = []
     elif in_zone:
         cands = _zone_model_candidates(model, gray, args, trk, following, placed)
     else:
         cands = list(_model_candidates(model, gray, args, trk, following))
+    cands = [c for c in cands if big(c[0])]
     strong = [c for c in cands if c[1] >= args.conf]
 
     if following and in_zone and not trk.get("sure"):
         # The box is on something only the small-ball finder vouched for (at
         # start-up it may be a look-alike on the mat). A ball seen being set
         # down elsewhere in the zone takes over.
-        elsewhere = [p for p in zone.placed if not _matches_track(p[0], trk)]
-        found = _new_ball_evidence(gray, args, [], elsewhere, use_blob)
+        elsewhere = [p for p in zone.placed if not _matches_track(p[0], trk) and big(p[0])]
+        found = [f for f in _new_ball_evidence(gray, args, [], elsewhere, use_blob) if big(f[0])]
         box = _confirmed(trk, [(b, s) for b, s, _ in found], args, key="takeover", hold=2,
                          better_than=args.conf, slow=(getattr(args, "confirm_checks", 2) + 3, 0.4))
         if box is not None:
@@ -1281,7 +1292,7 @@ def detect_ball(model, gray, args, trk, zone=None):
         return None
 
     # A new ball: a confident model find, or a spot where one was set down.
-    found = _new_ball_evidence(gray, args, cands, placed, use_blob)
+    found = [f for f in _new_ball_evidence(gray, args, cands, placed, use_blob) if big(f[0])]
     need = getattr(args, "confirm_checks", 2)
     # The zone's tiles are looked at in turn, so a find may only come back
     # every few checks: keep it in mind that long.
@@ -1298,7 +1309,7 @@ def detect_ball(model, gray, args, trk, zone=None):
         return None
 
     if use_blob and not (in_zone and zone.trusted):
-        spots = find_ball_spots(gray, args)
+        spots = [sp for sp in find_ball_spots(gray, args) if big(sp[0])]
         if in_zone and len(spots) > 1:
             # Several ball-like spots in the zone and none seen being set
             # down: don't guess (most are marks on the mat). The ball is

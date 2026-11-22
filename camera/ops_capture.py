@@ -23,9 +23,10 @@ Triggers (any of them freezes the buffer):
   * S! sent over the serial line (software trigger)
 
 Pre-trigger split (S#n): n of the 32 blocks come from before the trigger.
-Default here 10 (43 ms before, 94 ms after). Measured 2026-11-20: the speed
-trigger fires as the club passes 40 mph, ~15-20 ms before impact, so most of
-the recording is wanted after it, where the ball is.
+Default here 4 (17 ms before, 119 ms after): the speed trigger fires as the
+club comes through, before impact (2026-11-20, wedge at 40 mph: ~15-20 ms
+before; 2026-11-21, 3-iron: early enough that with 94 ms after the trigger the
+recording ended before impact), so nearly all of it goes after the trigger.
 
 Serial: the radar starts at 19200 baud (its saved setting); a dump is ~41 KB,
 which takes ~21 s at 19200, so we switch it to 230400 (I5) for ~1.8 s.
@@ -217,9 +218,10 @@ def parse_dump(lines: list[str], received: float, rate: float) -> Optional[Captu
 @dataclass
 class CaptureConfig:
     rate_ksps: int = 30
-    split: int = 10                       # blocks from before the trigger (S#n): the speed
-                                          # trigger fires ~15-20 ms before impact (club passing
-                                          # 40 mph), so 43 ms before / 94 ms after
+    split: int = 4                        # blocks from before the trigger (S#n): 17 ms before,
+                                          # 119 ms after. A fast club passes the speed trigger
+                                          # well before impact (2026-11-21, 3-iron: recordings
+                                          # with split 10 ended before the ball was struck)
     speed_trigger_mph: Optional[float] = 40.0   # radar's own trigger, moving away; None = off
     trigger_magnitude: int = 20           # SMnnn
 
@@ -249,6 +251,7 @@ class RollingBufferRadar:
             raise RuntimeError(f"OPS243 didn't answer at {FAST_BAUD} baud after {FAST_BAUD_CMD!r}")
         self.lock = threading.Lock()
         self.busy = False                   # a dump is coming in: radar isn't recording
+        self._new_trigger: Optional[float] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -273,6 +276,30 @@ class RollingBufferRadar:
                 print(f"  {cmd.decode().strip():<7} -> {' | '.join(replies) or '(no reply)'}")
 
     def arm(self) -> None:
+        with self.lock:
+            mph, self._new_trigger = self._new_trigger, None
+        if mph is not None:
+            self._send_speed_trigger(mph)
+        self.ser.write(b"GC")
+
+    def _send_speed_trigger(self, mph: float) -> None:
+        if mph and mph > 0:
+            mps = max(1, int(round(mph / MPH_PER_MPS)))
+            self.ser.write(f"ST-{mps}\r".encode())
+        else:
+            self.ser.write(b"ST-0\r")
+        time.sleep(0.05)
+        self.cfg.speed_trigger_mph = mph or None
+
+    def set_speed_trigger(self, mph: Optional[float]) -> None:
+        """Change the radar's own trigger speed (moving away, mph) while running.
+        Applied at once if the radar is recording, else after the recording
+        that is coming over."""
+        with self.lock:
+            if self.busy:
+                self._new_trigger = mph or 0.0
+                return
+        self._send_speed_trigger(mph or 0.0)
         self.ser.write(b"GC")
 
     def trigger(self) -> None:
@@ -363,7 +390,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="MODUS OPS243-A rolling-buffer test")
     p.add_argument("--port", default="/dev/ttyAMA0")
     p.add_argument("--reset-gpio", type=int, default=23)
-    p.add_argument("--split", type=int, default=10, help="blocks (of 32) kept from before the trigger")
+    p.add_argument("--split", type=int, default=4, help="blocks (of 32) kept from before the trigger")
     p.add_argument("--speed-trigger-mph", type=float, default=40.0,
                    help="radar triggers itself on anything moving away faster; 0 = off")
     p.add_argument("--min-ball", type=float, default=30.0)
