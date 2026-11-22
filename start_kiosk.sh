@@ -18,19 +18,23 @@
 #   camera only          -> shot with no speeds (see RADAR_CONFIRM)
 SPEED_RADAR=on     # off = camera only
 OPS_PORT=/dev/ttyAMA0   # speed radar on the Pi's UART (J3 pins 6/7 to Pi pins 8/10); USB would be /dev/ttyACM0
-OPS_SPLIT=10       # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
-                   # (speed trigger fires ~15-20 ms before impact: most of the recording goes after it)
-OPS_SPEED_TRIGGER=40  # radar records by itself when something moves away faster, mph; 0 = off
+OPS_SPLIT=4        # of the recording's 32 blocks (4.3 ms each), how many from before the trigger
+                   # (17 ms before, 119 ms after: a fast club trips the trigger well before impact)
+OPS_SPEED_TRIGGER=auto  # radar records by itself when something moves away faster than this, mph;
+                        # auto = by club (driver 75, irons 50-65, wedges 40); 0 = off
 OPS_MIN_BALL=30    # slowest ball the radar counts as a shot, mph (radar view, before any angle
                    # correction; 30 caught a heeled wedge with no false shots, 25 gave false ones)
 SPEED_CORRECTION=on  # on = ball speed corrected for the radar's line of sight (raw reading kept in the
                      # session log); 21 Nov 2026 TrackMan: raw read 2.9% low, corrected 0.9%. off = raw
+RADAR_FROM_CAMERA=off  # off = camera and radar trigger independently (a false camera trigger
+                       # can't keep the radar busy through the real swing); on = the camera
+                       # also triggers the radar (soft shots under the radar's trigger speed)
 RADAR_CONFIRM=off  # on = a camera trigger with no radar shot is NOT a shot (no speedless chips, but
                    # a shadow or the golfer moving can never count either)
 OPS_RESET_GPIO=23  # wired to OPS J3 pin 4 (/Reset); the OPS is reset each time the kiosk starts. Empty = off
 GATE_GPIO=20       # sound trigger input: GPIO20 = pin 38 (was 17 = pin 11)
 BALL_H=0.021       # ball centre above the ground, metres (0.021 = ball on the ground; on a mat add its thickness)
-HOLD_SECONDS=5      # ball covered (club at address, hand, foot) this long -> back to Looking for Ball
+HOLD_SECONDS=10     # ball covered (club at address, hand, foot) this long -> back to Looking for Ball
 MOTION_THRESHOLD=12 # camera trigger: how much the ball's spot must change (0-255) when the ball leaves.
                    # Was 25; lab shots only changed it by 13-16, so half were missed
 # Shadow guard: before a sudden change at the ball's spot counts as a shot (and
@@ -208,7 +212,7 @@ while true; do
     LOG="logs/kiosk_$(date +%Y%m%d_%H%M%S)_${MODE}.log"
     reset_ops
     echo "Starting kiosk: $MODE mode, club $CLUB, recording $RECORDING, camera $CAM_SENSOR at $FPS fps, sleep after $SLEEP_MIN min, shadow guard $GUARD, cover guard ${COVER:-off}, speed radar ${SPEED_RADAR:-off} (radar check ${RADAR_CONFIRM:-off}), pulse as at ${RADAR_PULSE_FPS:-0} fps, camera launch ${CAMLAUNCH:-off} (log: $LOG)"
-    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py',$OPSARG$DETECT,'--no-browser','--ball-height-m','$BALL_H',$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--radar-pulse-fps','${RADAR_PULSE_FPS:-0}','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${RADAR_CONFIRM:-off}','--speed-correction','${SPEED_CORRECTION:-off}','--cover-guard','${COVER:-off}','--cam-launch','${CAMLAUNCH:-off}','--cam-height-m','$CAM_HEIGHT_M','--cam-ball-m','$CAM_BALL_M','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
+    python3 -c "import logging,runpy,sys; logging.basicConfig(level=logging.INFO); sys.path.insert(0,'camera'); sys.argv=['kiosk.py',$OPSARG$DETECT,'--no-browser','--ball-height-m','$BALL_H',$MODELARG'--recording','$RECORDING','--sensor','$CAM_SENSOR','--fps','$FPS','--gate-gpio','$GATE_GPIO','--radar-port','$OPS_PORT','--trigger-out-gpio','$TRIGGER_OUT_GPIO','--radar-pulse-fps','${RADAR_PULSE_FPS:-0}','--motion-threshold','$MOTION_THRESHOLD','--hold-seconds','$HOLD_SECONDS','--shadow-guard','${GUARD:-off}','--radar-confirm','${RADAR_CONFIRM:-off}','--radar-from-camera','${RADAR_FROM_CAMERA:-off}','--speed-correction','${SPEED_CORRECTION:-off}','--cover-guard','${COVER:-off}','--cam-launch','${CAMLAUNCH:-off}','--cam-height-m','$CAM_HEIGHT_M','--cam-ball-m','$CAM_BALL_M','--sleep-minutes','$SLEEP_MIN','--sleep-screen','$SLEEP_SCREEN','--club','$CLUB']; runpy.run_path('camera/kiosk.py', run_name='__main__')" >> "$LOG" 2>&1
     code=$?
     if [ $code -ne 0 ]; then
         echo "Kiosk stopped unexpectedly (code $code)" >> "$LOG"
