@@ -66,10 +66,10 @@ BLOCK = 128
 N_BLOCKS = N_SAMPLES // BLOCK
 FAST_BAUD = 230400
 FAST_BAUD_CMD = b"I5"              # tested on our OPS243-A rev D6, fw 1.3.2
-DUMP_LAG_S = 0.75                  # the radar waits this long after its last sample before it
-                                   # sends the trigger message and the recording (2026-11-22:
-                                   # camera triggers came 0.73-0.76 s before the radar's impact
-                                   # time worked out without it). Refined from matched shots.
+DUMP_LAG_S = 0.0                   # time between the radar's last sample and the start of its
+                                   # recording coming over. ~0: its trigger message comes at the
+                                   # trigger. (A 0.75 s value tried on 2026-11-22 was wrong: the
+                                   # camera was firing at the takeaway, not the radar running late.)
 
 
 # --------------------------------------------------------------------------

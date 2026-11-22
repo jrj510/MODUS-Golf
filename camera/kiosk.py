@@ -1651,9 +1651,8 @@ def main():
             print("The saved hitting zone is outside this view: drag a new one")
     K.training = count_training(args.out)
 
-    # (+1.1 s: the speed radar's trigger message only comes ~0.75 s after its
-    # trigger, and it can ask for a capture of a shot that long ago)
-    sh = Shared(maxlen=int(args.fps * (args.pre + args.post + 1.1) * 1.3) + 20)
+    # (+0.35 s: the speed radar can ask for a capture of a shot ~0.3 s after it happened)
+    sh = Shared(maxlen=int(args.fps * (args.pre + args.post + 0.35) * 1.3) + 20)
     cam_thread = threading.Thread(target=camera_thread, args=(cam, sh, args), daemon=True)
     cam_thread.start()
 
@@ -1682,12 +1681,31 @@ def main():
         sh.trigger("radar", need_armed=False, t=t)
 
     def radar_notice_capture(t):
-        """The radar's speed trigger just fired: if the camera is Ready, start
-        a capture now, while the frames of the ball leaving are still kept.
-        (A practice swing is then turned down by the usual ball-still-there
-        check.) True if a capture started."""
+        """The radar's speed trigger just fired (the club coming through): if
+        the camera is Ready, start a capture now, while the frames of the ball
+        leaving are still kept. (A practice swing is then turned down by the
+        usual ball-still-there check.) True if a capture started.
+
+        If the camera already triggered well before this (0.25-3 s), it fired
+        at the takeaway (2026-11-22: the golfer's shadow moving off the mat
+        changes the ball's spot), and its frames are of the backswing: move
+        the capture onto the radar's moment instead."""
         if K.state == "SLEEPING":
             return False
+        with sh.lock:
+            old = sh.trigger_time if sh.trigger_time is not None else (
+                sh.pending[0] if sh.pending is not None else None)
+            early = old is not None and 0.25 < t - old < 3.0
+            if early:
+                sh.pending = None               # the camera thread re-collects around t
+                sh.trigger_time = t
+                sh.trigger_source = "radar"
+        if early:
+            if ops is not None and hasattr(ops, "camera_cancelled"):
+                ops.camera_cancelled(old)
+            print(f"[{time.strftime('%H:%M:%S')}] Camera had triggered {t - old:.2f} s before the "
+                  f"speed radar (the takeaway?): capture moved to the radar's moment")
+            return True
         sh.trigger("radar", need_armed=True, t=t)
         with sh.lock:
             return sh.trigger_time == t

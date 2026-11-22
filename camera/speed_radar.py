@@ -87,7 +87,7 @@ class SpeedRadar:
         # How late the radar's trigger message arrives after its trigger, s.
         # Measured on every recording (2026-11-21: some captures started after
         # impact); starts at a cautious guess.
-        self.notice_delay = 0.75     # it comes with the recording, ~0.75 s after the trigger
+        self.notice_delay = 0.0      # measured ~0-4 ms: it comes right at the trigger
         self.cond = threading.Condition()
         self.results: list[tuple[float, Optional[dict], FusedShot]] = []  # (trigger time, numbers, shot)
         self.listeners: list[Callable] = []
@@ -232,8 +232,6 @@ class SpeedRadar:
                     "smash": fs.smash, "source": fs.source}
         t = fs.camera_t
         notice = None
-        if fs.source == "confirmed" and fs.camera_t is not None:
-            self._learn_lag(fs.camera_t - fs.t_impact)
         if fs.source == "radar_only":
             notice = self._notice_for(fs.t_impact - 0.25, fs.t_impact + 0.1)
             if notice is not None:      # the camera is already capturing this shot
