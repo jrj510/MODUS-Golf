@@ -2116,6 +2116,8 @@ def main():
                     time.sleep(0.05)
                     continue
                 if verify["back"] >= 3:               # ball seen in its spot on 3 checks in a row
+                    if ops is not None and hasattr(ops, "camera_cancelled"):
+                        ops.camera_cancelled(verify["t"])
                     print(f"[{time.strftime('%H:%M:%S')}] No shot: the ball is still there "
                           f"(its spot changed by up to {verify['peak']:.1f}, now {d if d is not None else -1:.1f}"
                           + (f"; shadow guard: {describe_check(shaded)}" if shaded else "")
@@ -2144,6 +2146,8 @@ def main():
                     time.sleep(0.05)
                     continue
                 peak, d, shaded = verify["still_there"]
+                if ops is not None and hasattr(ops, "camera_cancelled"):
+                    ops.camera_cancelled(verify["t"])
                 radar_note = ("the speed radar was ready again" if ans is not None else
                               f"no answer from the speed radar in {args.radar_confirm_wait:g} s")
                 if ans is not None and ans[0] == "ball":

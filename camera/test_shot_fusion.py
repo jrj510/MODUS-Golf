@@ -78,8 +78,8 @@ def test_camera_only_can_be_dropped():
 
 def test_far_apart_events_are_not_paired():
     f, clk, shots, _ = make(ball_present=None)
-    clk.t = 100.05; f.camera_trigger(100.05, "motion")   # camera fires on its own
-    clk.t = 100.20; f.radar_shot(radar(100.14))          # impact after the camera trigger
+    clk.t = 99.40; f.camera_trigger(99.40, "motion")     # camera fires on its own...
+    clk.t = 100.20; f.radar_shot(radar(100.14))          # ...0.7 s before the radar's impact
     sources = [s.source for s in shots]
     assert sources == ["camera_only"]                    # radar shot falls in the cooldown
 
@@ -101,3 +101,27 @@ def test_radar_nothing_ends_the_wait():
     clk.t = 100.05; f.camera_trigger(100.05, "motion")
     clk.t = 102.00; f.radar_nothing(99.95, 100.09)
     assert [s.source for s in shots] == ["camera_only"]
+
+
+def test_late_camera_trigger_still_pairs():
+    f, clk, shots, _ = make(ball_present=False)
+    clk.t = 100.30; f.camera_trigger(100.30, "motion")    # 0.3 s after the radar's impact time
+    clk.t = 102.00; f.radar_shot(radar(100.0))
+    assert [s.source for s in shots] == ["confirmed"] and shots[0].ball_mph == 132.0
+
+
+def test_unpaired_radar_shot_is_not_thrown_away():
+    f, clk, shots, _ = make(ball_present=None)
+    clk.t = 90.00; f.camera_trigger(90.00, "motion")      # a camera trigger long before
+    clk.t = 102.00; f.radar_shot(radar(100.0))
+    clk.t = 102.30; f.poll()
+    assert [s.source for s in shots] == ["camera_only", "radar_only"]
+    assert shots[1].ball_mph == 132.0
+
+
+def test_cancelled_camera_trigger_is_forgotten():
+    f, clk, shots, _ = make()
+    clk.t = 100.05; f.camera_trigger(100.05, "motion")
+    clk.t = 101.00; f.camera_cancel(100.05)             # kiosk: ball still there
+    clk.t = 104.00; f.poll()
+    assert shots == []

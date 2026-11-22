@@ -203,6 +203,10 @@ class SpeedRadar:
         if self.camera_triggers and not self.hw_pulse:
             self.radar.trigger()    # no pulse wire: trigger it over the serial line
 
+    def camera_cancelled(self, t: float) -> None:
+        """The kiosk found the camera trigger at t was no shot (ball still there)."""
+        self.fusion.camera_cancel(t)
+
     def pulsed(self, t: float) -> None:
         """The kiosk's pulse on J3 pin 3 went out; the radar triggers on it itself."""
 

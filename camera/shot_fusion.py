@@ -45,8 +45,11 @@ from ops243 import Shot
 class FusionConfig:
     cam_wait_s: float = 3.0       # a camera trigger waits this long for the radar's answer
     radar_wait_s: float = 0.25    # a radar shot waits this long for a camera trigger
-    cam_after_min_s: float = -0.03  # camera trigger expected this long after impact (sound: ~0)
-    cam_after_max_s: float = 0.20  # ...up to this long (camera checks ~4.5 frames)
+    cam_after_min_s: float = -0.25  # a camera trigger this long before the radar's impact time...
+    cam_after_max_s: float = 0.40   # ...to this long after it is the same shot. Wide: the two
+                                    # clocks and triggers line up less tightly than planned
+                                    # (2026-11-22: real pairs missed at 0.2 s), and shots are
+                                    # seconds apart, so a wide window can't pair the wrong ones
     cam_delay_est_s: float = 0.06  # impact ~ this long before a camera-only trigger
     camera_only: str = "keep"     # "keep" (shot with no speeds) or "drop"
     cooldown_s: float = 1.5       # ignore both sensors this long after a shot
@@ -114,6 +117,14 @@ class ShotFusion:
             if self.camera and t0 - 0.05 <= self.camera[0] <= t1 + 0.25:
                 self._camera_alone()
 
+    def camera_cancel(self, t: float) -> None:
+        """The kiosk decided the camera trigger at t was no shot (the ball is
+        still there): forget it, so it can't become a camera-only shot or
+        block the real one."""
+        with self.lock:
+            if self.camera and abs(self.camera[0] - t) <= 0.05:
+                self.camera = None
+
     def poll(self) -> None:
         """Settle anything that has waited long enough. Call often (or start())."""
         with self.lock:
@@ -135,6 +146,9 @@ class ShotFusion:
 
     def _match(self, now: float, timeout_only: bool = False) -> None:
         cfg = self.cfg
+        if self.radar and self.camera:
+            gap = self.camera[0] - self.radar[1].t_impact
+            print(f"Pairing: camera trigger {1000 * gap:+.0f} ms from the radar's impact time")
         if self.radar and self.camera and self._fits(self.radar[1], self.camera[0]):
             _, shot = self.radar
             cam_t, cam_src = self.camera
@@ -142,11 +156,16 @@ class ShotFusion:
                                  shot.smash, cam_t, cam_src))
             return
         if self.radar and self.camera:
-            # Both fired but too far apart to be the same shot: drop the older one.
+            # Both fired but too far apart to be the same shot: settle the older
+            # one on its own and keep the newer one for its own pairing.
             if self.radar[1].t_impact < self.camera[0]:
+                keep, self.camera = self.camera, None
                 self._radar_alone()
+                self.camera = keep
             else:
+                keep, self.radar = self.radar, None
                 self._camera_alone()
+                self.radar = keep
             return
         if self.radar and now - self.radar[0] >= cfg.radar_wait_s:
             self._radar_alone()
