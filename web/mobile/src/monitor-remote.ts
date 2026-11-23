@@ -1,3 +1,4 @@
+import { readLiveShot } from './live-monitor-shot.ts';
 import { ballStatus } from './readiness.ts';
 
 export const monitorClubs = ['driver','3w','hybrid','5i','6i','7i','8i','9i','pw','52','56','60'] as const;
@@ -13,7 +14,7 @@ export function monitorState(data:unknown) {
   if (label === 'Status unavailable') return null;
   // Launcher pages and older kiosks may omit the hardware settings.
   const kiosk = Number.isInteger(s.rev) && Number.isInteger(s.shot) && typeof s.metrics === 'object' && !!s.metrics;
-  return {label, kiosk, club:monitorClubs.includes(s.club) ? s.club as Club : null,
+  return {label, kiosk, liveShot:kiosk ? readLiveShot(s.shot,s.metrics) : null, club:monitorClubs.includes(s.club) ? s.club as Club : null,
     light:s.light === 'day' || s.light === 'night' ? s.light as 'day'|'night' : null,
     zoom:typeof s.view?.zoomed === 'boolean' && s.view?.can_zoom === true ? s.view.zoomed as boolean : null,
     screenControl:s.display?.version === 1, displayed:typeof s.display?.applied === 'string' ? s.display.applied as string : null};

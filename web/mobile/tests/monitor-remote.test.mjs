@@ -40,3 +40,21 @@ test('a physical display change is confirmed only by the matching kiosk receipt'
   assert.equal(commandConfirmed(state,command,'d101'),false);
   assert.equal(commandConfirmed(state,command,'d100'),true);
 });
+
+test('live tiles mirror kiosk readings independently of CSV and phone controls', () => {
+  const metrics={ball_speed:97.5,club_speed:75,smash:1.3,carry:145,launch_angle:15.3,
+    launch_dir:0,spin:6120,total:158,estimated:['carry','total','spin']};
+  const snapshot=monitorState({...sample,metrics}).liveShot;
+  assert.equal(snapshot.sequence,2);
+  assert.deepEqual(snapshot.readings.map(item => [item.value,item.unit,item.estimated]),[
+    ['97.5','mph',false],['75.0','mph',false],['1.30','',false],['145','yd',true],
+    ['15.3','°',false],['0.0','°',false],['6120','rpm',true],['158','yd',true]
+  ]);
+  const next=monitorState({...sample,shot:3,metrics:{launch_dir:-2.5,club_speed:null,
+    ball_speed:'',total:Infinity,radar_pending:true,test:true}}).liveShot;
+  assert.equal(next.pending,true);
+  assert.equal(next.test,true);
+  assert.deepEqual(next.readings.map(item=>item.value),[null,null,null,null,null,'-2.5',null,null]);
+  assert.equal(monitorState({...sample,shot:0,metrics}).liveShot,null);
+  assert.equal(monitorState({state:'READY',metrics}).liveShot,null);
+});

@@ -32,6 +32,16 @@ function ReadinessView({origin,connected,foreground,onPractice,canConnect,connec
       <button onClick={settings}>Monitor settings</button>
     </div>}
   </section>
+    {live && state?.liveShot && <section className="panel" aria-label="Live monitor metrics">
+      <h2>Live monitor · {state.liveShot.test ? 'Test shot' : 'Shot'} {state.liveShot.sequence}</h2>
+      <p>Live readings use the monitor’s units.</p>
+      {state.liveShot.pending && <p>Waiting for final radar readings…</p>}
+      <div className="secondary-metrics">{state.liveShot.readings.map(reading =>
+        <div key={reading.label}><span>{reading.label}</span>
+          <strong>{reading.value ?? '—'}{reading.value !== null && <small> {reading.unit}{reading.estimated ? ' est.' : ''}</small>}</strong>
+        </div>
+      )}</div>
+    </section>}
     {!onPractice && live && <MonitorRemote state={state} origin={origin}/>}
   </>;
 }
