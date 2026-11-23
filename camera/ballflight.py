@@ -49,7 +49,7 @@ MPH = 0.44704           # m/s per mph
 # (TrackMan PGA Tour averages; used for the launch angle and as the reference
 # for the club, not for the spin of a shot: see estimate_spin).
 CLUBS = {
-    "driver": (11.0, 2700), "3w": (11.5, 3600), "5w": (12.5, 4300),
+    "driver": (15.0, 2700), "3w": (11.5, 3600), "5w": (12.5, 4300),
     "hybrid": (13.5, 4500), "3i": (12.5, 4100), "4i": (13.5, 4700), "5i": (14.5, 5300),
     "6i": (15.5, 6200), "7i": (16.5, 7000), "8i": (18.5, 7900),
     "9i": (20.5, 8600), "pw": (24.0, 9300), "gw": (28.0, 9600),
